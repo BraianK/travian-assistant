@@ -632,6 +632,16 @@ class TravianBrowserSession:
         self._network_response_handler: Callable[[str, dict], bool] | None = None
         self._network_responses: dict[str, dict] = {}
         self._request_filter = RequestFilter()
+        self._incoming_attack_handler: Callable[[dict], None] | None = None
+        self._village_names_handler: Callable[[dict], None] | None = None
+        self._incoming_attack_binding = (
+            f"travianAssistantAttack_{uuid.uuid4().hex}"
+        )
+        self._incoming_attack_registry = (
+            f"__{self._incoming_attack_binding}_subscriptions"
+        )
+        self._incoming_attack_listener_active = False
+        self._village_names_by_id: dict[str, str] = {}
 
     def set_network_response_handler(
         self, handler: Callable[[str, dict], bool] | None
@@ -639,10 +649,26 @@ class TravianBrowserSession:
         """Set the consumer for parsed game API responses."""
         self._network_response_handler = handler
 
+    def set_incoming_attack_handler(
+        self, handler: Callable[[dict], None] | None
+    ) -> None:
+        """Set the consumer for live incoming-attack snapshots."""
+        self._incoming_attack_handler = handler
+
+    def set_village_names_handler(
+        self, handler: Callable[[dict], None] | None
+    ) -> None:
+        """Set the consumer for newly resolved map village names."""
+        self._village_names_handler = handler
+
     def _attach_network_listeners(self) -> None:
         if self._tab is None:
             raise RuntimeError("Cannot monitor network traffic before connecting.")
 
+        self._tab.set_listener(
+            "Runtime.bindingCalled",
+            self._on_incoming_attack_binding_called,
+        )
         self._tab.set_listener(
             "Network.requestWillBeSent",
             self._on_network_request_sent,
@@ -660,6 +686,323 @@ class TravianBrowserSession:
             self._on_network_loading_failed,
         )
 
+    def _on_incoming_attack_binding_called(
+        self, params: dict | None = None, **event_params: object
+    ) -> None:
+        params = params if params is not None else event_params
+        if (
+            params.get("name") != self._incoming_attack_binding
+            or self._incoming_attack_handler is None
+        ):
+            return
+        try:
+            snapshot = json.loads(str(params.get("payload", "")))
+            if not isinstance(snapshot, dict):
+                raise ValueError("The live attack event is not an object.")
+            village_id = snapshot.get("village_id")
+            server_time = snapshot.get("server_time")
+            attacks = snapshot.get("attacks")
+            if (
+                not isinstance(village_id, str)
+                or not village_id.isdigit()
+                or isinstance(server_time, bool)
+                or not isinstance(server_time, (int, float))
+                or not math.isfinite(server_time)
+                or not isinstance(attacks, list)
+            ):
+                raise ValueError("The live attack event has invalid village data.")
+
+            normalized_attacks = []
+            for attack in attacks:
+                if not isinstance(attack, dict):
+                    raise ValueError("The live attack event contains invalid data.")
+                movement_id = attack.get("movement_id")
+                arrival_time = attack.get("arrival_time")
+                if (
+                    not isinstance(movement_id, str)
+                    or not movement_id
+                    or str(attack.get("village_id")) != village_id
+                    or isinstance(arrival_time, bool)
+                    or not isinstance(arrival_time, (int, float))
+                    or not math.isfinite(arrival_time)
+                    or arrival_time <= 0
+                ):
+                    raise ValueError("The live attack event is incomplete.")
+                source_village_id = str(
+                    attack.get("source_village_id") or ""
+                ).strip()
+                if source_village_id and not source_village_id.isdigit():
+                    source_village_id = ""
+                source_village_name = (
+                    str(attack.get("source_village") or "").strip()
+                    or self._village_names_by_id.get(source_village_id, "")
+                    or (
+                        f"Wioska {source_village_id}"
+                        if source_village_id
+                        else "Nieznana wioska"
+                    )
+                )
+                normalized_attacks.append({
+                    "movement_id": movement_id,
+                    "village_id": village_id,
+                    "village_name": (
+                        str(attack.get("village_name") or "").strip()
+                        or f"Wioska {village_id}"
+                    ),
+                    "attacker_name": (
+                        str(attack.get("attacker_name") or "").strip()
+                        or "Nieznany gracz"
+                    ),
+                    "source_village_id": source_village_id or None,
+                    "source_village": source_village_name,
+                    "arrival_time": float(arrival_time),
+                    "seconds_remaining": max(
+                        0.0,
+                        float(arrival_time) - float(server_time),
+                    ),
+                    "movement_type": (
+                        str(attack.get("movement_type") or "").strip()
+                        or "Atak"
+                    ),
+                    "masked": bool(attack.get("masked")),
+                })
+            self._incoming_attack_handler({
+                "village_id": village_id,
+                "server_time": float(server_time),
+                "attacks": normalized_attacks,
+            })
+        except (TypeError, ValueError) as error:
+            logger.warning(
+                "Ignoring malformed live incoming-attack update: %s",
+                error,
+            )
+        except Exception:
+            logger.exception("Could not forward live incoming-attack update")
+
+    def start_incoming_attack_listener(self, villages: list[dict]) -> int:
+        """Subscribe to game movement collections without switching villages."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        if self._incoming_attack_listener_active:
+            raise RuntimeError("Incoming attack listener is already active.")
+
+        village_ids = [
+            str(village.get("id") or village.get("village_id") or "")
+            for village in villages
+        ]
+        village_names = {
+            village_id: str(village.get("name") or "").strip()
+            for village_id, village in zip(village_ids, villages)
+            if str(village.get("name") or "").strip()
+        }
+        village_names = {
+            village_id: str(village.get("name") or "").strip()
+            for village_id, village in zip(village_ids, villages)
+            if str(village.get("name") or "").strip()
+        }
+        if not village_ids or any(not village_id.isdigit() for village_id in village_ids):
+            raise ValueError("Invalid village identifier in live attack listener.")
+        if len(set(village_ids)) != len(village_ids):
+            raise ValueError("Duplicate village identifier in live attack listener.")
+
+        self._tab.call_method("Runtime.enable")
+        self._tab.call_method(
+            "Runtime.addBinding",
+            name=self._incoming_attack_binding,
+        )
+        self._incoming_attack_listener_active = True
+        registry_key = json.dumps(self._incoming_attack_registry)
+        binding_name = json.dumps(self._incoming_attack_binding)
+        expression = """(villageIds, registryKey, bindingName, villageNames) => {
+            if (typeof Troops === "undefined"
+                || !window.angular
+                || typeof Troops.getCollection !== "function") {
+                throw new Error("Troop movement collections are unavailable.");
+            }
+            if (window[registryKey]) {
+                throw new Error("A live attack listener is already installed.");
+            }
+            const injector = angular.element(document.body).injector();
+            const villageService = injector
+                && injector.get("VillageService");
+            const ownedVillages = villageService && villageService.U();
+            if (!ownedVillages || !Array.isArray(ownedVillages.data)) {
+                throw new Error("The game's owned village list is unavailable.");
+            }
+            const ownedIds = new Set(ownedVillages.data.map(village =>
+                String(village.data && village.data.villageId || "")
+            ));
+            if (villageIds.some(id => !ownedIds.has(String(id)))) {
+                throw new Error("A selected village is not owned by this account.");
+            }
+            const publish = villageId => {
+                const collection = Troops.getCollection(
+                    Troops.COLLECTION_MOVING,
+                    String(villageId)
+                );
+                if (!collection || !collection.filled
+                    || !Array.isArray(collection.data)) {
+                    throw new Error(
+                        `Movement collection is unavailable for village ${villageId}.`
+                    );
+                }
+                const serverTime = Number(
+                    injector.get("$rootScope").currentServerTime
+                );
+                if (!Number.isFinite(serverTime) || serverTime <= 0) return;
+                const movementType = type => {
+                    if (type === Number(Troops.MOVEMENT_TYPE_RAID)) return "Napad";
+                    if (type === Number(Troops.MOVEMENT_TYPE_SIEGE)) return "Oblężenie";
+                    if (type === Number(Troops.MOVEMENT_TYPE_SPY)) return "Zwiad";
+                    return "Atak";
+                };
+                const attacks = collection.data.filter(row =>
+                    row && typeof row.getMovementGroup === "function"
+                    && row.getMovementGroup(Number(villageId))
+                        === "incoming_attacks"
+                ).map(row => {
+                    const data = row.data || {};
+                    const movement = data.movement || {};
+                    const sourceVillageId = String(
+                        movement.villageIdStart || data.villageIdStart || ""
+                    );
+                    const sourceVillage = sourceVillageId
+                        && typeof Village !== "undefined"
+                        ? Village.get(sourceVillageId)
+                        : null;
+                    return {
+                        movement_id: String(
+                            movement.troopId || data.troopId || row.serverId || ""
+                        ),
+                        village_id: String(
+                            movement.villageIdTarget || villageId
+                        ),
+                        village_name: String(
+                            movement.villageNameTarget
+                            || villageNames[String(
+                                movement.villageIdTarget || villageId
+                            )]
+                            || ""
+                        ),
+                        attacker_name: String(
+                            movement.playerNameStart || data.playerName || ""
+                        ),
+                        source_village: String(
+                            movement.villageNameStart
+                            || data.villageName
+                            || sourceVillage && sourceVillage.data
+                                && sourceVillage.data.name
+                            || villageNames[sourceVillageId]
+                            || ""
+                        ),
+                        source_village_id: sourceVillageId,
+                        arrival_time: Number(movement.timeFinish),
+                        movement_type: movementType(
+                            Number(movement.movementType)
+                        ),
+                        masked: Boolean(data.isMasked)
+                    };
+                });
+                window[bindingName](JSON.stringify({
+                    village_id: String(villageId),
+                    server_time: serverTime,
+                    attacks
+                }));
+            };
+            const subscriptions = window[registryKey] = [];
+            for (const rawVillageId of villageIds) {
+                const villageId = String(rawVillageId);
+                const collection = Troops.getCollection(
+                    Troops.COLLECTION_MOVING,
+                    villageId
+                );
+                if (!collection || typeof collection.subscribe !== "function") {
+                    throw new Error(
+                        `Movement updates are unavailable for village ${villageId}.`
+                    );
+                }
+                const subscriptionId = collection.subscribe(
+                    () => publish(villageId)
+                );
+                subscriptions.push({collection, subscriptionId});
+            }
+            window[registryKey] = subscriptions;
+            return subscriptions.length;
+        }"""
+        try:
+            result = self._tab.call_method(
+                "Runtime.evaluate",
+                expression=(
+                    f"({expression})({json.dumps(village_ids)}, "
+                    f"{registry_key}, {binding_name}, "
+                    f"{json.dumps(village_names, ensure_ascii=False)})"
+                ),
+                returnByValue=True,
+                _timeout=5,
+            )
+            remote_result = result.get("result", {})
+            if remote_result.get("subtype") == "error":
+                raise RuntimeError(
+                    "The Travian page could not start live attack monitoring."
+                )
+            count = remote_result.get("value")
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count != len(village_ids)
+            ):
+                raise RuntimeError(
+                    "The Travian page returned an invalid listener count."
+                )
+            return count
+        except Exception:
+            self.stop_incoming_attack_listener()
+            raise
+
+    def stop_incoming_attack_listener(self) -> None:
+        if not self._incoming_attack_listener_active:
+            return
+        self._incoming_attack_listener_active = False
+        if self._tab is None:
+            return
+
+        try:
+            result = self._tab.call_method(
+                "Runtime.evaluate",
+                expression=f"""(() => {{
+                    const subscriptions = window[
+                        {json.dumps(self._incoming_attack_registry)}
+                    ] || [];
+                    for (const item of subscriptions) {{
+                        item.collection.unsubscribe(item.subscriptionId);
+                    }}
+                    delete window[
+                        {json.dumps(self._incoming_attack_registry)}
+                    ];
+                    return true;
+                }})()""",
+                returnByValue=True,
+                _timeout=3,
+            )
+            if result.get("result", {}).get("value") is not True:
+                logger.warning("The game did not confirm attack listener cleanup")
+        except Exception:
+            logger.warning(
+                "Could not remove live incoming-attack subscriptions",
+                exc_info=True,
+            )
+        try:
+            self._tab.call_method(
+                "Runtime.removeBinding",
+                name=self._incoming_attack_binding,
+                _timeout=3,
+            )
+        except Exception:
+            logger.warning(
+                "Could not remove the live incoming-attack browser binding",
+                exc_info=True,
+            )
+
     def _on_network_request_sent(
         self, params: dict | None = None, **event_params: object
     ) -> None:
@@ -668,7 +1011,30 @@ class TravianBrowserSession:
         request_data = params.get("request", {})
         url = str(request_data.get("url", ""))
         method = str(request_data.get("method", "GET"))
-        if request_id and self._request_filter.should_capture_response(url, method):
+        request_body = request_data.get("postData")
+        if (
+            not isinstance(request_body, str)
+            and method.upper() == "POST"
+            and "/api/" in url
+        ):
+            try:
+                body = self._tab.call_method(
+                    "Network.getRequestPostData",
+                    requestId=request_id,
+                    _timeout=2,
+                )
+                request_body = body.get("postData")
+            except Exception:
+                logger.debug(
+                    "Could not read request body for game API request %s",
+                    request_id,
+                    exc_info=True,
+                )
+        if request_id and self._request_filter.should_capture_response(
+            url,
+            method,
+            request_body if isinstance(request_body, str) else None,
+        ):
             self._network_responses[request_id] = {
                 "url": url,
                 "status": 0,
@@ -714,6 +1080,7 @@ class TravianBrowserSession:
             if not isinstance(raw_data, dict):
                 logger.debug("Ignoring non-object game response from %s", request["url"])
                 return
+            self._remember_village_names(raw_data)
             self._network_response_handler(request["url"], raw_data)
         except (ValueError, TypeError):
             logger.warning(
@@ -726,6 +1093,31 @@ class TravianBrowserSession:
                 "Failed to process captured game response from %s",
                 request["url"],
             )
+
+    def _remember_village_names(self, payload: dict) -> None:
+        """Cache village names exposed by map/cache API responses."""
+        resolved_names = {}
+        pending = [payload]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                village_id = value.get("villageId")
+                name = value.get("name")
+                if (
+                    str(village_id or "").isdigit()
+                    and isinstance(name, str)
+                    and name.strip()
+                ):
+                    self._village_names_by_id[str(village_id)] = name.strip()
+                    resolved_names[str(village_id)] = name.strip()
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        if resolved_names and self._village_names_handler is not None:
+            try:
+                self._village_names_handler(resolved_names)
+            except Exception:
+                logger.exception("Could not forward resolved village names")
 
     def _on_network_loading_failed(
         self, params: dict | None = None, **event_params: object
@@ -781,6 +1173,226 @@ class TravianBrowserSession:
             state["capacities"],
         )
         return state
+
+    def read_incoming_attacks(self, villages: list[dict]) -> list[dict]:
+        """Read cached incoming attacks for every owned village."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+
+        village_ids = [
+            str(village.get("id") or village.get("village_id") or "")
+            for village in villages
+        ]
+        if any(not village_id.isdigit() for village_id in village_ids):
+            raise ValueError("Invalid village identifier in attack scan.")
+        if len(set(village_ids)) != len(village_ids):
+            raise ValueError("Duplicate village identifier in attack scan.")
+
+        village_names = {
+            village_id: str(village.get("name") or "").strip()
+            for village_id, village in zip(village_ids, villages)
+            if str(village.get("name") or "").strip()
+        }
+        expression = """(villageIds, villageNames) => {
+            if (typeof Troops === "undefined"
+                || !window.angular) {
+                throw new Error("Troop movement data is unavailable.");
+            }
+            const injector = angular.element(document.body).injector();
+            if (!injector) {
+                throw new Error("The game data injector is unavailable.");
+            }
+            const villageService = injector.get("VillageService");
+            const ownedVillages = villageService.U();
+            if (!ownedVillages || !Array.isArray(ownedVillages.data)) {
+                throw new Error("The game's owned village list is unavailable.");
+            }
+            const ownedIds = new Set(ownedVillages.data.map(village =>
+                String(village.data && village.data.villageId || "")
+            ));
+            const missing = villageIds.filter(id => !ownedIds.has(String(id)));
+            if (missing.length) {
+                throw new Error(
+                    `Village data is not available for ${missing.join(", ")}.`
+                );
+            }
+            const serverTime = Number(
+                injector.get("$rootScope").currentServerTime
+            );
+            if (!Number.isFinite(serverTime) || serverTime <= 0) {
+                throw new Error("The game server time is unavailable.");
+            }
+            const movementType = type => {
+                if (type === Number(Troops.MOVEMENT_TYPE_RAID)) return "Napad";
+                if (type === Number(Troops.MOVEMENT_TYPE_SIEGE)) return "Oblężenie";
+                if (type === Number(Troops.MOVEMENT_TYPE_SPY)) return "Zwiad";
+                return "Atak";
+            };
+            const villages = villageIds.map(rawVillageId => {
+                const villageId = String(rawVillageId);
+                const collection = Troops.getCollection(
+                    Troops.COLLECTION_MOVING,
+                    villageId
+                );
+                if (!collection || !collection.filled
+                    || !Array.isArray(collection.data)) {
+                    throw new Error(
+                        `Troop movement data is not loaded for village ${villageId}.`
+                    );
+                }
+                const attacks = collection.data.filter(row =>
+                    row && typeof row.getMovementGroup === "function"
+                    && row.getMovementGroup(Number(villageId))
+                        === "incoming_attacks"
+                ).map(row => {
+                    const data = row.data || {};
+                    const movement = data.movement || {};
+                    const sourceVillageId = String(
+                        movement.villageIdStart || data.villageIdStart || ""
+                    );
+                    const sourceVillage = sourceVillageId
+                        && typeof Village !== "undefined"
+                        ? Village.get(sourceVillageId)
+                        : null;
+                    return {
+                        movement_id: String(
+                            movement.troopId || data.troopId || row.serverId || ""
+                        ),
+                        village_id: String(
+                            movement.villageIdTarget || villageId
+                        ),
+                        village_name: String(
+                            movement.villageNameTarget
+                            || villageNames[String(
+                                movement.villageIdTarget || villageId
+                            )]
+                            || ""
+                        ),
+                        attacker_name: String(
+                            movement.playerNameStart || data.playerName || ""
+                        ),
+                        source_village: String(
+                            movement.villageNameStart
+                            || data.villageName
+                            || sourceVillage && sourceVillage.data
+                                && sourceVillage.data.name
+                            || villageNames[sourceVillageId]
+                            || ""
+                        ),
+                        source_village_id: sourceVillageId,
+                        arrival_time: Number(movement.timeFinish),
+                        movement_type: movementType(
+                            Number(movement.movementType)
+                        ),
+                        masked: Boolean(data.isMasked)
+                    };
+                });
+                return {village_id: villageId, attacks};
+            });
+            return {server_time: serverTime, villages};
+        }"""
+
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=(
+                f"({expression})({json.dumps(village_ids)}, "
+                f"{json.dumps(village_names, ensure_ascii=False)})"
+            ),
+            returnByValue=True,
+            _timeout=5,
+        )
+        remote_result = result.get("result", {})
+        if remote_result.get("subtype") == "error":
+            raise RuntimeError("The Travian page could not read incoming attacks.")
+        response = remote_result.get("value")
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("server_time"), (int, float))
+            or isinstance(response.get("server_time"), bool)
+            or not math.isfinite(response["server_time"])
+            or not isinstance(response.get("villages"), list)
+            or len(response["villages"]) != len(village_ids)
+        ):
+            raise RuntimeError("The Travian page returned invalid attack data.")
+
+        village_names = {
+            str(village.get("id") or village.get("village_id")):
+                str(village.get("name") or "")
+            for village in villages
+        }
+        returned_ids = set()
+        attacks = []
+        for village in response["villages"]:
+            if (
+                not isinstance(village, dict)
+                or not isinstance(village.get("village_id"), str)
+                or village["village_id"] not in village_names
+                or village["village_id"] in returned_ids
+                or not isinstance(village.get("attacks"), list)
+            ):
+                raise RuntimeError("The Travian page returned invalid village attack data.")
+            village_id = village["village_id"]
+            returned_ids.add(village_id)
+            village_name = village_names[village_id] or f"Wioska {village_id}"
+            for attack in village["attacks"]:
+                if not isinstance(attack, dict):
+                    raise RuntimeError(
+                        f"The game returned an invalid attack for village {village_id}."
+                    )
+                movement_id = attack.get("movement_id")
+                target_id = attack.get("village_id")
+                arrival_time = attack.get("arrival_time")
+                if (
+                    not isinstance(movement_id, str)
+                    or not movement_id
+                    or str(target_id) != village_id
+                    or isinstance(arrival_time, bool)
+                    or not isinstance(arrival_time, (int, float))
+                    or not math.isfinite(arrival_time)
+                    or arrival_time <= 0
+                ):
+                    raise RuntimeError(
+                        f"The game returned incomplete attack data for village {village_id}."
+                    )
+                attacks.append({
+                    "movement_id": movement_id,
+                    "village_id": village_id,
+                    "village_name": (
+                        str(attack.get("village_name") or "").strip()
+                        or village_name
+                    ),
+                    "attacker_name": (
+                        str(attack.get("attacker_name") or "").strip()
+                        or "Nieznany gracz"
+                    ),
+                    "source_village_id": (
+                        str(attack.get("source_village_id") or "").strip()
+                        or None
+                    ),
+                    "source_village": (
+                        str(attack.get("source_village") or "").strip()
+                        or self._village_names_by_id.get(
+                            str(attack.get("source_village_id") or ""),
+                            "",
+                        )
+                        or (
+                            f"Wioska {attack['source_village_id']}"
+                            if str(attack.get("source_village_id") or "").isdigit()
+                            else "Nieznana wioska"
+                        )
+                    ),
+                    "arrival_time": float(arrival_time),
+                    "seconds_remaining": max(
+                        0.0,
+                        float(arrival_time) - float(response["server_time"]),
+                    ),
+                    "movement_type": (
+                        str(attack.get("movement_type") or "").strip()
+                        or "Atak"
+                    ),
+                    "masked": bool(attack.get("masked")),
+                })
+        return attacks
 
     def read_troops_for_villages(self, villages: list[dict]) -> list[dict]:
         """Read stationed own-tribe units in each village, restoring the selection."""

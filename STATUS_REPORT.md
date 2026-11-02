@@ -107,7 +107,8 @@ The eight tables currently declared in SQLAlchemy metadata are created automatic
 | Grain milling UI | ✅ Dedicated top-level tab with two independently configurable per-village methods: empty grain at a high threshold or refill grain at a low threshold |
 | Automatic NPC Trader milling | ✅ Both methods are off by default per village; refill defaults to 5%, fills up to granary capacity, and leaves overflow allocated among other resources; checks all village stocks every 30 seconds, requires a valid 100% split and enough gold to preserve the configured reserve (default 300 after the 5-gold NPC cost), and persists uncertain orders to prevent duplicate charges |
 | Detailed village view | ✅ Village metadata, resource values, and saved building/upgrading state |
-| Attack automation UI panel | ❌ Not implemented |
+| Incoming attack monitoring | ✅ Live subscriptions for every owned village; persists full observed movement records and event/status history, resolves village names from loaded game models or later map responses (backfilling existing records), marks pre-arrival disappearance as withdrawn and post-arrival disappearance as arrived, supports per-record deletion, and warns once per newly observed movement |
+| Attack planning and automation UI | ❌ Not implemented |
 | Defense coordination UI panel | ❌ Not implemented |
 | Coalition planning UI panel | ❌ Not implemented |
 

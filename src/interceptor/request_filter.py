@@ -5,6 +5,7 @@ This module provides pattern matching for Travian game traffic, allowing the int
 to identify relevant requests/responses for parsing and analysis.
 """
 
+import json
 import re
 from typing import Optional
 
@@ -12,6 +13,7 @@ from typing import Optional
 TRAVIAN_DOMAIN_PATTERNS = [
     r".*\.traviangames\.com",
     r".*\.travian\..*",
+    r".*\.kingdoms\.com",
     r"t[0-9]+\.[a-z]+\.(?:traviangames|me)",
 ]
 
@@ -67,7 +69,12 @@ class RequestFilter:
                 return category
         return "unknown"
 
-    def should_capture_response(self, url: str, method: str = "GET") -> bool:
+    def should_capture_response(
+        self,
+        url: str,
+        method: str = "GET",
+        request_body: str | None = None,
+    ) -> bool:
         """Determine if we should capture and store the response body.
         
         Args:
@@ -101,6 +108,21 @@ class RequestFilter:
             "alliance",
         }
         category = self.categorize_request(url)
+        if (
+            category == "unknown"
+            and method.upper() == "POST"
+            and re.search(r"/api/?(?:\?|$)", url, re.IGNORECASE)
+            and request_body
+        ):
+            try:
+                request_data = json.loads(request_body)
+            except (TypeError, ValueError):
+                return False
+            return (
+                isinstance(request_data, dict)
+                and request_data.get("controller") == "map"
+                and request_data.get("action") == "getByRegionIds"
+            )
         return category in api_categories
 
     def is_attack_request(self, url: str) -> bool:

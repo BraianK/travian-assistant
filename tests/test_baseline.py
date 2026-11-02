@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.app import MainWindow
 from src.config.settings import (
@@ -23,9 +23,14 @@ from src.config.settings import (
 )
 from src.core.browser_session import TravianBrowserSession
 from src.interceptor.browser_cdp import ChromeCDPInterceptor
+from src.interceptor.request_filter import RequestFilter
 from src.database.connection import DatabaseManager
 from src.database.models import Base
-from src.database.repository import AccountRepository, VillageRepository
+from src.database.repository import (
+    AccountRepository,
+    VillageRepository,
+    IncomingAttackRepository,
+)
 from src.core.account_manager import AccountManager
 from src.core.village_tracker import VillageTracker
 from src.core.recruitment_economics import estimate_recruitment_costs_per_hour
@@ -320,6 +325,15 @@ class BaselineSmokeTests(unittest.TestCase):
                 self.assertEqual(
                     30 * 1000,
                     window.resource_milling_timer.interval(),
+                )
+                self.assertEqual(
+                    1000,
+                    window.incoming_attack_eta_timer.interval(),
+                )
+                self.assertEqual("Ataki", window.content_tabs.tabText(4))
+                self.assertEqual(
+                    "1 min 5 s",
+                    window.incoming_attacks_tab._format_eta(65),
                 )
                 window.dashboard_tab.update_persisted_village("101")
                 window.village_detail_tab.update_village("101")
@@ -897,6 +911,213 @@ class BaselineSmokeTests(unittest.TestCase):
         self.assertEqual(100000.0, rows[0]["capacities"]["grain"])
         self.assertEqual(305.0, rows[0]["gold"])
 
+    def test_reads_incoming_attacks_and_calculates_eta_from_server_time(self):
+        class FakeTab:
+            def call_method(self, method, **kwargs):
+                self.method = method
+                self.expression = kwargs["expression"]
+                return {
+                    "result": {
+                        "value": {
+                            "server_time": 1000,
+                            "villages": [{
+                                "village_id": "101",
+                                "attacks": [{
+                                    "movement_id": "1234",
+                                    "village_id": "101",
+                                    "village_name": "Testonia",
+                                    "attacker_name": "Robber",
+                                    "source_village": "Hideout",
+                                    "arrival_time": 1120,
+                                    "movement_type": "Atak",
+                                    "masked": True,
+                                }],
+                            }],
+                        }
+                    }
+                }
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+        session._selected_village_id = lambda: "101"
+
+        attacks = session.read_incoming_attacks([
+            {"id": "101", "name": "Testonia"},
+        ])
+
+        self.assertEqual("Runtime.evaluate", session._tab.method)
+        self.assertIn('"incoming_attacks"', session._tab.expression)
+        self.assertIn("currentServerTime", session._tab.expression)
+        self.assertEqual(1, len(attacks))
+        self.assertEqual("1234", attacks[0]["movement_id"])
+        self.assertEqual("Testonia", attacks[0]["village_name"])
+        self.assertEqual("Hideout", attacks[0]["source_village"])
+        self.assertEqual(120, attacks[0]["seconds_remaining"])
+        self.assertTrue(attacks[0]["masked"])
+
+    def test_incoming_attack_scan_reads_all_villages_without_switching(self):
+        class FakeTab:
+            def call_method(self, method, **kwargs):
+                self.expression = kwargs["expression"]
+                return {
+                    "result": {
+                        "value": {
+                            "server_time": 1000,
+                            "villages": [{
+                                "village_id": village_id,
+                                "attacks": [],
+                            } for village_id in ("101", "202")],
+                        }
+                    }
+                }
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+
+        attacks = session.read_incoming_attacks([
+            {"id": "101", "name": "Testonia"},
+            {"id": "202", "name": "Second"},
+        ])
+
+        self.assertEqual([], attacks)
+        self.assertIn("VillageService", session._tab.expression)
+        self.assertIn("Troops.getCollection", session._tab.expression)
+
+    def test_starts_live_incoming_attack_subscriptions_for_all_villages(self):
+        class FakeTab:
+            def __init__(self):
+                self.calls = []
+                self.listener = None
+
+            def call_method(self, method, **kwargs):
+                self.calls.append((method, kwargs))
+                if method == "Runtime.evaluate":
+                    self.expression = kwargs["expression"]
+                    if "delete window[" in self.expression:
+                        return {"result": {"value": True}}
+                    return {"result": {"value": 2}}
+                return {}
+
+            def set_listener(self, event, callback):
+                self.listener = (event, callback)
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+        session._tab.set_listener = lambda event, callback: setattr(
+            session._tab, "listener", (event, callback)
+        )
+        session._tab.set_listener(
+            "Runtime.bindingCalled",
+            session._on_incoming_attack_binding_called,
+        )
+
+        count = session.start_incoming_attack_listener([
+            {"id": "101", "name": "Testonia"},
+            {"id": "202", "name": "Second"},
+        ])
+
+        self.assertEqual(2, count)
+        self.assertIn("collection.subscribe", session._tab.expression)
+        self.assertIn("incoming_attacks", session._tab.expression)
+        self.assertTrue(session._incoming_attack_listener_active)
+        self.assertIn(
+            "Runtime.addBinding",
+            [method for method, _ in session._tab.calls],
+        )
+        session.stop_incoming_attack_listener()
+        self.assertFalse(session._incoming_attack_listener_active)
+        self.assertIn(
+            "Runtime.removeBinding",
+            [method for method, _ in session._tab.calls],
+        )
+
+    def test_live_incoming_attack_binding_normalizes_game_snapshot(self):
+        received = []
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session.set_incoming_attack_handler(received.append)
+
+        session._on_incoming_attack_binding_called({
+            "name": session._incoming_attack_binding,
+            "payload": json.dumps({
+                "village_id": "101",
+                "server_time": 1000,
+                "attacks": [{
+                    "movement_id": "1234",
+                    "village_id": "101",
+                    "village_name": "Testonia",
+                    "attacker_name": "Robber",
+                    "source_village": "Hideout",
+                    "arrival_time": 1120,
+                    "movement_type": "Atak",
+                    "masked": True,
+                }],
+            }),
+        })
+
+        self.assertEqual(1, len(received))
+        self.assertEqual("101", received[0]["village_id"])
+        self.assertEqual(1000, received[0]["server_time"])
+        self.assertEqual(120, received[0]["attacks"][0]["seconds_remaining"])
+        self.assertTrue(received[0]["attacks"][0]["masked"])
+
+    def test_incoming_attack_binding_resolves_source_village_name_from_map_data(self):
+        received = []
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session.set_incoming_attack_handler(received.append)
+        session._remember_village_names({
+            "response": {
+                "2": {
+                    "region": {
+                        "537018367": [{
+                            "id": "537935870",
+                            "village": {
+                                "villageId": "537935870",
+                                "name": "00.Assembly",
+                            },
+                        }],
+                    },
+                },
+            },
+        })
+
+        session._on_incoming_attack_binding_called({
+            "name": session._incoming_attack_binding,
+            "payload": json.dumps({
+                "village_id": "101",
+                "server_time": 1000,
+                "attacks": [{
+                    "movement_id": "1234",
+                    "village_id": "101",
+                    "source_village_id": "537935870",
+                    "arrival_time": 1120,
+                }],
+            }),
+        })
+
+        self.assertEqual("00.Assembly", received[0]["attacks"][0]["source_village"])
+        self.assertEqual("537935870", received[0]["attacks"][0]["source_village_id"])
+
+    def test_map_village_names_are_forwarded_for_delayed_history_resolution(self):
+        received = []
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session.set_village_names_handler(received.append)
+
+        session._remember_village_names({
+            "response": [{
+                "region": [{
+                    "village": {
+                        "villageId": "537935870",
+                        "name": "00.Assembly",
+                    },
+                }],
+            }],
+        })
+
+        self.assertEqual(
+            [{"537935870": "00.Assembly"}],
+            received,
+        )
+
     def test_queue_resource_milling_uses_npc_trader_request_contract(self):
         class FakeTab:
             def call_method(self, method, **kwargs):
@@ -1178,6 +1399,9 @@ class BaselineSmokeTests(unittest.TestCase):
                 self.queue_threshold = queue_threshold
                 return {"status": "confirmed", "count": 6}
 
+            def stop_incoming_attack_listener(self):
+                pass
+
             def disconnect(self):
                 pass
 
@@ -1238,6 +1462,9 @@ class BaselineSmokeTests(unittest.TestCase):
                 queue_threshold,
             ):
                 return {"status": "unconfirmed"}
+
+            def stop_incoming_attack_listener(self):
+                pass
 
             def disconnect(self):
                 pass
@@ -1339,6 +1566,9 @@ class BaselineSmokeTests(unittest.TestCase):
                 queue_threshold,
             ):
                 return {"status": "pending"}
+
+            def stop_incoming_attack_listener(self):
+                pass
 
             def disconnect(self):
                 pass
@@ -1474,6 +1704,9 @@ class BaselineSmokeTests(unittest.TestCase):
                     "target_grain": 0,
                 }
 
+            def stop_incoming_attack_listener(self):
+                pass
+
             def disconnect(self):
                 pass
 
@@ -1562,6 +1795,9 @@ class BaselineSmokeTests(unittest.TestCase):
                     "target_grain": 100000,
                 }
 
+            def stop_incoming_attack_listener(self):
+                pass
+
             def disconnect(self):
                 pass
 
@@ -1618,6 +1854,187 @@ class BaselineSmokeTests(unittest.TestCase):
                 window.close()
                 db.close()
 
+    def test_live_incoming_attack_popup_is_deduplicated(self):
+        attack = {
+                    "movement_id": "1234",
+                    "village_id": "101",
+                    "village_name": "Testonia",
+                    "attacker_name": "Robber",
+                    "source_village": "Hideout",
+                    "arrival_time": 1120,
+                    "seconds_remaining": 120,
+                    "movement_type": "Atak",
+                    "masked": True,
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "incoming-attacks.db"))
+            db.init()
+            window = MainWindow(
+                AppSettings(),
+                AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+                IncomingAttackRepository(db),
+            )
+
+            try:
+                with patch("src.app.QMessageBox.warning") as warning:
+                    snapshot = {
+                        "village_id": "101",
+                        "attacks": [attack],
+                    }
+                    window._on_incoming_attack_update(snapshot)
+                    window._on_incoming_attack_update(snapshot)
+
+                self.assertEqual(1, warning.call_count)
+                self.assertEqual(1, window.incoming_attacks_tab.table.rowCount())
+                self.assertIn("Hideout", warning.call_args.args[2])
+                self.assertIn("nie wysyła", warning.call_args.args[2])
+                self.assertEqual(
+                    1,
+                    len(IncomingAttackRepository(db).get_recent_attacks()),
+                )
+            finally:
+                window.close()
+                db.close()
+
+    def test_incoming_attack_history_persists_withdrawal_and_can_be_deleted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "incoming-attacks.db"))
+            db.init()
+            attack_repo = IncomingAttackRepository(db)
+            window = MainWindow(
+                AppSettings(),
+                AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+                attack_repo,
+            )
+            attack = {
+                "movement_id": "1234",
+                "village_id": "101",
+                "village_name": "Testonia",
+                "attacker_name": "Robber",
+                "source_village_id": "202",
+                "source_village": "Hideout",
+                "arrival_time": 2000,
+                "seconds_remaining": 1000,
+                "movement_type": "Atak",
+                "masked": True,
+            }
+
+            try:
+                with patch("src.app.QMessageBox.warning"):
+                    window._on_incoming_attack_update({
+                        "village_id": "101",
+                        "server_time": 1000,
+                        "attacks": [attack],
+                    })
+                    window._on_incoming_attack_update({
+                        "village_id": "101",
+                        "server_time": 1100,
+                        "attacks": [],
+                    })
+
+                records = attack_repo.get_recent_attacks()
+                self.assertEqual(1, len(records))
+                self.assertEqual("withdrawn", records[0]["status"])
+                self.assertEqual(
+                    ["detected", "withdrawn"],
+                    [event["event"] for event in records[0]["event_log"]],
+                )
+                self.assertEqual(1, window.incoming_attacks_tab.table.rowCount())
+                self.assertEqual(
+                    "Wycofany",
+                    window.incoming_attacks_tab.table.item(0, 6).text(),
+                )
+
+                with patch(
+                    "src.app.QMessageBox.question",
+                    return_value=QMessageBox.Yes,
+                ):
+                    window._delete_incoming_attack_record(records[0]["id"])
+
+                self.assertEqual([], attack_repo.get_recent_attacks())
+                self.assertEqual(0, window.incoming_attacks_tab.table.rowCount())
+            finally:
+                window.close()
+                db.close()
+
+    def test_late_map_response_updates_saved_attack_and_history_view(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "incoming-attacks.db"))
+            db.init()
+            attack_repo = IncomingAttackRepository(db)
+            window = MainWindow(
+                AppSettings(),
+                AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+                attack_repo,
+            )
+            attack = {
+                "movement_id": "193736",
+                "village_id": "538001407",
+                "village_name": "Aden",
+                "attacker_name": "RejeZ",
+                "source_village_id": "537935870",
+                "source_village": "Wioska 537935870",
+                "arrival_time": 2000,
+                "seconds_remaining": 1000,
+                "movement_type": "Atak",
+                "masked": True,
+            }
+
+            try:
+                with patch("src.app.QMessageBox.warning"):
+                    window._on_incoming_attack_update({
+                        "village_id": "538001407",
+                        "server_time": 1000,
+                        "attacks": [attack],
+                    })
+                window._on_village_names_update({
+                    "537935870": "00.Assembly",
+                })
+
+                record = attack_repo.get_recent_attacks()[0]
+                self.assertEqual("00.Assembly", record["source_village_name"])
+                self.assertEqual(
+                    "00.Assembly",
+                    record["details"]["source_village"],
+                )
+                self.assertEqual(
+                    "source_village_resolved",
+                    record["event_log"][-1]["event"],
+                )
+                self.assertEqual(
+                    "00.Assembly",
+                    window.incoming_attacks_tab.table.item(0, 2).text(),
+                )
+            finally:
+                window.close()
+                db.close()
+
+    def test_live_request_body_fallback_captures_map_lookup(self):
+        class FakeTab:
+            def call_method(self, method, **kwargs):
+                if method == "Network.getRequestPostData":
+                    return {"postData": json.dumps({
+                        "controller": "map",
+                        "action": "getByRegionIds",
+                    })}
+                raise AssertionError(f"Unexpected CDP method: {method}")
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+        session._on_network_request_sent({
+            "requestId": "map-request",
+            "request": {
+                "url": "https://tr2nx3.kingdoms.com/api/",
+                "method": "POST",
+            },
+        })
+
+        self.assertIn("map-request", session._network_responses)
+
     def test_rejects_incomplete_recruitment_queue_scan(self):
         class FakeTab:
             def call_method(self, method, **kwargs):
@@ -1628,6 +2045,32 @@ class BaselineSmokeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
             session.read_recruitment_queues([{"id": "101", "name": "Testonia"}])
+
+    def test_request_filter_captures_map_responses_for_village_name_lookup(self):
+        request_filter = RequestFilter()
+
+        self.assertTrue(request_filter.should_capture_response(
+            "https://tr2nx3.kingdoms.com/api/",
+            "POST",
+            json.dumps({
+                "controller": "map",
+                "action": "getByRegionIds",
+                "params": {"regionIdCollection": {}},
+            }),
+        ))
+        self.assertFalse(request_filter.should_capture_response(
+            "https://tr2nx3.kingdoms.com/api/",
+            "POST",
+            json.dumps({
+                "controller": "player",
+                "action": "ping",
+            }),
+        ))
+        self.assertFalse(request_filter.should_capture_response(
+            "https://tr2nx3.kingdoms.com/api/",
+            "POST",
+            "{invalid",
+        ))
 
     def test_network_interceptor_can_be_initialized_before_connecting(self):
         interceptor = ChromeCDPInterceptor()

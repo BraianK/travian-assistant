@@ -210,6 +210,29 @@ class AttackLog(Base):
         }
 
 
+class IncomingAttackLog(Base):
+    """Persisted observations and resolution state for incoming attacks."""
+    __tablename__ = "incoming_attack_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    movement_key = Column(String, nullable=False, unique=True)
+    movement_id = Column(String, nullable=False)
+    target_village_id = Column(String, nullable=False)
+    target_village_name = Column(String, nullable=False)
+    attacker_name = Column(String, nullable=False)
+    source_village_id = Column(String, nullable=True)
+    source_village_name = Column(String, nullable=False)
+    movement_type = Column(String, nullable=False)
+    arrival_time = Column(Float, nullable=False)
+    masked = Column(Integer, nullable=False, default=0)
+    status = Column(String, nullable=False)
+    first_detected_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    details = Column(Text, nullable=False)
+    event_log = Column(Text, nullable=False)
+
+
 class ScoutReport(Base):
     """Scout intelligence data table."""
     __tablename__ = "scout_reports"

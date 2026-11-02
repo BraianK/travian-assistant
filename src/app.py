@@ -1,9 +1,11 @@
 """Main application module with PySide6 UI."""
 
 import logging
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -26,7 +28,12 @@ try:
         VillageRecruitmentSettings,
     )
     from src.database.connection import DatabaseManager
-    from src.database.repository import AccountRepository, VillageRepository, AttackLogRepository
+    from src.database.repository import (
+        AccountRepository,
+        VillageRepository,
+        AttackLogRepository,
+        IncomingAttackRepository,
+    )
     from src.core.account_manager import AccountManager
     from src.core.browser_session import (
         NPC_TRADER_PRICE,
@@ -45,7 +52,12 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         VillageRecruitmentSettings,
     )
     from database.connection import DatabaseManager
-    from database.repository import AccountRepository, VillageRepository, AttackLogRepository
+    from database.repository import (
+        AccountRepository,
+        VillageRepository,
+        AttackLogRepository,
+        IncomingAttackRepository,
+    )
     from core.account_manager import AccountManager
     from core.browser_session import (
         NPC_TRADER_PRICE,
@@ -1613,6 +1625,237 @@ class MillingWidget(QWidget):
         )
 
 
+class IncomingAttacksWidget(QWidget):
+    """Display the persisted history of attacks detected in owned villages."""
+
+    delete_requested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._attacks: list[dict] = []
+        self._history: list[dict] = []
+        self._eta_references: dict[str, tuple[float, float]] = {}
+        self._row_by_attack_key: dict[str, int] = {}
+        layout = QVBoxLayout(self)
+        self.status = QLabel(
+            "Połącz z grą, aby rozpocząć monitorowanie ataków."
+        )
+        self.status.setObjectName("secondaryText")
+        layout.addWidget(self.status)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels([
+            "Cel", "Atakujący", "Wioska źródłowa",
+            "Rodzaj", "Dotarcie", "Pozostało", "Status", "Wykryto",
+        ])
+        DashboardWidget._configure_table(
+            self.table,
+            stretch_columns=(0, 1, 2, 6, 7),
+        )
+        self.table.cellDoubleClicked.connect(self._show_attack_details)
+        layout.addWidget(self.table)
+
+        self.delete_button = QPushButton("Usuń wybrany wpis")
+        self.delete_button.clicked.connect(self._request_delete_selected)
+        layout.addWidget(self.delete_button, alignment=Qt.AlignRight)
+
+        hint = QLabel(
+            "Historia ataków jest zapisywana lokalnie. Podwójne kliknięcie "
+            "pokazuje szczegóły i zdarzenia; aplikacja nie wysyła obrony "
+            "ani innych działań."
+        )
+        hint.setObjectName("secondaryText")
+        layout.addWidget(hint)
+
+    @staticmethod
+    def _format_eta(seconds_remaining: float) -> str:
+        seconds = max(0, int(seconds_remaining))
+        days, seconds = divmod(seconds, 24 * 60 * 60)
+        hours, seconds = divmod(seconds, 60 * 60)
+        minutes, seconds = divmod(seconds, 60)
+        parts = []
+        if days:
+            parts.append(f"{days} d")
+        if hours or days:
+            parts.append(f"{hours} godz.")
+        if minutes or hours or days:
+            parts.append(f"{minutes} min")
+        parts.append(f"{seconds} s")
+        return " ".join(parts)
+
+    def update_attacks(self, attacks: list[dict], checked_at: datetime):
+        now = monotonic()
+        self._attacks = [dict(attack) for attack in attacks]
+        attack_keys = set()
+        for attack in attacks:
+            attack_key = (
+                f"{attack['village_id']}:{attack['movement_id']}"
+            )
+            attack_keys.add(attack_key)
+            remaining = float(attack["seconds_remaining"])
+            previous = self._eta_references.get(attack_key)
+            if previous is None or abs(
+                previous[0] - max(0.0, remaining - (now - previous[1]))
+            ) > 2:
+                self._eta_references[attack_key] = (remaining, now)
+        self._eta_references = {
+            key: value
+            for key, value in self._eta_references.items()
+            if key in attack_keys
+        }
+        self._render_history()
+        self.status.setText(
+            f"Nasłuch live · nadchodzące ruchy: {len(attacks)} · "
+            f"historia: {len(self._history)} · aktualizacja "
+            f"{checked_at:%H:%M:%S}"
+        )
+
+    def update_history(self, records: list[dict]):
+        self._history = [dict(record) for record in records]
+        self._render_history()
+        self.status.setText(
+            f"Historia lokalna · rekordów: {len(self._history)}"
+        )
+
+    @staticmethod
+    def _format_record_time(value: object) -> str:
+        if isinstance(value, datetime):
+            return value.strftime("%d.%m %H:%M:%S")
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value).strftime("%d.%m %H:%M:%S")
+            except ValueError:
+                return value
+        return "—"
+
+    def _render_history(self):
+        active_by_key = {
+            f"{attack['village_id']}:{attack['movement_id']}": attack
+            for attack in self._attacks
+        }
+        records = list(self._history)
+        known_keys = {
+            record.get("movement_key")
+            for record in records
+            if record.get("movement_key")
+        }
+        for key, attack in active_by_key.items():
+            if key not in known_keys:
+                records.append({
+                    **attack,
+                    "movement_key": key,
+                    "status": "incoming",
+                    "first_detected_at": None,
+                    "id": None,
+                })
+
+        self.table.setRowCount(len(records))
+        self._row_by_attack_key = {}
+        for row, record in enumerate(records):
+            key = record.get("movement_key") or (
+                f"{record['village_id']}:{record['movement_id']}"
+            )
+            attack = active_by_key.get(key)
+            if attack is not None:
+                self._row_by_attack_key[key] = row
+            arrival_time = float(record["arrival_time"])
+            status = record.get("status", "incoming")
+            status_labels = {
+                "incoming": "Nadchodzący",
+                "withdrawn": "Wycofany",
+                "arrived": "Dotarł",
+            }
+            values = (
+                record.get("target_village_name", record.get("village_name", "")),
+                record.get("attacker_name", ""),
+                record.get(
+                    "source_village_name",
+                    record.get("source_village", ""),
+                ),
+                record.get("movement_type", ""),
+                datetime.fromtimestamp(arrival_time).strftime("%d.%m %H:%M:%S"),
+                (
+                    self._format_eta(attack["seconds_remaining"])
+                    if attack is not None
+                    else "—"
+                ),
+                status_labels.get(status, status),
+                self._format_record_time(record.get("first_detected_at")),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.UserRole, record.get("id"))
+                self.table.setItem(row, column, item)
+            first_item = self.table.item(row, 0)
+            first_item.setData(
+                Qt.UserRole + 1,
+                json.dumps({
+                    "details": record.get("details", {}),
+                    "events": record.get("event_log", []),
+                }, ensure_ascii=False, indent=2),
+            )
+            if record.get("masked"):
+                self.table.item(row, 2).setToolTip(
+                    "Skład wojsk jest ukryty w danych gry."
+                )
+        self.refresh_eta()
+
+    def _show_attack_details(self, row: int, _column: int):
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        details = item.data(Qt.UserRole + 1)
+        if not details:
+            return
+        QMessageBox.information(
+            self,
+            "Szczegóły ataku",
+            str(details),
+        )
+
+    def _request_delete_selected(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Historia ataków",
+                "Najpierw wybierz rekord do usunięcia.",
+            )
+            return
+        record_id = self.table.item(selected[0].row(), 0).data(Qt.UserRole)
+        if isinstance(record_id, int):
+            self.delete_requested.emit(record_id)
+
+    def refresh_eta(self):
+        now = monotonic()
+        for attack in self._attacks:
+            attack_key = f"{attack['village_id']}:{attack['movement_id']}"
+            row = self._row_by_attack_key.get(attack_key)
+            if row is None:
+                continue
+            item = self.table.item(row, 5)
+            if item is not None:
+                baseline, updated_at = self._eta_references[attack_key]
+                item.setText(self._format_eta(
+                    baseline - max(0.0, now - updated_at)
+                ))
+
+    def set_listening(self, village_count: int):
+        self.status.setText(
+            f"Nasłuch live aktywny · {village_count} wiosek"
+        )
+
+    def set_monitoring_error(self, message: str):
+        self.status.setText(f"Nie udało się uruchomić nasłuchu live: {message}")
+
+    def set_disconnected(self):
+        self.status.setText(
+            f"Brak połączenia z grą — zachowano historię "
+            f"({len(self._history)} wpisów)."
+        )
+
+
 class VillageDetailWidget(QWidget):
     """Detailed view for a single village."""
     
@@ -1888,13 +2131,18 @@ class SettingsDialog(QDialog):
 
 class MainWindow(QMainWindow):
     """Main application window."""
+
+    incoming_attack_update = Signal(dict)
+    village_names_update = Signal(dict)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
-                 village_tracker: VillageTracker):
+                 village_tracker: VillageTracker,
+                 incoming_attack_repo: IncomingAttackRepository | None = None):
         super().__init__()
         self.settings = settings
         self.account_mgr = account_mgr
         self.tracker = village_tracker
+        self.incoming_attack_repo = incoming_attack_repo
         self.browser_session: TravianBrowserSession | None = None
         self._auto_recruitment_candidates: list[dict] = []
         self._auto_recruitment_active = False
@@ -1904,6 +2152,9 @@ class MainWindow(QMainWindow):
         self._milling_scan_active = False
         self._pending_milling_responses: dict[str, int] = {}
         self._connected_milling_controls: set[int] = set()
+        self._seen_incoming_attack_ids: set[str] = set()
+        self._incoming_attacks_by_key: dict[str, dict] = {}
+        self._dismissed_incoming_attack_ids: set[str] = set()
         
         self.setWindowTitle(settings.app_name)
         self.resize(1280, 860)
@@ -1948,6 +2199,11 @@ class MainWindow(QMainWindow):
         self.resource_milling_timer.timeout.connect(
             self._check_resource_milling
         )
+        self.incoming_attack_eta_timer = QTimer(self)
+        self.incoming_attack_eta_timer.setInterval(1000)
+        self.incoming_attack_eta_timer.timeout.connect(
+            self.incoming_attacks_tab.refresh_eta
+        )
 
         self.account_mgr.load_from_database()
         self.tracker.load_from_database()
@@ -1982,6 +2238,12 @@ class MainWindow(QMainWindow):
         )
         self.milling_tab.clear_pending_btn.clicked.connect(
             self._clear_pending_milling_orders
+        )
+        self.incoming_attack_update.connect(
+            self._on_incoming_attack_update
+        )
+        self.village_names_update.connect(
+            self._on_village_names_update
         )
         self._refresh_data()
     
@@ -2042,6 +2304,16 @@ class MainWindow(QMainWindow):
 
         self.milling_tab = MillingWidget()
         self.content_tabs.addTab(self.milling_tab, "Mielenie")
+
+        self.incoming_attacks_tab = IncomingAttacksWidget()
+        self.incoming_attacks_tab.delete_requested.connect(
+            self._delete_incoming_attack_record
+        )
+        if self.incoming_attack_repo is not None:
+            self.incoming_attacks_tab.update_history(
+                self.incoming_attack_repo.get_recent_attacks()
+            )
+        self.content_tabs.addTab(self.incoming_attacks_tab, "Ataki")
         
         layout.addWidget(self.content_tabs, stretch=3)
         
@@ -2056,6 +2328,8 @@ class MainWindow(QMainWindow):
     def _connect_browser(self):
         """Connect to an already-authenticated local Travian browser tab."""
         try:
+            self._seen_incoming_attack_ids.clear()
+            self._incoming_attacks_by_key.clear()
             self.browser_session = TravianBrowserSession(
                 self.settings.browser.cdp_address,
                 self.settings.browser.cdp_port,
@@ -2063,7 +2337,13 @@ class MainWindow(QMainWindow):
             self.browser_session.set_network_response_handler(
                 self.tracker.process_network_response
             )
+            self.browser_session.set_village_names_handler(
+                self.village_names_update.emit
+            )
             state = self.browser_session.connect()
+            self.browser_session.set_incoming_attack_handler(
+                self.incoming_attack_update.emit
+            )
             self.tracker.sync_live_state(state)
             self._persist_live_dashboard_state(state)
             self.dashboard_tab.update_live_state(state)
@@ -2084,6 +2364,20 @@ class MainWindow(QMainWindow):
                 self.troops_refresh_timer.start()
                 self.recruitment_queue_timer.start()
                 self.resource_milling_timer.start()
+                try:
+                    village_count = (
+                        self.browser_session.start_incoming_attack_listener(
+                            state["villages"]
+                        )
+                    )
+                    self.incoming_attacks_tab.set_listening(village_count)
+                    self.incoming_attack_eta_timer.start()
+                except Exception as error:
+                    logger.warning(
+                        "Could not start live incoming-attack monitoring: %s",
+                        error,
+                    )
+                    self.incoming_attacks_tab.set_monitoring_error(str(error))
                 QTimer.singleShot(
                     1500,
                     lambda: self._read_all_village_troops(automatic=True),
@@ -2093,6 +2387,7 @@ class MainWindow(QMainWindow):
             else:
                 self.recruitment_queue_timer.stop()
                 self.resource_milling_timer.stop()
+                self.incoming_attack_eta_timer.stop()
         except Exception as error:
             self.browser_session = None
             logger.warning("Travian browser connection failed: %s", error)
@@ -2186,6 +2481,173 @@ class MainWindow(QMainWindow):
                 self.troops_refresh_timer.start()
             self.dashboard_tab.refresh_troops_btn.setEnabled(
                 self.browser_session is not None
+            )
+
+    def _on_incoming_attack_update(self, snapshot: dict):
+        village_id = snapshot["village_id"]
+        observed_at = datetime.now()
+        server_time = float(snapshot.get("server_time", observed_at.timestamp()))
+        previous_keys = {
+            key
+            for key, attack in self._incoming_attacks_by_key.items()
+            if attack["village_id"] == village_id
+        }
+        active_movement_keys = {
+            f"{village_id}:{attack['movement_id']}"
+            for attack in snapshot["attacks"]
+        }
+        try:
+            if self.incoming_attack_repo is not None:
+                for attack in snapshot["attacks"]:
+                    attack_key = f"{village_id}:{attack['movement_id']}"
+                    if attack_key not in self._dismissed_incoming_attack_ids:
+                        self.incoming_attack_repo.record_attack(
+                            attack,
+                            observed_at,
+                        )
+                self.incoming_attack_repo.reconcile_village(
+                    village_id,
+                    active_movement_keys,
+                    server_time,
+                    observed_at,
+                )
+                self.incoming_attacks_tab.update_history(
+                    self.incoming_attack_repo.get_recent_attacks()
+                )
+        except Exception as error:
+            logger.exception("Could not save incoming attack history")
+            QMessageBox.warning(
+                self,
+                "Błąd historii ataków",
+                f"Nie udało się zapisać historii ataku: {error}",
+            )
+
+        self._incoming_attacks_by_key = {
+            key: attack
+            for key, attack in self._incoming_attacks_by_key.items()
+            if attack["village_id"] != village_id
+        }
+        self._dismissed_incoming_attack_ids.difference_update(
+            previous_keys - active_movement_keys
+        )
+
+        new_attacks = []
+        for attack in snapshot["attacks"]:
+            attack_key = f"{village_id}:{attack['movement_id']}"
+            self._incoming_attacks_by_key[attack_key] = attack
+            if attack_key not in self._seen_incoming_attack_ids:
+                self._seen_incoming_attack_ids.add(attack_key)
+                new_attacks.append(attack)
+
+        current_attacks = sorted(
+            (
+                attack
+                for key, attack in self._incoming_attacks_by_key.items()
+                if key not in self._dismissed_incoming_attack_ids
+            ),
+            key=lambda attack: attack["seconds_remaining"],
+        )
+        self.incoming_attacks_tab.update_attacks(
+            current_attacks,
+            observed_at,
+        )
+
+        if new_attacks:
+            details = []
+            for attack in new_attacks:
+                line = (
+                    f"{attack['attacker_name']} — "
+                    f"{attack['source_village']} → "
+                    f"{attack['village_name']} "
+                    f"({attack['movement_type']}, za "
+                    f"{IncomingAttacksWidget._format_eta(attack['seconds_remaining'])})"
+                )
+                if attack["masked"]:
+                    line += " — skład wojsk ukryty"
+                details.append(line)
+            QMessageBox.warning(
+                self,
+                "Wykryto nadchodzący atak",
+                "\n".join(details)
+                + "\n\nTo tylko ostrzeżenie. Aplikacja nie wysyła "
+                "obrony ani żadnych działań do gry.",
+            )
+
+    def _delete_incoming_attack_record(self, record_id: int):
+        if self.incoming_attack_repo is None:
+            QMessageBox.warning(
+                self,
+                "Historia ataków",
+                "Historia ataków nie jest dostępna.",
+            )
+            return
+        record = self.incoming_attack_repo.get_attack(record_id)
+        if record is None:
+            self.incoming_attacks_tab.update_history(
+                self.incoming_attack_repo.get_recent_attacks()
+            )
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "Usuń rekord ataku",
+            "Czy na pewno usunąć wybrany rekord z historii?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirmation != QMessageBox.Yes:
+            return
+        try:
+            self.incoming_attack_repo.delete_attack(record_id)
+            if record["movement_key"] in self._incoming_attacks_by_key:
+                self._dismissed_incoming_attack_ids.add(
+                    record["movement_key"]
+                )
+            self.incoming_attacks_tab.update_history(
+                self.incoming_attack_repo.get_recent_attacks()
+            )
+            current_attacks = [
+                attack
+                for key, attack in self._incoming_attacks_by_key.items()
+                if key not in self._dismissed_incoming_attack_ids
+            ]
+            self.incoming_attacks_tab.update_attacks(
+                current_attacks,
+                datetime.now(),
+            )
+        except Exception as error:
+            logger.exception("Could not delete incoming attack history record")
+            QMessageBox.warning(
+                self,
+                "Błąd historii ataków",
+                f"Nie udało się usunąć wybranego rekordu: {error}",
+            )
+
+    def _on_village_names_update(self, village_names: dict):
+        if self.incoming_attack_repo is None:
+            return
+        try:
+            resolved_count = self.incoming_attack_repo.resolve_source_village_names(
+                village_names,
+                datetime.now(),
+            )
+            if resolved_count:
+                self.incoming_attacks_tab.update_history(
+                    self.incoming_attack_repo.get_recent_attacks()
+                )
+                self.incoming_attacks_tab.update_attacks(
+                    [
+                        attack
+                        for key, attack in self._incoming_attacks_by_key.items()
+                        if key not in self._dismissed_incoming_attack_ids
+                    ],
+                    datetime.now(),
+                )
+        except Exception as error:
+            logger.exception("Could not update incoming attack village names")
+            QMessageBox.warning(
+                self,
+                "Błąd mapowania wioski",
+                f"Nie udało się zaktualizować nazw wiosek w historii: {error}",
             )
 
     def _update_recruitment_queues(
@@ -3341,13 +3803,16 @@ class MainWindow(QMainWindow):
         self.troops_refresh_timer.stop()
         self.recruitment_queue_timer.stop()
         self.resource_milling_timer.stop()
+        self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
+            self.browser_session.stop_incoming_attack_listener()
             self.browser_session.disconnect()
             self.browser_session = None
         self.dashboard_tab.connect_button.setEnabled(True)
         self.dashboard_tab.disconnect_button.setEnabled(False)
         self.dashboard_tab.refresh_troops_btn.setEnabled(False)
         self.dashboard_tab.connection_status.setText("Nie połączono z grą")
+        self.incoming_attacks_tab.set_disconnected()
         self.dashboard_tab.clear_live_state()
         self.dashboard_tab.clear_recruitment_queues()
         self.recruitment_tab.clear_recruitment_queues()
@@ -3493,6 +3958,7 @@ class TravelAssistantApp(QApplication):
         self.account_repo = AccountRepository(self.db)
         self.village_repo = VillageRepository(self.db)
         self.attack_repo = AttackLogRepository(self.db)
+        self.incoming_attack_repo = IncomingAttackRepository(self.db)
         
         # Initialize core services
         self.account_mgr = AccountManager(self.account_repo)
@@ -3503,6 +3969,7 @@ class TravelAssistantApp(QApplication):
             self.settings,
             self.account_mgr,
             self.village_tracker,
+            self.incoming_attack_repo,
         )
         self.window.show()
         if self.db.backup_is_due(backup_interval_hours):

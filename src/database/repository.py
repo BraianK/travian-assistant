@@ -242,3 +242,281 @@ class AttackLogRepository(Repository):
             LIMIT :limit
         """
         return self._execute(query, {"limit": limit})
+
+
+class IncomingAttackRepository(Repository):
+    """Persist incoming attack observations and their final state."""
+
+    @staticmethod
+    def _decode_row(row: dict) -> dict:
+        return {
+            **row,
+            "details": json.loads(row["details"]),
+            "event_log": json.loads(row["event_log"]),
+        }
+
+    def record_attack(self, attack: dict, observed_at: datetime) -> int:
+        """Insert or refresh one live movement without losing its first-seen time."""
+        target_village_id = str(attack["village_id"])
+        movement_id = str(attack["movement_id"])
+        movement_key = f"{target_village_id}:{movement_id}"
+        now = observed_at.isoformat()
+        details = dict(attack)
+        details.pop("seconds_remaining", None)
+        details_json = json.dumps(details, ensure_ascii=False)
+        existing_rows = self.db.execute_raw(
+            """
+                SELECT id, status, details, event_log
+                FROM incoming_attack_logs
+                WHERE movement_key = :movement_key
+            """,
+            {"movement_key": movement_key},
+        )
+
+        if existing_rows:
+            existing = existing_rows[0]
+            events = json.loads(existing["event_log"])
+            previous_details = json.loads(existing["details"])
+            status = "incoming"
+            if existing["status"] != status:
+                events.append({
+                    "event": "detected_again",
+                    "timestamp": now,
+                    "status": status,
+                })
+            elif previous_details != details:
+                events.append({
+                    "event": "details_updated",
+                    "timestamp": now,
+                    "status": status,
+                })
+            self.db.execute_raw(
+                """
+                    UPDATE incoming_attack_logs SET
+                        movement_id = :movement_id,
+                        target_village_name = :target_village_name,
+                        attacker_name = :attacker_name,
+                        source_village_id = :source_village_id,
+                        source_village_name = :source_village_name,
+                        movement_type = :movement_type,
+                        arrival_time = :arrival_time,
+                        masked = :masked,
+                        status = :status,
+                        last_seen_at = :last_seen_at,
+                        resolved_at = NULL,
+                        details = :details,
+                        event_log = :event_log
+                    WHERE id = :id
+                """,
+                {
+                    "id": existing["id"],
+                    "movement_id": movement_id,
+                    "target_village_name": attack["village_name"],
+                    "attacker_name": attack["attacker_name"],
+                    "source_village_id": attack.get("source_village_id"),
+                    "source_village_name": attack["source_village"],
+                    "movement_type": attack["movement_type"],
+                    "arrival_time": float(attack["arrival_time"]),
+                    "masked": int(bool(attack["masked"])),
+                    "status": status,
+                    "last_seen_at": now,
+                    "details": details_json,
+                    "event_log": json.dumps(events, ensure_ascii=False),
+                },
+            )
+            return int(existing["id"])
+
+        events = [{
+            "event": "detected",
+            "timestamp": now,
+            "status": "incoming",
+        }]
+        self.db.execute_raw(
+            """
+                INSERT INTO incoming_attack_logs (
+                    movement_key, movement_id, target_village_id,
+                    target_village_name, attacker_name, source_village_id,
+                    source_village_name, movement_type, arrival_time, masked,
+                    status, first_detected_at, last_seen_at, resolved_at,
+                    details, event_log
+                ) VALUES (
+                    :movement_key, :movement_id, :target_village_id,
+                    :target_village_name, :attacker_name, :source_village_id,
+                    :source_village_name, :movement_type, :arrival_time, :masked,
+                    :status, :first_detected_at, :last_seen_at, :resolved_at,
+                    :details, :event_log
+                )
+            """,
+            {
+                "movement_key": movement_key,
+                "movement_id": movement_id,
+                "target_village_id": target_village_id,
+                "target_village_name": attack["village_name"],
+                "attacker_name": attack["attacker_name"],
+                "source_village_id": attack.get("source_village_id"),
+                "source_village_name": attack["source_village"],
+                "movement_type": attack["movement_type"],
+                "arrival_time": float(attack["arrival_time"]),
+                "masked": int(bool(attack["masked"])),
+                "status": "incoming",
+                "first_detected_at": now,
+                "last_seen_at": now,
+                "resolved_at": None,
+                "details": details_json,
+                "event_log": json.dumps(events, ensure_ascii=False),
+            },
+        )
+        return int(self.db.execute_raw(
+            """
+                SELECT id FROM incoming_attack_logs
+                WHERE movement_key = :movement_key
+            """,
+            {"movement_key": movement_key},
+        )[0]["id"])
+
+    def reconcile_village(
+        self,
+        village_id: str,
+        active_movement_keys: set[str],
+        server_time: float,
+        observed_at: datetime,
+    ) -> None:
+        """Mark previously live movements that disappeared from a village snapshot."""
+        rows = self.db.execute_raw(
+            """
+                SELECT id, movement_key, arrival_time, event_log
+                FROM incoming_attack_logs
+                WHERE target_village_id = :village_id AND status = 'incoming'
+            """,
+            {"village_id": village_id},
+        )
+        now = observed_at.isoformat()
+        for row in rows:
+            if row["movement_key"] in active_movement_keys:
+                continue
+            status = (
+                "withdrawn"
+                if float(server_time) < float(row["arrival_time"])
+                else "arrived"
+            )
+            events = json.loads(row["event_log"])
+            events.append({
+                "event": status,
+                "timestamp": now,
+                "status": status,
+            })
+            self.db.execute_raw(
+                """
+                    UPDATE incoming_attack_logs SET
+                        status = :status,
+                        resolved_at = :resolved_at,
+                        event_log = :event_log
+                    WHERE id = :id
+                """,
+                {
+                    "id": row["id"],
+                    "status": status,
+                    "resolved_at": now,
+                    "event_log": json.dumps(events, ensure_ascii=False),
+                },
+            )
+
+    def get_recent_attacks(self) -> list[dict]:
+        """Return the complete incoming movement history, newest first."""
+        rows = self.db.execute_raw(
+            """
+                SELECT * FROM incoming_attack_logs
+                ORDER BY first_detected_at DESC, id DESC
+            """
+        )
+        return [self._decode_row(row) for row in rows]
+
+    def resolve_source_village_names(
+        self,
+        village_names: dict[str, str],
+        observed_at: datetime,
+    ) -> int:
+        """Fill in source names for previously recorded movements."""
+        updated_count = 0
+        now = observed_at.isoformat()
+        unresolved_rows = self.db.execute_raw(
+            """
+                SELECT DISTINCT source_village_id
+                FROM incoming_attack_logs
+                WHERE source_village_name = ''
+                    OR source_village_name = 'Nieznana wioska'
+                    OR source_village_name = 'Wioska ' || source_village_id
+            """
+        )
+        unresolved_ids = {
+            str(row["source_village_id"])
+            for row in unresolved_rows
+            if row["source_village_id"]
+        }
+        for village_id, village_name in village_names.items():
+            village_id = str(village_id)
+            village_name = str(village_name).strip()
+            if (
+                village_id not in unresolved_ids
+                or not village_id.isdigit()
+                or not village_name
+            ):
+                continue
+            rows = self.db.execute_raw(
+                """
+                    SELECT id, source_village_name, details, event_log
+                    FROM incoming_attack_logs
+                    WHERE source_village_id = :village_id
+                """,
+                {"village_id": village_id},
+            )
+            for row in rows:
+                expected_fallback = f"Wioska {village_id}"
+                if row["source_village_name"] not in (
+                    "",
+                    "Nieznana wioska",
+                    expected_fallback,
+                ):
+                    continue
+                details = json.loads(row["details"])
+                details["source_village"] = village_name
+                events = json.loads(row["event_log"])
+                events.append({
+                    "event": "source_village_resolved",
+                    "timestamp": now,
+                    "village_id": village_id,
+                    "village_name": village_name,
+                })
+                self.db.execute_raw(
+                    """
+                        UPDATE incoming_attack_logs SET
+                            source_village_name = :village_name,
+                            details = :details,
+                            event_log = :event_log
+                        WHERE id = :id
+                    """,
+                    {
+                        "id": row["id"],
+                        "village_name": village_name,
+                        "details": json.dumps(details, ensure_ascii=False),
+                        "event_log": json.dumps(events, ensure_ascii=False),
+                    },
+                )
+                updated_count += 1
+        return updated_count
+
+    def get_attack(self, record_id: int) -> dict | None:
+        """Return one history record by its local database ID."""
+        rows = self.db.execute_raw(
+            "SELECT * FROM incoming_attack_logs WHERE id = :id",
+            {"id": record_id},
+        )
+        return self._decode_row(rows[0]) if rows else None
+
+    def delete_attack(self, record_id: int) -> bool:
+        """Delete exactly one history record."""
+        self.db.execute_raw(
+            "DELETE FROM incoming_attack_logs WHERE id = :id",
+            {"id": record_id},
+        )
+        return True
