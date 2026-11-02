@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "travian-assistant"
+version = "0.1.0"
+description = "Local desktop assistant for tracking villages and resources in Travian Kingdoms"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.6.0",
+    "SQLAlchemy>=2.0.0",
+    "pydantic>=2.0.0",
+    "pychrome==0.2.4",
+    "matplotlib>=3.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+travian-assistant = "src.main:main"
+
+[tool.setuptools.packages.find]
+include = ["src*"]

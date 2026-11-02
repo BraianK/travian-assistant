@@ -1,0 +1,33 @@
+.env
+.env.*
+!.env.example
+
+# Local settings, game data, browser sessions, and captured network requests
+/config/settings.json
+/data/
+/src/data/
+*.devtools
+*.sqlite
+*.sqlite3
+*.db
+
+# Python environments, build output, and test artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]

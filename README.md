@@ -1,0 +1,105 @@
+# Travian Kingdoms Assistant
+
+A desktop helper for tracking village state, resources, and game activity in Travian Kingdoms.
+
+## Project status
+
+This project is currently in a functional foundation / MVP stage:
+
+- desktop UI shell is implemented,
+- browser integration reads game state and supports explicitly enabled recruitment automation,
+- database models and repositories are in place,
+- core planning analytics modules are partially implemented.
+
+## Instalacja (Windows)
+
+Wymagany jest **Python 3.12 lub nowszy**. Zainstaluj go z [python.org](https://www.python.org/downloads/windows/) i zaznacz opcję dodania Pythona do `PATH`.
+
+1. Sklonuj repozytorium i przejdź do katalogu projektu:
+
+   ```powershell
+   git clone https://github.com/BraianK/travian-assistant.git
+   cd travian-assistant
+   ```
+
+2. Utwórz środowisko wirtualne i zainstaluj aplikację wraz z zależnościami:
+
+   ```powershell
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -e .
+   ```
+
+   Alternatywnie można użyć `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
+
+3. Uruchom program z katalogu repozytorium:
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m src.main
+   ```
+
+   Aplikację można też uruchomić poleceniem `travian-assistant` po aktywowaniu środowiska `.venv`.
+
+4. W aplikacji otwórz przeglądarkę przyciskiem **Uruchom przeglądarkę**, zaloguj się ręcznie do własnego konta Travian i wybierz **Połącz**.
+
+Nie trzeba tworzyć pliku `.env` ani podawać hasła do gry aplikacji. Baza danych, ustawienia i profil przeglądarki powstają lokalnie. Automaty rekrutacji i mielenia są domyślnie wyłączone — włączaj je osobno dopiero po sprawdzeniu ustawień.
+
+### Aktualizacja
+
+W katalogu repozytorium pobierz zmiany i zaktualizuj aplikację:
+
+```powershell
+git pull
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+### Uruchomienie testów
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+## Bezpieczeństwo przy publikowaniu zmian
+
+Nie dodawaj do repozytorium plików `.env`, `config/settings.json`, katalogu `data/`, profilu przeglądarki, bazy SQLite, kopii zapasowych ani plików `*.devtools`. Mogą zawierać dane logowania, aktywną sesję, dane konta lub przechwycone żądania gry. Reguły w `.gitignore` pomijają te lokalne pliki. Przed każdym wypchnięciem sprawdź listę plików dodawanych do commita i upewnij się, że nie ma w niej lokalnych danych ani sekretów.
+
+Automatyzacja wykonuje działania w grze po ręcznym włączeniu. Używaj jej zgodnie z zasadami gry i na własną odpowiedzialność.
+
+### Pierwsze wypchnięcie kodu
+
+Zainstaluj Git for Windows, otwórz PowerShell w katalogu projektu i najpierw sprawdź ignorowane dane oraz listę plików:
+
+```powershell
+git check-ignore -v .env config/settings.json data/travian.db koszary.devtools
+git status --short
+```
+
+Jeśli lista zawiera wyłącznie kod i pliki dokumentacji, zainicjalizuj lokalne repozytorium i wypchnij je do pustego repozytorium GitHub:
+
+```powershell
+git init -b main
+git add .
+git diff --cached --stat
+git status --short
+git commit -m "Prepare Travian assistant for sharing"
+git remote add origin https://github.com/BraianK/travian-assistant.git
+git push -u origin main
+```
+
+Sprawdź `git status` przed commitem i upewnij się, że baza, profil przeglądarki, ustawienia lokalne oraz pliki przechwyconych żądań nie są dodane. Repozytorium nie zawiera obecnie pliku licencji; przed publicznym udostępnieniem kodu wybierz licencję odpowiednią do planowanego użycia.
+
+## Notes
+
+- The project uses SQLite for local state storage.
+- On startup, the dashboard restores all saved villages, their latest resource values, and the most recently captured building, resource-field, troop, and map details. Resource history is shown for the selected village.
+- Connect to the manually signed-in browser to refresh those snapshots; saved details remain available offline and represent the last successful read.
+- The village dashboard includes a per-village plan: it estimates when the next resource-field upgrade is affordable and how many Phalanx and Theutates Thunder can be paid for from current stocks. While connected to the game, it reads recruitment queues for every troop type available to each village's tribe every three minutes without changing the selected village.
+- Recruitment monitoring and automatic replenishment are available in a dedicated top-level "Rekrutacja" tab, separate from the village overview and village details.
+- Automatic recruitment is off by default. The recruitment panel detects the current village's troop types from the game's tribe configuration and displays a separate choice for each detected unit; settings are stored by unit type ID to support different tribes and preserve existing Phalanx/Theutates Thunder selections. When enabled, it adds the configured batch (default 5) when that unit's queue falls to the configured threshold (default 1) or less; threshold 0 means only an empty queue. Each village has its own automation switch; units requiring an unavailable building are disabled. The app checks resources, submits orders sequentially, and checks the game's asynchronous response before reporting success. An order is not retried until the queue rises above the configured threshold; uncertain orders remain visibly pending to avoid duplicates. The pending-order reset turns automation off and requires confirmation.
+- The recruitment tab also shows each village's recorded hourly production, estimated hourly costs for selected units under continuous training, and net hourly balance by resource. The table uses one row per village, with a column for each resource; each cell shows production, recruitment cost, and net balance per hour. Hourly cost is unit cost multiplied by units trained per hour, calculated from the game's `troop.time`, `TG_TROOP_SPEED`, and the current training-time modifier of each available barracks/stable. Parallel standard and large training buildings are included independently. If the game does not provide complete cost or duration data, or multiple selected unit types share a training building queue, costs and net balances are shown as unavailable rather than treated as zero. Production figures use the latest saved reading for each village.
+- Grain milling is available in its own "Mielenie" tab and both methods are off per village by default. The first method empties the granary when grain reaches its configured threshold (default 100%), distributing the full stock among clay/iron/wood (default 40/30/30; the shares must total 100%). The second method refills grain when it falls to its configured low threshold (default 5%), converting available stock to grain up to granary capacity; any surplus stays distributed among the other resources using the same shares. Each exchange uses the captured `premiumFeature/bookFeature` request at a cost of 5 gold; the app requires the current account balance to be at least the global reserve plus 5 (default reserve: 300) before sending. Milling is checked every 30 seconds, rechecks the threshold and gold immediately before sending, and verifies each asynchronous response before it sends another village's order. Uncertain or unconfirmed orders remain blocked to prevent duplicate gold charges.
+- While connected, the app also captures eligible JSON responses from the game's network requests, parses and normalizes supported response categories, and stores them with the relevant village for inspection.
+- SQLite is backed up automatically on startup when no recent backup exists and then at the configured interval. Backups are integrity-checked and stored next to the database in a `backups` folder; restore through `DatabaseManager.restore_backup()` first verifies the selected backup and safeguards the current database.
+- The browser connection requires a manually logged-in Travian session. Game actions are limited to recruitment orders and NPC Trader exchanges when the user explicitly enables their separate automations.
+- The app is intended as a local assistant, not as a full automated bot.
