@@ -68,7 +68,7 @@ class BaselineSmokeTests(unittest.TestCase):
                     )
                     self.assertEqual(app_root / "data", settings.data_dir)
                     self.assertEqual(
-                        str(app_root / "data" / "travian.db"),
+                        str((app_root / "data" / "travian.db").resolve()),
                         DatabaseManager._resolve_db_path("./data/travian.db"),
                     )
 
