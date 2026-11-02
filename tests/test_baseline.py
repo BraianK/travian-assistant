@@ -21,6 +21,7 @@ from src.config.settings import (
     VillageMillingSettings,
     VillageRecruitmentSettings,
 )
+from src.config.paths import get_app_data_dir, get_data_dir, get_settings_path
 from src.core.browser_session import TravianBrowserSession
 from src.interceptor.browser_cdp import ChromeCDPInterceptor
 from src.interceptor.request_filter import RequestFilter
@@ -47,6 +48,36 @@ class BaselineSmokeTests(unittest.TestCase):
 
         self.assertTrue(hasattr(src.main, "main"))
         self.assertTrue(hasattr(src.app, "TravelAssistantApp"))
+
+    def test_packaged_app_uses_per_user_data_paths_without_manual_setup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("src.config.paths.sys.frozen", True, create=True):
+                with patch.dict(os.environ, {"LOCALAPPDATA": tmpdir}):
+                    app_root = Path(tmpdir) / "Travian Kingdoms Assistant"
+                    self.assertEqual(app_root, get_app_data_dir())
+                    self.assertEqual(app_root / "data", get_data_dir())
+                    self.assertEqual(
+                        app_root / "config" / "settings.json",
+                        get_settings_path(),
+                    )
+
+                    settings = AppSettings()
+                    self.assertEqual(
+                        str(app_root / "data" / "travian.db"),
+                        settings.database.db_path,
+                    )
+                    self.assertEqual(app_root / "data", settings.data_dir)
+                    self.assertEqual(
+                        str(app_root / "data" / "travian.db"),
+                        DatabaseManager._resolve_db_path("./data/travian.db"),
+                    )
+
+                    settings.save()
+                    self.assertTrue(get_settings_path().is_file())
+                    self.assertEqual(
+                        settings.database.db_path,
+                        AppSettings.load().database.db_path,
+                    )
 
     def test_recruitment_settings_default_off_and_round_trip(self):
         settings = AppSettings()

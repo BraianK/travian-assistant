@@ -1,0 +1,66 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install application and packager
+        run: python -m pip install ".[build]"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build Windows application
+        run: >-
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --windowed
+          --onedir
+          --name TravianAssistant
+          --paths .
+          src/main.py
+
+      - name: Add quick-start instructions and archive
+        shell: pwsh
+        run: |
+          Copy-Item packaging\README-Windows.txt dist\TravianAssistant\README.txt
+          Compress-Archive `
+            -Path dist\TravianAssistant `
+            -DestinationPath dist\TravianAssistant-Windows-x64.zip
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: TravianAssistant-Windows-x64
+          path: dist/TravianAssistant-Windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          "dist/TravianAssistant-Windows-x64.zip"
+          --title "Travian Assistant ${{ github.ref_name }}"
+          --generate-notes

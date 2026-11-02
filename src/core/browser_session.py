@@ -19,8 +19,10 @@ import pychrome
 
 try:
     from src.interceptor.request_filter import RequestFilter
+    from src.config.paths import get_data_dir
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from interceptor.request_filter import RequestFilter
+    from config.paths import get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -2690,7 +2692,6 @@ def launch_chrome_for_game(address: str, port: int) -> None:
     """Open a Chromium browser with an isolated profile and loopback-only CDP."""
     cdp_url = _cdp_url(address, port)
     resolved_port = urlsplit(cdp_url).port
-    root = Path(__file__).resolve().parents[2]
     local_app_data = os.environ.get("LOCALAPPDATA", "")
     program_files = os.environ.get("PROGRAMFILES", "")
     program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "")
@@ -2756,7 +2757,7 @@ def launch_chrome_for_game(address: str, port: int) -> None:
             "Sprawdź, czy przeglądarka jest zainstalowana."
         )
 
-    profile_dir = root / "data" / "travian-browser-profile"
+    profile_dir = get_data_dir() / "travian-browser-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     subprocess.Popen(

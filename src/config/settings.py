@@ -3,10 +3,14 @@
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
+
+try:
+    from src.config.paths import get_data_dir, get_settings_path
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from config.paths import get_data_dir, get_settings_path
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -35,7 +39,10 @@ class BrowserSettings(BaseModel):
 
 class DatabaseSettings(BaseModel):
     """Database connection settings."""
-    db_path: str = Field(default="./data/travian.db", description="Path to SQLite database file")
+    db_path: str = Field(
+        default_factory=lambda: str(get_data_dir() / "travian.db"),
+        description="Path to SQLite database file",
+    )
     backup_interval_hours: int = Field(default=24, description="Auto-backup interval in hours")
 
 
@@ -132,7 +139,7 @@ class AppSettings(BaseModel):
     )
     
     # Data directory
-    data_dir: Path = Field(default=Path("./data"), repr=False)
+    data_dir: Path = Field(default_factory=get_data_dir, repr=False)
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -143,17 +150,19 @@ class AppSettings(BaseModel):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "backups").mkdir(exist_ok=True)
     
-    def save(self, filepath: str = "./config/settings.json"):
+    def save(self, filepath: str | Path | None = None):
         """Save settings to JSON file."""
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w") as f:
+        settings_path = Path(filepath) if filepath is not None else get_settings_path()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings_path, "w", encoding="utf-8") as f:
             f.write(self.model_dump_json(indent=2))
     
     @classmethod
-    def load(cls, filepath: str = "./config/settings.json") -> "AppSettings":
+    def load(cls, filepath: str | Path | None = None) -> "AppSettings":
         """Load settings from JSON file."""
-        if os.path.exists(filepath):
-            with open(filepath, "r") as f:
+        settings_path = Path(filepath) if filepath is not None else get_settings_path()
+        if settings_path.exists():
+            with open(settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return cls(**data)
         return cls()

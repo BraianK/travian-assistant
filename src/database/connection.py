@@ -11,6 +11,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, Session
 
+try:
+    from src.config.paths import get_app_data_dir
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from config.paths import get_app_data_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,8 +29,7 @@ class DatabaseManager:
         if candidate.is_absolute():
             return str(candidate)
 
-        project_root = Path(__file__).resolve().parents[2]
-        resolved = (project_root / candidate).resolve()
+        resolved = (get_app_data_dir() / candidate).resolve()
         return str(resolved)
 
     def __init__(self, db_path: str = "./data/travian.db"):

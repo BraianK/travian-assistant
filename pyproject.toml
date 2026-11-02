@@ -16,6 +16,11 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.10",
+]
+
 [project.scripts]
 travian-assistant = "src.main:main"
 

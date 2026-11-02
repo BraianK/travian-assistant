@@ -2,19 +2,18 @@
 
 import sys
 import logging
-from pathlib import Path
-
-from PySide6.QtWidgets import QApplication
 
 try:
     from src.app import TravelAssistantApp
+    from src.config.paths import get_data_dir
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from app import TravelAssistantApp
+    from config.paths import get_data_dir
 
 
 def setup_logging():
     """Configure logging for the application."""
-    log_path = Path(__file__).parent.parent / "data" / "travian.log"
+    log_path = get_data_dir() / "travian.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
     logging.basicConfig(

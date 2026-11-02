@@ -11,7 +11,23 @@ This project is currently in a functional foundation / MVP stage:
 - database models and repositories are in place,
 - core planning analytics modules are partially implemented.
 
-## Instalacja (Windows)
+## Gotowa aplikacja Windows
+
+Użytkownik nie musi instalować Pythona ani konfigurować bazy danych. Pobierz
+`TravianAssistant-Windows-x64.zip` z [GitHub Releases](https://github.com/BraianK/travian-assistant/releases),
+rozpakuj cały folder i uruchom `TravianAssistant.exe`. Następnie kliknij
+**Uruchom przeglądarkę**, zaloguj się ręcznie do Traviana i wybierz **Połącz**.
+Wymagana jest zainstalowana przeglądarka Chrome, Edge, Opera lub Opera GX.
+
+SQLite, ustawienia, logi, kopie zapasowe i dedykowany profil przeglądarki
+tworzą się automatycznie w `%LOCALAPPDATA%\Travian Kingdoms Assistant`.
+Nie usuwaj ani nie udostępniaj tego folderu — profil zawiera prywatną sesję
+gry. Paczka wymaga rozpakowania; nie przenoś samego pliku `.exe` poza folder.
+
+Wydanie powstaje automatycznie z taga `v*` przez workflow Windows release.
+Ręczne uruchomienie workflow buduje tę samą paczkę jako artefakt do pobrania.
+
+## Instalacja ze źródeł (Windows)
 
 Wymagany jest **Python 3.12 lub nowszy**. Zainstaluj go z [python.org](https://www.python.org/downloads/windows/) i zaznacz opcję dodania Pythona do `PATH`.
 
