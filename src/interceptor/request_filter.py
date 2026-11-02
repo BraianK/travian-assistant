@@ -118,9 +118,21 @@ class RequestFilter:
                 request_data = json.loads(request_body)
             except (TypeError, ValueError):
                 return False
+            if not isinstance(request_data, dict):
+                return False
+            if (
+                request_data.get("controller") == "cache"
+                and request_data.get("action") == "get"
+            ):
+                params = request_data.get("params")
+                names = params.get("names") if isinstance(params, dict) else None
+                return isinstance(names, list) and any(
+                    isinstance(name, str)
+                    and re.fullmatch(r"Village:\d+", name)
+                    for name in names
+                )
             return (
-                isinstance(request_data, dict)
-                and request_data.get("controller") == "map"
+                request_data.get("controller") == "map"
                 and request_data.get("action") == "getByRegionIds"
             )
         return category in api_categories

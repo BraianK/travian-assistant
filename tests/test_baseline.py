@@ -2066,6 +2066,24 @@ class BaselineSmokeTests(unittest.TestCase):
                 "action": "ping",
             }),
         ))
+        self.assertTrue(request_filter.should_capture_response(
+            "https://tr2nx3.kingdoms.com/api/",
+            "POST",
+            json.dumps({
+                "controller": "cache",
+                "action": "get",
+                "params": {"names": ["Village:538034204"]},
+            }),
+        ))
+        self.assertFalse(request_filter.should_capture_response(
+            "https://tr2nx3.kingdoms.com/api/",
+            "POST",
+            json.dumps({
+                "controller": "cache",
+                "action": "get",
+                "params": {"names": ["Player:275", "Collection:FieldMarkerGlobal:1"]},
+            }),
+        ))
         self.assertFalse(request_filter.should_capture_response(
             "https://tr2nx3.kingdoms.com/api/",
             "POST",
