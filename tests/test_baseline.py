@@ -124,6 +124,9 @@ class BaselineSmokeTests(unittest.TestCase):
                 enabled=True,
                 units={"24"},
                 queue_minutes_by_unit={"24": 10},
+                queue_strategy="count",
+                batch_size=12,
+                queue_threshold=0,
             )
             settings.resource_milling.villages["101"] = VillageMillingSettings(
                 enabled=True,
@@ -165,6 +168,12 @@ class BaselineSmokeTests(unittest.TestCase):
                 {"24": 10},
                 restored.recruitment.villages["202"].queue_minutes_by_unit,
             )
+            # Village 101 inherits account-wide rules, 202 overrides them.
+            self.assertEqual("duration", restored.recruitment.strategy_for("101"))
+            self.assertEqual(8, restored.recruitment.batch_size_for("101"))
+            self.assertEqual("count", restored.recruitment.strategy_for("202"))
+            self.assertEqual(12, restored.recruitment.batch_size_for("202"))
+            self.assertEqual(0, restored.recruitment.queue_threshold_for("202"))
             milling = restored.resource_milling
             self.assertEqual(450, milling.minimum_gold_balance)
             self.assertTrue(milling.villages["101"].enabled)
@@ -191,6 +200,12 @@ class BaselineSmokeTests(unittest.TestCase):
             AppSettings(recruitment={"queue_strategy": "unknown"})
         with self.assertRaises(ValueError):
             VillageRecruitmentSettings(queue_minutes_by_unit={"21": 1441})
+        with self.assertRaises(ValueError):
+            VillageRecruitmentSettings(batch_size=0)
+        with self.assertRaises(ValueError):
+            VillageRecruitmentSettings(queue_threshold=101)
+        with self.assertRaises(ValueError):
+            VillageRecruitmentSettings(queue_strategy="unknown")
         with self.assertRaises(ValueError):
             VillageMillingSettings(trigger_percent=101)
         with self.assertRaises(ValueError):
@@ -361,13 +376,10 @@ class BaselineSmokeTests(unittest.TestCase):
                 self.assertFalse(
                     window.recruitment_tab.auto_recruitment_checkbox.isChecked()
                 )
-                self.assertEqual(
-                    5,
-                    window.recruitment_tab.auto_recruitment_batch_size.value(),
-                )
+                self.assertEqual(5, window.settings.recruitment.batch_size_for("101"))
                 self.assertEqual(
                     1,
-                    window.recruitment_tab.auto_recruitment_threshold.value(),
+                    window.settings.recruitment.queue_threshold_for("101"),
                 )
                 self.assertEqual(
                     "Rekrutacja",
@@ -1750,6 +1762,7 @@ class BaselineSmokeTests(unittest.TestCase):
             "101": VillageRecruitmentSettings(
                 units={"21"},
                 queue_minutes_by_unit={"21": 60},
+                queue_strategy="duration",
             ),
             "202": VillageRecruitmentSettings(
                 units={"24"},
@@ -1781,8 +1794,6 @@ class BaselineSmokeTests(unittest.TestCase):
             ],
             village_settings,
         )
-        recruitment_tab.set_recruitment_strategy("duration")
-
         self.assertTrue(
             recruitment_tab.village_recruitment_controls["101"]["21"].isChecked()
         )
@@ -1801,14 +1812,21 @@ class BaselineSmokeTests(unittest.TestCase):
             10,
             recruitment_tab.village_queue_duration_controls["202"]["24"].value(),
         )
-        self.assertFalse(
-            recruitment_tab.auto_recruitment_batch_size.isHidden()
-        )
-        self.assertTrue(
-            recruitment_tab.auto_recruitment_threshold.isHidden()
-        )
+        # Village 101 uses queue duration, village 202 inherits fixed batches.
+        self.assertEqual("duration", recruitment_tab.village_strategy("101"))
+        self.assertEqual("count", recruitment_tab.village_strategy("202"))
+        rules_101 = recruitment_tab.village_rule_controls["101"]
+        rules_202 = recruitment_tab.village_rule_controls["202"]
+        self.assertTrue(rules_101["duration"].isChecked())
+        self.assertTrue(rules_101["threshold"].isHidden())
+        self.assertFalse(rules_101["batch"].isHidden())
         self.assertFalse(
             recruitment_tab.village_queue_duration_controls["101"]["21"].isHidden()
+        )
+        self.assertTrue(rules_202["count"].isChecked())
+        self.assertFalse(rules_202["threshold"].isHidden())
+        self.assertTrue(
+            recruitment_tab.village_queue_duration_controls["202"]["24"].isHidden()
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1917,9 +1935,20 @@ class BaselineSmokeTests(unittest.TestCase):
                         tab.village_queue_duration_controls["101"]["21"].isHidden()
                     )
 
-                    tab.duration_strategy_button.click()
-                    self.assertEqual("duration", settings.recruitment.queue_strategy)
-                    self.assertTrue(tab.auto_recruitment_threshold.isHidden())
+                    rules = tab.village_rule_controls["101"]
+                    rules["threshold"].setValue(7)
+                    rules["batch"].setValue(12)
+                    self.assertEqual(7, settings.recruitment.queue_threshold_for("101"))
+                    self.assertEqual(12, settings.recruitment.batch_size_for("101"))
+                    self.assertEqual(1, settings.recruitment.queue_threshold)
+
+                    rules["duration"].click()
+                    self.assertEqual(
+                        "duration",
+                        settings.recruitment.villages["101"].queue_strategy,
+                    )
+                    self.assertEqual("count", settings.recruitment.queue_strategy)
+                    self.assertTrue(rules["threshold"].isHidden())
                     self.assertFalse(
                         tab.village_queue_duration_controls["101"]["21"].isHidden()
                     )
@@ -1943,6 +1972,19 @@ class BaselineSmokeTests(unittest.TestCase):
                         "wyłączony",
                         tab.village_summary_labels["101"].text(),
                     )
+
+                    window._render_village_recruitment_settings([
+                        {"id": "101", "name": "Testonia", "recruitment_units": []},
+                        {"id": "202", "name": "Secondonia", "recruitment_units": []},
+                    ])
+                    self.assertEqual("count", tab.village_strategy("202"))
+                    tab.village_rule_controls["101"]["copy"].click()
+                    copied = settings.recruitment.villages["202"]
+                    self.assertEqual("duration", copied.queue_strategy)
+                    self.assertEqual(12, copied.batch_size)
+                    self.assertEqual(7, copied.queue_threshold)
+                    self.assertEqual(set(), copied.units)
+                    self.assertEqual("duration", tab.village_strategy("202"))
             finally:
                 window.close()
                 db.close()

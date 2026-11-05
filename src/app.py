@@ -20,11 +20,12 @@ from PySide6.QtWidgets import (
     QGridLayout, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon
 
 try:
     from src.config.settings import (
         AppSettings,
+        RecruitmentSettings,
         VillageMillingSettings,
         VillageRecruitmentSettings,
     )
@@ -52,6 +53,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from config.settings import (
         AppSettings,
+        RecruitmentSettings,
         VillageMillingSettings,
         VillageRecruitmentSettings,
     )
@@ -245,6 +247,24 @@ QLabel#villageName {
 }
 QCheckBox#unitUnselected {
     color: #64748b;
+}
+QFrame#ruleStrip {
+    background: #f6f8fb;
+    border: 1px solid #e6ebf1;
+    border-radius: 8px;
+}
+QFrame#ruleStrip QLabel {
+    background: transparent;
+}
+QPushButton#linkButton {
+    background: transparent;
+    border: none;
+    color: #2563eb;
+    padding: 4px 6px;
+}
+QPushButton#linkButton:hover {
+    color: #1d4ed8;
+    text-decoration: underline;
 }
 QLabel#fieldLabel {
     color: #475569;
@@ -1204,12 +1224,16 @@ class RecruitmentWidget(QWidget):
     village_enabled_toggled = Signal(str, bool)
     unit_toggled = Signal(str, str, bool)
     queue_minutes_changed = Signal(str, str, int)
-    strategy_changed = Signal(str)
+    village_strategy_changed = Signal(str, str)
+    village_batch_changed = Signal(str, int)
+    village_threshold_changed = Signal(str, int)
+    village_rule_copy_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._recruitment_pending_keys: set[str] = set()
         self._settings_by_village: dict = {}
+        self._recruitment_defaults = RecruitmentSettings()
         self._villages: dict[str, dict] = {}
         self._queue_rows: dict[tuple[str, str], dict] = {}
         self._economics: dict[str, dict] = {}
@@ -1218,9 +1242,10 @@ class RecruitmentWidget(QWidget):
         self.unit_rows: dict[tuple[str, str], dict] = {}
         self.village_summary_labels: dict[str, QLabel] = {}
         self.village_economics_labels: dict[str, dict[str, QLabel]] = {}
-        self._target_column_widgets: list[QWidget] = []
-        self._unit_grids: list[QGridLayout] = []
-        self._strategy = "count"
+        self.village_rule_controls: dict[str, dict[str, QWidget]] = {}
+        self._village_strategy: dict[str, str] = {}
+        self._village_target_headers: dict[str, QLabel] = {}
+        self._village_grids: dict[str, QGridLayout] = {}
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -1275,63 +1300,14 @@ class RecruitmentWidget(QWidget):
         )
         top_row.addWidget(self.auto_recruitment_checkbox)
         top_row.addSpacing(10)
-        mode_label = QLabel("Sposób uzupełniania:")
-        mode_label.setObjectName("fieldLabel")
-        top_row.addWidget(mode_label)
-        self.count_strategy_button = QPushButton("Stała partia")
-        self.count_strategy_button.setObjectName("segmentLeft")
-        self.duration_strategy_button = QPushButton("Docelowy czas kolejki")
-        self.duration_strategy_button.setObjectName("segmentRight")
-        self._strategy_buttons = {
-            "count": self.count_strategy_button,
-            "duration": self.duration_strategy_button,
-        }
-        segment_layout = QHBoxLayout()
-        segment_layout.setSpacing(0)
-        for strategy, button in self._strategy_buttons.items():
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.setMinimumWidth(
-                button.fontMetrics().horizontalAdvance(button.text()) + 44
-            )
-            button.clicked.connect(
-                lambda _checked=False, value=strategy:
-                    self._choose_strategy(value)
-            )
-            segment_layout.addWidget(button)
-        self.count_strategy_button.setChecked(True)
-        top_row.addLayout(segment_layout)
-        top_row.addStretch()
-        automation_layout.addLayout(top_row)
-
-        rule_row = QHBoxLayout()
-        rule_row.setSpacing(8)
-        self._rule_prefix = QLabel()
-        rule_row.addWidget(self._rule_prefix)
-        self.auto_recruitment_threshold = QSpinBox()
-        self.auto_recruitment_threshold.setRange(0, 100)
-        self.auto_recruitment_threshold.setSuffix(" szt.")
-        self.auto_recruitment_threshold.setFixedWidth(90)
-        self.auto_recruitment_threshold.setToolTip(
-            "Wartość 0 oznacza: uzupełniaj dopiero, gdy kolejka jest pusta."
+        automation_hint = QLabel(
+            "Sposób uzupełniania — <b>stałą partię</b> albo <b>docelowy czas "
+            "kolejki</b> — ustawiasz osobno w karcie każdej wioski."
         )
-        rule_row.addWidget(self.auto_recruitment_threshold)
-        self._rule_middle = QLabel("lub mniej — dodaj")
-        rule_row.addWidget(self._rule_middle)
-        self.auto_recruitment_batch_size = QSpinBox()
-        self.auto_recruitment_batch_size.setRange(1, 100)
-        self.auto_recruitment_batch_size.setSuffix(" jedn.")
-        self.auto_recruitment_batch_size.setFixedWidth(100)
-        rule_row.addWidget(self.auto_recruitment_batch_size)
-        self._rule_suffix = QLabel()
-        rule_row.addWidget(self._rule_suffix)
-        rule_row.addStretch()
-        automation_layout.addLayout(rule_row)
-
-        self._strategy_hint = QLabel()
-        self._strategy_hint.setObjectName("secondaryText")
-        self._strategy_hint.setWordWrap(True)
-        automation_layout.addWidget(self._strategy_hint)
+        automation_hint.setObjectName("secondaryText")
+        automation_hint.setWordWrap(True)
+        top_row.addWidget(automation_hint, stretch=1)
+        automation_layout.addLayout(top_row)
         layout.addWidget(automation_card)
 
         # Pending orders banner ----------------------------------------------
@@ -1388,51 +1364,65 @@ class RecruitmentWidget(QWidget):
         layout.addWidget(self.recruitment_economics_status)
         layout.addStretch()
 
-        self._apply_recruitment_strategy_visibility()
+    # Per-village rules ------------------------------------------------------
+    def bind_settings(self, recruitment_settings: RecruitmentSettings):
+        """Use account-wide values as defaults for villages without overrides."""
+        self._recruitment_defaults = recruitment_settings
+        self._settings_by_village = recruitment_settings.villages
 
-    # Strategy ---------------------------------------------------------------
-    def recruitment_strategy(self) -> str:
-        return self._strategy
+    def _effective_rule(self, village_id: str, field: str):
+        village_settings = self._settings_by_village.get(village_id)
+        value = (
+            getattr(village_settings, field)
+            if village_settings is not None
+            else None
+        )
+        return getattr(self._recruitment_defaults, field) if value is None else value
 
-    def set_recruitment_strategy(self, strategy: str):
-        self._strategy = strategy if strategy in self._strategy_buttons else "count"
-        for value, button in self._strategy_buttons.items():
-            button.setChecked(value == self._strategy)
-        self._apply_recruitment_strategy_visibility()
+    def village_strategy(self, village_id: str) -> str:
+        return self._village_strategy.get(
+            village_id,
+            self._effective_rule(village_id, "queue_strategy"),
+        )
 
-    def _choose_strategy(self, strategy: str):
-        previous = self._strategy
-        self.set_recruitment_strategy(strategy)
+    def set_village_strategy(self, village_id: str, strategy: str):
+        """Show a village's mode without emitting change signals."""
+        if strategy not in ("count", "duration"):
+            strategy = "count"
+        self._village_strategy[village_id] = strategy
+        controls = self.village_rule_controls.get(village_id)
+        if controls is not None:
+            controls["count"].setChecked(strategy == "count")
+            controls["duration"].setChecked(strategy == "duration")
+        self._apply_village_strategy(village_id)
+
+    def _choose_village_strategy(self, village_id: str, strategy: str):
+        previous = self.village_strategy(village_id)
+        self.set_village_strategy(village_id, strategy)
         if previous != strategy:
-            self.strategy_changed.emit(strategy)
+            self.village_strategy_changed.emit(village_id, strategy)
 
-    def _apply_recruitment_strategy_visibility(self, *_args):
-        duration = self.recruitment_strategy() == "duration"
-        self.auto_recruitment_threshold.setHidden(duration)
-        self._rule_middle.setHidden(duration)
-        if duration:
-            self._rule_prefix.setText(
-                "Dobieraj liczbę jednostek do celu ustawionego przy "
-                "jednostce, maksymalnie"
+    def _apply_village_strategy(self, village_id: str):
+        controls = self.village_rule_controls.get(village_id)
+        duration = self.village_strategy(village_id) == "duration"
+        if controls is not None:
+            controls["threshold"].setHidden(duration)
+            controls["middle"].setHidden(duration)
+            controls["prefix"].setText(
+                "Uzupełniaj do celu z kolumny „Cel”, maks."
+                if duration else "Gdy w kolejce zostanie"
             )
-            self._rule_suffix.setText("w jednym zleceniu.")
-            self._strategy_hint.setText(
-                "Cel (w minutach) ustawiasz osobno dla każdej jednostki "
-                "w karcie wioski. Automat dodaje tylko brakujący czas kolejki."
-            )
-        else:
-            self._rule_prefix.setText("Gdy w kolejce zostanie")
-            self._rule_suffix.setText("")
-            self._strategy_hint.setText(
-                "Zlecenie zostanie wysłane tylko, gdy wioska ma surowce "
-                "na całą partię."
-            )
-        for widget in self._target_column_widgets:
-            widget.setHidden(not duration)
-        for grid in self._unit_grids:
+            controls["suffix"].setText("na zlecenie." if duration else "")
+            controls["suffix"].setHidden(not duration)
+        header = self._village_target_headers.get(village_id)
+        if header is not None:
+            header.setHidden(not duration)
+        grid = self._village_grids.get(village_id)
+        if grid is not None:
             grid.setColumnMinimumWidth(4, 105 if duration else 0)
-        for key in self.unit_rows:
-            self._refresh_unit_row(*key)
+        for row_village_id, unit_id in self.unit_rows:
+            if row_village_id == village_id:
+                self._refresh_unit_row(village_id, unit_id)
 
     # Village cards ----------------------------------------------------------
     def update_village_recruitment_settings(
@@ -1519,8 +1509,10 @@ class RecruitmentWidget(QWidget):
         self.unit_rows.clear()
         self.village_summary_labels.clear()
         self.village_economics_labels.clear()
-        self._target_column_widgets.clear()
-        self._unit_grids.clear()
+        self.village_rule_controls.clear()
+        self._village_strategy.clear()
+        self._village_target_headers.clear()
+        self._village_grids.clear()
 
         if not self._villages:
             self.village_cards_layout.addWidget(
@@ -1533,7 +1525,7 @@ class RecruitmentWidget(QWidget):
             self.village_cards_layout.addWidget(
                 self._build_village_card(village_id, village)
             )
-        self._apply_recruitment_strategy_visibility()
+            self._apply_village_strategy(village_id)
         self._apply_queue_rows()
         self._apply_economics()
 
@@ -1567,11 +1559,17 @@ class RecruitmentWidget(QWidget):
         header.addWidget(enabled)
         card_layout.addLayout(header)
         self.village_summary_labels[village_id] = summary
+        card_layout.addWidget(self._build_rule_strip(village_id))
+        header.insertWidget(
+            header.count() - 1,
+            self.village_rule_controls[village_id]["copy"],
+        )
+        header.insertSpacing(header.count() - 1, 8)
 
         units_grid = QGridLayout()
         units_grid.setHorizontalSpacing(18)
         units_grid.setVerticalSpacing(2)
-        self._unit_grids.append(units_grid)
+        self._village_grids[village_id] = units_grid
         units_grid.setColumnStretch(0, 1)
         for column, width in enumerate((0, 90, 80, 95, 105, 180)):
             if width:
@@ -1585,7 +1583,7 @@ class RecruitmentWidget(QWidget):
             header_label.setObjectName("columnHeader")
             units_grid.addWidget(header_label, 0, column)
             if text == "Cel":
-                self._target_column_widgets.append(header_label)
+                self._village_target_headers[village_id] = header_label
 
         controls = {"enabled": enabled}
         duration_controls = {}
@@ -1711,7 +1709,115 @@ class RecruitmentWidget(QWidget):
         self._refresh_village_summary(village_id)
         return card
 
+    def _build_rule_strip(self, village_id: str) -> QFrame:
+        strip = QFrame()
+        strip.setObjectName("ruleStrip")
+        strip_layout = QHBoxLayout(strip)
+        strip_layout.setContentsMargins(12, 8, 10, 8)
+        strip_layout.setSpacing(8)
+
+        count_button = QPushButton("Stała partia")
+        count_button.setObjectName("segmentLeft")
+        duration_button = QPushButton("Docelowy czas kolejki")
+        duration_button.setObjectName("segmentRight")
+        segment_layout = QHBoxLayout()
+        segment_layout.setSpacing(0)
+        for strategy, button in (
+            ("count", count_button),
+            ("duration", duration_button),
+        ):
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            bold_font = QFont(button.font())
+            bold_font.setBold(True)
+            button.setMinimumWidth(
+                QFontMetrics(bold_font).horizontalAdvance(button.text()) + 34
+            )
+            button.clicked.connect(
+                lambda _checked=False, current_id=village_id, value=strategy:
+                    self._choose_village_strategy(current_id, value)
+            )
+            segment_layout.addWidget(button)
+        strip_layout.addLayout(segment_layout)
+        strip_layout.addSpacing(12)
+
+        prefix = QLabel()
+        strip_layout.addWidget(prefix)
+        threshold = QSpinBox()
+        threshold.setRange(0, 100)
+        threshold.setSuffix(" szt.")
+        threshold.setFixedWidth(88)
+        threshold.setValue(self._effective_rule(village_id, "queue_threshold"))
+        threshold.setToolTip(
+            "Wartość 0 oznacza: uzupełniaj dopiero, gdy kolejka jest pusta."
+        )
+        threshold.valueChanged.connect(
+            lambda value, current_id=village_id:
+                self.village_threshold_changed.emit(current_id, value)
+        )
+        strip_layout.addWidget(threshold)
+        middle = QLabel("lub mniej — dodaj")
+        strip_layout.addWidget(middle)
+        batch = QSpinBox()
+        batch.setRange(1, 100)
+        batch.setSuffix(" jedn.")
+        batch.setFixedWidth(92)
+        batch.setValue(self._effective_rule(village_id, "batch_size"))
+        batch.setToolTip(
+            "Zlecenie zostanie wysłane tylko, gdy wioska ma surowce "
+            "na całą partię."
+        )
+        batch.valueChanged.connect(
+            lambda value, current_id=village_id:
+                self.village_batch_changed.emit(current_id, value)
+        )
+        strip_layout.addWidget(batch)
+        suffix = QLabel()
+        strip_layout.addWidget(suffix)
+        strip_layout.addStretch()
+
+        copy_button = QPushButton("Kopiuj do innych wiosek")
+        copy_button.setObjectName("linkButton")
+        copy_button.setCursor(Qt.PointingHandCursor)
+        copy_button.setToolTip(
+            "Skopiuj sposób uzupełniania, próg i partię do wszystkich "
+            "pozostałych wiosek. Zaznaczone jednostki i cele w minutach "
+            "pozostaną bez zmian."
+        )
+        copy_button.clicked.connect(
+            lambda _checked=False, current_id=village_id:
+                self.village_rule_copy_requested.emit(current_id)
+        )
+
+        self.village_rule_controls[village_id] = {
+            "count": count_button,
+            "duration": duration_button,
+            "prefix": prefix,
+            "threshold": threshold,
+            "middle": middle,
+            "batch": batch,
+            "suffix": suffix,
+            "copy": copy_button,
+        }
+        strategy = self._effective_rule(village_id, "queue_strategy")
+        self._village_strategy[village_id] = strategy
+        count_button.setChecked(strategy == "count")
+        duration_button.setChecked(strategy == "duration")
+        return strip
+
     def _sync_controls_with_settings(self):
+        for village_id, controls in self.village_rule_controls.items():
+            for key, field in (
+                ("threshold", "queue_threshold"),
+                ("batch", "batch_size"),
+            ):
+                controls[key].blockSignals(True)
+                controls[key].setValue(self._effective_rule(village_id, field))
+                controls[key].blockSignals(False)
+            self.set_village_strategy(
+                village_id,
+                self._effective_rule(village_id, "queue_strategy"),
+            )
         for village_id, controls in self.village_recruitment_controls.items():
             village_settings = self._village_settings(village_id)
             controls["enabled"].blockSignals(True)
@@ -1819,7 +1925,7 @@ class RecruitmentWidget(QWidget):
         checkbox.style().unpolish(checkbox)
         checkbox.style().polish(checkbox)
         widgets["target"].setHidden(
-            self._strategy != "duration" or not selected
+            self.village_strategy(village_id) != "duration" or not selected
         )
 
         queue = self._queue_rows.get((village_id, unit_id))
@@ -2740,15 +2846,6 @@ class MainWindow(QMainWindow):
         self.recruitment_tab.auto_recruitment_checkbox.setChecked(
             settings.recruitment.automatic_enabled
         )
-        self.recruitment_tab.auto_recruitment_batch_size.setValue(
-            settings.recruitment.batch_size
-        )
-        self.recruitment_tab.auto_recruitment_threshold.setValue(
-            settings.recruitment.queue_threshold
-        )
-        self.recruitment_tab.set_recruitment_strategy(
-            settings.recruitment.queue_strategy
-        )
         self.milling_tab.minimum_gold_balance.setValue(
             settings.resource_milling.minimum_gold_balance
         )
@@ -2801,13 +2898,18 @@ class MainWindow(QMainWindow):
         self.recruitment_tab.auto_recruitment_checkbox.toggled.connect(
             self._set_automatic_recruitment_enabled
         )
-        self.recruitment_tab.auto_recruitment_batch_size.valueChanged.connect(
-            self._set_recruitment_batch_size
+        self.recruitment_tab.village_strategy_changed.connect(
+            self._set_village_recruitment_strategy
         )
-        self.recruitment_tab.auto_recruitment_threshold.valueChanged.connect(
-            self._set_recruitment_queue_threshold
+        self.recruitment_tab.village_batch_changed.connect(
+            self._set_village_recruitment_batch_size
         )
-        self.recruitment_tab.strategy_changed.connect(self._set_queue_strategy)
+        self.recruitment_tab.village_threshold_changed.connect(
+            self._set_village_recruitment_threshold
+        )
+        self.recruitment_tab.village_rule_copy_requested.connect(
+            self._copy_village_recruitment_rule
+        )
         self.recruitment_tab.village_enabled_toggled.connect(
             self._set_village_recruitment_enabled
         )
@@ -2884,9 +2986,7 @@ class MainWindow(QMainWindow):
         self.content_tabs.addTab(self.dashboard_tab, "Przegląd")
 
         self.recruitment_tab = RecruitmentWidget()
-        self.recruitment_tab._settings_by_village = (
-            self.settings.recruitment.villages
-        )
+        self.recruitment_tab.bind_settings(self.settings.recruitment)
         self.content_tabs.addTab(self.recruitment_tab, "Rekrutacja")
 
         self.village_detail_tab = VillageDetailWidget(self.tracker)
@@ -3349,34 +3449,82 @@ class MainWindow(QMainWindow):
             self.dashboard_tab._recruitment_queue_rows
         )
 
-    def _set_recruitment_batch_size(self, batch_size: int):
-        previous = self.settings.recruitment.batch_size
-        self.settings.recruitment.batch_size = batch_size
-        if self._save_recruitment_settings():
+    def _set_village_recruitment_rule(
+        self,
+        village_id: str,
+        field: str,
+        value,
+        recheck: bool,
+    ):
+        village_settings = self.settings.recruitment.villages.setdefault(
+            village_id,
+            VillageRecruitmentSettings(),
+        )
+        previous = getattr(village_settings, field)
+        setattr(village_settings, field, value)
+        if not self._save_recruitment_settings():
+            setattr(village_settings, field, previous)
+            self.recruitment_tab._sync_controls_with_settings()
             return
+        if (
+            recheck
+            and self.settings.recruitment.automatic_enabled
+            and self.browser_session is not None
+        ):
+            self._check_recruitment_queues()
 
-        self.settings.recruitment.batch_size = previous
-        spin_box = self.recruitment_tab.auto_recruitment_batch_size
-        spin_box.blockSignals(True)
-        spin_box.setValue(previous)
-        spin_box.blockSignals(False)
+    def _set_village_recruitment_strategy(self, village_id: str, strategy: str):
+        self._set_village_recruitment_rule(
+            village_id, "queue_strategy", strategy, recheck=True,
+        )
 
-    def _set_recruitment_queue_threshold(self, threshold: int):
-        previous = self.settings.recruitment.queue_threshold
-        self.settings.recruitment.queue_threshold = threshold
-        if self._save_recruitment_settings():
-            if (
-                self.settings.recruitment.automatic_enabled
-                and self.browser_session is not None
-            ):
-                self._check_recruitment_queues()
+    def _set_village_recruitment_batch_size(self, village_id: str, batch_size: int):
+        self._set_village_recruitment_rule(
+            village_id, "batch_size", batch_size, recheck=False,
+        )
+
+    def _set_village_recruitment_threshold(self, village_id: str, threshold: int):
+        self._set_village_recruitment_rule(
+            village_id, "queue_threshold", threshold, recheck=True,
+        )
+
+    def _copy_village_recruitment_rule(self, source_village_id: str):
+        recruitment = self.settings.recruitment
+        rule = {
+            "queue_strategy": recruitment.strategy_for(source_village_id),
+            "batch_size": recruitment.batch_size_for(source_village_id),
+            "queue_threshold": recruitment.queue_threshold_for(source_village_id),
+        }
+        target_ids = [
+            village_id
+            for village_id in self.recruitment_tab.village_rule_controls
+            if village_id != source_village_id
+        ]
+        previous = {
+            village_id: recruitment.villages.get(village_id)
+            for village_id in target_ids
+        }
+        for village_id in target_ids:
+            village_settings = recruitment.villages.setdefault(
+                village_id,
+                VillageRecruitmentSettings(),
+            )
+            recruitment.villages[village_id] = village_settings.model_copy(
+                update=rule
+            )
+        if not self._save_recruitment_settings():
+            for village_id, village_settings in previous.items():
+                if village_settings is None:
+                    recruitment.villages.pop(village_id, None)
+                else:
+                    recruitment.villages[village_id] = village_settings
             return
-
-        self.settings.recruitment.queue_threshold = previous
-        spin_box = self.recruitment_tab.auto_recruitment_threshold
-        spin_box.blockSignals(True)
-        spin_box.setValue(previous)
-        spin_box.blockSignals(False)
+        self.recruitment_tab._sync_controls_with_settings()
+        self.recruitment_tab.recruitment_queue_status.setText(
+            f"Skopiowano ustawienia do {len(target_ids)} wiosek."
+        )
+        if recruitment.automatic_enabled and self.browser_session is not None:
+            self._check_recruitment_queues()
 
     def _set_village_queue_minutes(
         self,
@@ -3406,21 +3554,6 @@ class MainWindow(QMainWindow):
             self.dashboard_tab._recruitment_queue_rows,
             self.settings.recruitment.pending_orders,
         )
-
-    def _set_queue_strategy(self, _strategy: str):
-        previous = self.settings.recruitment.queue_strategy
-        self.settings.recruitment.queue_strategy = (
-            self.recruitment_tab.recruitment_strategy()
-        )
-        if not self._save_recruitment_settings():
-            self.settings.recruitment.queue_strategy = previous
-            self.recruitment_tab.set_recruitment_strategy(previous)
-            return
-        if (
-            self.settings.recruitment.automatic_enabled
-            and self.browser_session is not None
-        ):
-            self._check_recruitment_queues()
 
     def _set_milling_gold_reserve(self, minimum_gold_balance: int):
         previous = self.settings.resource_milling.minimum_gold_balance
@@ -3690,8 +3823,9 @@ class MainWindow(QMainWindow):
         Returns ``None`` in duration mode when the game provided no usable
         training time for the unit.
         """
-        if self.settings.recruitment.queue_strategy != "duration":
-            return self.settings.recruitment.queue_threshold
+        recruitment = self.settings.recruitment
+        if recruitment.strategy_for(row["village_id"]) != "duration":
+            return recruitment.queue_threshold_for(row["village_id"])
         return recruitment_queue_threshold_for_duration(
             row,
             self._recruitment_target_minutes(row),
@@ -3699,8 +3833,11 @@ class MainWindow(QMainWindow):
 
     def _recruitment_queue_is_low(self, row: dict) -> bool | None:
         """Return whether the row needs replenishing, or None if unknown."""
-        if self.settings.recruitment.queue_strategy != "duration":
-            return row["count"] <= self.settings.recruitment.queue_threshold
+        recruitment = self.settings.recruitment
+        if recruitment.strategy_for(row["village_id"]) != "duration":
+            return row["count"] <= recruitment.queue_threshold_for(
+                row["village_id"]
+            )
         duration = recruitment_queue_duration_seconds(row)
         threshold = self._recruitment_queue_threshold_for_row(row)
         if duration is None or threshold is None:
@@ -3709,12 +3846,14 @@ class MainWindow(QMainWindow):
 
     def _recruitment_batch_size_for_row(self, row: dict) -> int | None:
         """Return the number of units to order for a recruitment row."""
-        if self.settings.recruitment.queue_strategy != "duration":
-            return self.settings.recruitment.batch_size
+        recruitment = self.settings.recruitment
+        batch_size = recruitment.batch_size_for(row["village_id"])
+        if recruitment.strategy_for(row["village_id"]) != "duration":
+            return batch_size
         return recruitment_batch_for_duration(
             row,
             self._recruitment_target_minutes(row),
-            self.settings.recruitment.batch_size,
+            batch_size,
         )
 
     def _clear_pending_recruitment_orders(self):

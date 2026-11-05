@@ -70,6 +70,10 @@ class VillageRecruitmentSettings(BaseModel):
     enabled: bool = True
     units: set[str] = Field(default_factory=set)
     queue_minutes_by_unit: dict[str, int] = Field(default_factory=dict)
+    # ``None`` inherits the account-wide value from RecruitmentSettings.
+    queue_strategy: Literal["count", "duration"] | None = None
+    batch_size: int | None = Field(default=None, ge=1, le=100)
+    queue_threshold: int | None = Field(default=None, ge=0, le=100)
 
     @field_validator("units", mode="before")
     @classmethod
@@ -121,6 +125,23 @@ class RecruitmentSettings(BaseModel):
     queue_threshold: int = Field(default=1, ge=0, le=100)
     pending_orders: set[str] = Field(default_factory=set)
     villages: dict[str, VillageRecruitmentSettings] = Field(default_factory=dict)
+
+    def _village_value(self, village_id: str, field: str):
+        village = self.villages.get(str(village_id))
+        value = getattr(village, field) if village is not None else None
+        return getattr(self, field) if value is None else value
+
+    def strategy_for(self, village_id: str) -> str:
+        """Return the replenishment mode used in one village."""
+        return self._village_value(village_id, "queue_strategy")
+
+    def batch_size_for(self, village_id: str) -> int:
+        """Return the (maximum) batch size used in one village."""
+        return self._village_value(village_id, "batch_size")
+
+    def queue_threshold_for(self, village_id: str) -> int:
+        """Return the count threshold used in one village."""
+        return self._village_value(village_id, "queue_threshold")
 
 
 class VillageMillingSettings(BaseModel):
