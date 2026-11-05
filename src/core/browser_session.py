@@ -145,6 +145,8 @@ _RECRUITMENT_BUILDING_NAMES = {
 }
 
 _RECRUITMENT_BUILDING_TYPES = (19, 20, 21, 25, 26, 29, 30)
+# Duration targets (up to 24 h) can translate into large unit counts.
+_MAX_RECRUITMENT_QUEUE_THRESHOLD = 1_000_000
 
 NPC_TRADER_PRICE = 5
 
@@ -1546,6 +1548,9 @@ class TravianBrowserSession:
                         ? queueTypes : targetBuildingTypes;
                     let count = 0;
                     let otherCount = 0;
+                    let queueSecondsRemaining = 0;
+                    let queueTimeKnown = true;
+                    const nowSeconds = Date.now() / 1000;
                     for (const type of countedTypes) {
                         const entries = model.data.buildingTypes[String(type)];
                         if (!Array.isArray(entries)) continue;
@@ -1556,6 +1561,19 @@ class TravianBrowserSession:
                             );
                             if (Number(entry.unitType) === unitType) {
                                 count += entryCount;
+                                if (entryCount > 0) {
+                                    const finished = Number(
+                                        entry.timeFinishedLast
+                                    );
+                                    if (Number.isFinite(finished)) {
+                                        queueSecondsRemaining = Math.max(
+                                            queueSecondsRemaining,
+                                            finished - nowSeconds
+                                        );
+                                    } else {
+                                        queueTimeKnown = false;
+                                    }
+                                }
                             } else {
                                 otherCount += entryCount;
                             }
@@ -1569,6 +1587,22 @@ class TravianBrowserSession:
                     const baseTrainingTime = Number(troop.time);
                     const troopSpeed = Number(Travian.Config.TG_TROOP_SPEED);
                     const trainingTimesSeconds = existing.map(type => {
+                        // The live queue reports the exact per-unit duration
+                        // (all modifiers included) while units are training.
+                        const queueEntries = model.data.buildingTypes[
+                            String(type)
+                        ];
+                        const queuedEntry = Array.isArray(queueEntries)
+                            ? queueEntries.find(entry =>
+                                Number(entry.unitType) === unitType)
+                            : null;
+                        const queuedDuration = Number(
+                            queuedEntry && queuedEntry.durationPerUnit
+                        );
+                        if (Number.isFinite(queuedDuration)
+                            && queuedDuration > 0) {
+                            return queuedDuration;
+                        }
                         const building = villageBuildings.find(item =>
                             item.data
                             && Number(item.data.buildingType) === type
@@ -1611,6 +1645,8 @@ class TravianBrowserSession:
                         building_available: existing.length > 0,
                         costs,
                         training_times_seconds: trainingTimesSeconds,
+                        queue_seconds_remaining:
+                            queueTimeKnown ? queueSecondsRemaining : null,
                         count,
                         other_count: otherCount
                     }];
@@ -1727,6 +1763,17 @@ class TravianBrowserSession:
                 "building_available": row.get("building_available") is True,
                 "costs": costs,
                 "training_times_seconds": training_times_seconds,
+                "queue_seconds_remaining": (
+                    float(row["queue_seconds_remaining"])
+                    if not isinstance(row.get("queue_seconds_remaining"), bool)
+                    and isinstance(
+                        row.get("queue_seconds_remaining"),
+                        (int, float),
+                    )
+                    and math.isfinite(row["queue_seconds_remaining"])
+                    and row["queue_seconds_remaining"] >= 0
+                    else None
+                ),
                 "count": int(count),
                 "other_count": int(other_count),
             })
@@ -2243,7 +2290,7 @@ class TravianBrowserSession:
             or not 1 <= batch_size <= 100
             or isinstance(queue_threshold, bool)
             or not isinstance(queue_threshold, int)
-            or not 0 <= queue_threshold <= 100
+            or not 0 <= queue_threshold <= _MAX_RECRUITMENT_QUEUE_THRESHOLD
         ):
             raise ValueError("Invalid automatic recruitment request.")
 
@@ -2418,7 +2465,7 @@ class TravianBrowserSession:
             or not re.fullmatch(r"[a-f0-9]{32}", request_id)
             or isinstance(queue_threshold, bool)
             or not isinstance(queue_threshold, int)
-            or not 0 <= queue_threshold <= 100
+            or not 0 <= queue_threshold <= _MAX_RECRUITMENT_QUEUE_THRESHOLD
         ):
             raise ValueError("Invalid recruitment response lookup.")
 

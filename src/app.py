@@ -44,6 +44,9 @@ try:
     from src.core.village_advisor import get_village_plan
     from src.core.recruitment_economics import (
         estimate_recruitment_costs_per_hour,
+        recruitment_batch_for_duration,
+        recruitment_queue_duration_seconds,
+        recruitment_queue_threshold_for_duration,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from config.settings import (
@@ -68,6 +71,9 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.village_advisor import get_village_plan
     from core.recruitment_economics import (
         estimate_recruitment_costs_per_hour,
+        recruitment_batch_for_duration,
+        recruitment_queue_duration_seconds,
+        recruitment_queue_threshold_for_duration,
     )
 
 logger = logging.getLogger(__name__)
@@ -204,6 +210,7 @@ _RECRUITMENT_QUEUE_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 _RESOURCE_MILLING_REFRESH_INTERVAL_MS = 30 * 1000
 _AUTO_RECRUITMENT_ORDER_INTERVAL_MS = 6 * 1000
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
+DEFAULT_RECRUITMENT_QUEUE_MINUTES = 60
 _NPC_TRADER_ORDER_INTERVAL_MS = 6 * 1000
 
 
@@ -977,7 +984,20 @@ class RecruitmentWidget(QWidget):
             "i typy jednostek, które automat ma uzupełniać."
         )
         controls_layout.addWidget(self.auto_recruitment_checkbox)
-        controls_layout.addWidget(QLabel("Liczebność partii:"))
+        controls_layout.addWidget(QLabel("Tryb:"))
+        self.queue_strategy_combobox = QComboBox()
+        self.queue_strategy_combobox.addItem("Liczba jednostek", "count")
+        self.queue_strategy_combobox.addItem("Czas kolejki", "duration")
+        self.queue_strategy_combobox.setFixedWidth(150)
+        self.queue_strategy_combobox.setToolTip(
+            "Liczba jednostek: dodaje stałą partię, gdy w kolejce zostanie "
+            "podana liczba jednostek lub mniej.\n"
+            "Czas kolejki: utrzymuje kolejkę o docelowej długości w minutach, "
+            "ustawianej osobno dla każdej wioski i jednostki."
+        )
+        controls_layout.addWidget(self.queue_strategy_combobox)
+        self.auto_recruitment_batch_size_label = QLabel("Liczebność partii:")
+        controls_layout.addWidget(self.auto_recruitment_batch_size_label)
         self.auto_recruitment_batch_size = QSpinBox()
         self.auto_recruitment_batch_size.setRange(1, 100)
         self.auto_recruitment_batch_size.setSuffix(" jednostek")
@@ -987,7 +1007,8 @@ class RecruitmentWidget(QWidget):
             "na całą partię."
         )
         controls_layout.addWidget(self.auto_recruitment_batch_size)
-        controls_layout.addWidget(QLabel("Uzupełnij, gdy zostanie:"))
+        self.auto_recruitment_threshold_label = QLabel("Uzupełnij, gdy zostanie:")
+        controls_layout.addWidget(self.auto_recruitment_threshold_label)
         self.auto_recruitment_threshold = QSpinBox()
         self.auto_recruitment_threshold.setRange(0, 100)
         self.auto_recruitment_threshold.setSuffix(" szt. lub mniej")
@@ -1082,13 +1103,13 @@ class RecruitmentWidget(QWidget):
         self.recruitment_queue_status.setWordWrap(True)
         queues_layout.addWidget(self.recruitment_queue_status)
 
-        self.recruitment_queue_table = QTableWidget(0, 4)
+        self.recruitment_queue_table = QTableWidget(0, 5)
         self.recruitment_queue_table.setHorizontalHeaderLabels(
-            ["Wioska", "Jednostka · budynek", "W kolejce", "Status"]
+            ["Wioska", "Jednostka · budynek", "W kolejce", "Czas kolejki", "Status"]
         )
         DashboardWidget._configure_table(
             self.recruitment_queue_table,
-            stretch_columns=(0, 1, 3),
+            stretch_columns=(0, 1, 4),
         )
         self.recruitment_queue_table.setMinimumHeight(180)
         queues_layout.addWidget(self.recruitment_queue_table, stretch=1)
@@ -1105,6 +1126,39 @@ class RecruitmentWidget(QWidget):
 
         self._recruitment_pending_keys: set[str] = set()
         self.village_recruitment_controls: dict[str, dict[str, QCheckBox]] = {}
+        self.village_queue_duration_controls: dict[str, dict[str, QSpinBox]] = {}
+        self.queue_strategy_combobox.currentIndexChanged.connect(
+            self._apply_recruitment_strategy_visibility
+        )
+        self._apply_recruitment_strategy_visibility()
+
+    def recruitment_strategy(self) -> str:
+        return self.queue_strategy_combobox.currentData() or "count"
+
+    def set_recruitment_strategy(self, strategy: str):
+        index = self.queue_strategy_combobox.findData(strategy)
+        self.queue_strategy_combobox.blockSignals(True)
+        self.queue_strategy_combobox.setCurrentIndex(max(0, index))
+        self.queue_strategy_combobox.blockSignals(False)
+        self._apply_recruitment_strategy_visibility()
+
+    def _apply_recruitment_strategy_visibility(self, *_args):
+        duration = self.recruitment_strategy() == "duration"
+        self.auto_recruitment_threshold_label.setHidden(duration)
+        self.auto_recruitment_threshold.setHidden(duration)
+        self.auto_recruitment_batch_size_label.setText(
+            "Maks. partia:" if duration else "Liczebność partii:"
+        )
+        self.auto_recruitment_batch_size.setToolTip(
+            "Maksymalna liczba jednostek w jednym zleceniu. Automat dodaje "
+            "tylko brakujący czas kolejki, nie więcej niż ta wartość."
+            if duration else
+            "Zlecenie zostanie wysłane tylko, jeśli wioska ma zasoby "
+            "na całą partię."
+        )
+        for controls in self.village_queue_duration_controls.values():
+            for spin_box in controls.values():
+                spin_box.setHidden(not duration)
 
     def update_village_recruitment_settings(
         self,
@@ -1122,6 +1176,7 @@ class RecruitmentWidget(QWidget):
                     widget.deleteLater()
 
         self.village_recruitment_controls.clear()
+        self.village_queue_duration_controls.clear()
         if not villages:
             self.village_settings_content_layout.addWidget(
                 self.village_settings_empty_label
@@ -1153,21 +1208,49 @@ class RecruitmentWidget(QWidget):
             row_layout.addLayout(header_layout)
 
             units = {}
+            duration_inputs = {}
             units_layout = QGridLayout()
             units_layout.setContentsMargins(0, 0, 0, 0)
+            units_layout.setHorizontalSpacing(8)
+            columns_per_row = 3
             for index, unit in enumerate(village.get("recruitment_units", [])):
                 unit_id = str(unit["unit_id"])
-                checkbox = QCheckBox(
-                    f"{unit['building']} · {unit['unit']}"
-                )
-                checkbox.setChecked(unit_id in village_settings.units)
-                checkbox.setEnabled(unit.get("building_available") is True)
-                if not checkbox.isEnabled():
+                building_available = unit.get("building_available") is True
+                selected = unit_id in village_settings.units
+                checkbox = QCheckBox(f"{unit['building']} · {unit['unit']}")
+                checkbox.setChecked(selected)
+                # A selected unit stays editable so it can be deselected even
+                # when its building is missing; the automation skips it.
+                checkbox.setEnabled(building_available or selected)
+                if not building_available:
                     checkbox.setToolTip(
-                        "W tej wiosce nie ma odpowiedniego budynku."
+                        "W tej wiosce nie ma odpowiedniego budynku — "
+                        "automat pominie tę jednostkę."
                     )
-                units_layout.addWidget(checkbox, index // 3, index % 3)
+
+                spin_box = QSpinBox()
+                spin_box.setRange(1, 1440)
+                spin_box.setSuffix(" min")
+                spin_box.setFixedWidth(90)
+                spin_box.setValue(
+                    village_settings.queue_minutes_by_unit.get(
+                        unit_id,
+                        DEFAULT_RECRUITMENT_QUEUE_MINUTES,
+                    )
+                )
+                spin_box.setEnabled(building_available)
+                spin_box.setToolTip(
+                    f"Docelowa długość kolejki dla {unit['unit']} w tej "
+                    "wiosce. Automat dobierze liczbę jednostek tak, aby "
+                    "uzupełnić brakujący czas."
+                )
+
+                grid_row = index // columns_per_row
+                grid_column = (index % columns_per_row) * 2
+                units_layout.addWidget(checkbox, grid_row, grid_column)
+                units_layout.addWidget(spin_box, grid_row, grid_column + 1)
                 units[unit_id] = checkbox
+                duration_inputs[unit_id] = spin_box
 
             row_layout.addLayout(units_layout)
             self.village_settings_content_layout.addWidget(row)
@@ -1175,6 +1258,9 @@ class RecruitmentWidget(QWidget):
                 "enabled": enabled,
                 **units,
             }
+            self.village_queue_duration_controls[village_id] = duration_inputs
+
+        self._apply_recruitment_strategy_visibility()
 
     def update_recruitment_queues(
         self,
@@ -1235,6 +1321,20 @@ class RecruitmentWidget(QWidget):
             self.recruitment_queue_table.setItem(
                 row_index, 2, QTableWidgetItem(count_text)
             )
+            queue_seconds = (
+                recruitment_queue_duration_seconds(queue)
+                if count_text != "—"
+                else None
+            )
+            self.recruitment_queue_table.setItem(
+                row_index,
+                3,
+                QTableWidgetItem(
+                    f"{queue_seconds / 60:.0f} min"
+                    if queue_seconds is not None
+                    else "—"
+                ),
+            )
             status_item = QTableWidgetItem(status)
             status_item.setBackground(color)
             if (
@@ -1245,7 +1345,7 @@ class RecruitmentWidget(QWidget):
                     "Zlecenie wysłano. Automat nie ponowi go, dopóki "
                     "kolejka nie potwierdzi przyjęcia jednostek."
                 )
-            self.recruitment_queue_table.setItem(row_index, 3, status_item)
+            self.recruitment_queue_table.setItem(row_index, 4, status_item)
 
         village_count = len({row["village_id"] for row in rows})
         active_queues = len(rows) - inactive_queues
@@ -2172,6 +2272,9 @@ class MainWindow(QMainWindow):
         self.recruitment_tab.auto_recruitment_threshold.setValue(
             settings.recruitment.queue_threshold
         )
+        self.recruitment_tab.set_recruitment_strategy(
+            settings.recruitment.queue_strategy
+        )
         self.milling_tab.minimum_gold_balance.setValue(
             settings.resource_milling.minimum_gold_balance
         )
@@ -2229,6 +2332,9 @@ class MainWindow(QMainWindow):
         )
         self.recruitment_tab.auto_recruitment_threshold.valueChanged.connect(
             self._set_recruitment_queue_threshold
+        )
+        self.recruitment_tab.queue_strategy_combobox.currentIndexChanged.connect(
+            self._set_queue_strategy
         )
         self.recruitment_tab.clear_recruitment_pending_btn.clicked.connect(
             self._clear_pending_recruitment_orders
@@ -2788,6 +2894,47 @@ class MainWindow(QMainWindow):
         spin_box.setValue(previous)
         spin_box.blockSignals(False)
 
+    def _set_village_queue_minutes(
+        self,
+        village_id: str,
+        unit_id: str,
+        minutes: int,
+    ):
+        village_settings = self.settings.recruitment.villages[village_id]
+        previous = village_settings.queue_minutes_by_unit.get(unit_id)
+        village_settings.queue_minutes_by_unit[unit_id] = minutes
+        if not self._save_recruitment_settings():
+            if previous is None:
+                village_settings.queue_minutes_by_unit.pop(unit_id, None)
+            else:
+                village_settings.queue_minutes_by_unit[unit_id] = previous
+            spin_box = self.recruitment_tab.village_queue_duration_controls[
+                village_id
+            ][unit_id]
+            spin_box.blockSignals(True)
+            spin_box.setValue(previous or DEFAULT_RECRUITMENT_QUEUE_MINUTES)
+            spin_box.blockSignals(False)
+            return
+        self._update_recruitment_queues(
+            self.dashboard_tab._recruitment_queue_rows,
+            self.settings.recruitment.pending_orders,
+        )
+
+    def _set_queue_strategy(self, _index: int):
+        previous = self.settings.recruitment.queue_strategy
+        self.settings.recruitment.queue_strategy = (
+            self.recruitment_tab.recruitment_strategy()
+        )
+        if not self._save_recruitment_settings():
+            self.settings.recruitment.queue_strategy = previous
+            self.recruitment_tab.set_recruitment_strategy(previous)
+            return
+        if (
+            self.settings.recruitment.automatic_enabled
+            and self.browser_session is not None
+        ):
+            self._check_recruitment_queues()
+
     def _set_milling_gold_reserve(self, minimum_gold_balance: int):
         previous = self.settings.resource_milling.minimum_gold_balance
         self.settings.resource_milling.minimum_gold_balance = minimum_gold_balance
@@ -2960,6 +3107,20 @@ class MainWindow(QMainWindow):
                 lambda enabled, current_id=village_id:
                     self._set_village_recruitment_enabled(current_id, enabled)
             )
+            for unit_id, spin_box in (
+                self.recruitment_tab.village_queue_duration_controls
+                .get(village_id, {})
+                .items()
+            ):
+                spin_box.valueChanged.connect(
+                    lambda minutes, current_id=village_id,
+                    current_unit_id=unit_id:
+                        self._set_village_queue_minutes(
+                            current_id,
+                            current_unit_id,
+                            minutes,
+                        )
+                )
             for unit_id, checkbox in controls.items():
                 if unit_id == "enabled":
                     continue
@@ -3053,6 +3214,49 @@ class MainWindow(QMainWindow):
             and row.get("building_available", True) is not False
         )
 
+    def _recruitment_target_minutes(self, row: dict) -> int:
+        village_settings = self.settings.recruitment.villages.get(
+            row["village_id"],
+            VillageRecruitmentSettings(),
+        )
+        return village_settings.queue_minutes_by_unit.get(
+            str(row.get("unit_id", row.get("unit_type", row["unit"]))),
+            DEFAULT_RECRUITMENT_QUEUE_MINUTES,
+        )
+
+    def _recruitment_queue_threshold_for_row(self, row: dict) -> int | None:
+        """Return the queue count at or below which the row is replenished.
+
+        Returns ``None`` in duration mode when the game provided no usable
+        training time for the unit.
+        """
+        if self.settings.recruitment.queue_strategy != "duration":
+            return self.settings.recruitment.queue_threshold
+        return recruitment_queue_threshold_for_duration(
+            row,
+            self._recruitment_target_minutes(row),
+        )
+
+    def _recruitment_queue_is_low(self, row: dict) -> bool | None:
+        """Return whether the row needs replenishing, or None if unknown."""
+        if self.settings.recruitment.queue_strategy != "duration":
+            return row["count"] <= self.settings.recruitment.queue_threshold
+        duration = recruitment_queue_duration_seconds(row)
+        threshold = self._recruitment_queue_threshold_for_row(row)
+        if duration is None or threshold is None:
+            return None
+        return duration < self._recruitment_target_minutes(row) * 60
+
+    def _recruitment_batch_size_for_row(self, row: dict) -> int | None:
+        """Return the number of units to order for a recruitment row."""
+        if self.settings.recruitment.queue_strategy != "duration":
+            return self.settings.recruitment.batch_size
+        return recruitment_batch_for_duration(
+            row,
+            self._recruitment_target_minutes(row),
+            self.settings.recruitment.batch_size,
+        )
+
     def _clear_pending_recruitment_orders(self):
         if not self.settings.recruitment.pending_orders:
             return
@@ -3099,13 +3303,28 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        candidates = [
-            row for row in rows
-            if row["count"] <= self.settings.recruitment.queue_threshold
-            and self._is_village_recruitment_enabled(row)
-            and _recruitment_row_key(row)
-            not in self.settings.recruitment.pending_orders
-        ]
+        candidates = []
+        missing_queue_times = []
+        for row in rows:
+            if (
+                not self._is_village_recruitment_enabled(row)
+                or _recruitment_row_key(row)
+                in self.settings.recruitment.pending_orders
+            ):
+                continue
+            queue_is_low = self._recruitment_queue_is_low(row)
+            if queue_is_low is None:
+                missing_queue_times.append(
+                    f"{row['unit']} ({row.get('village', row['village_id'])})"
+                )
+            elif queue_is_low:
+                candidates.append(row)
+        if missing_queue_times:
+            self.recruitment_tab.recruitment_queue_status.setText(
+                "Pominięto — brak danych o czasie szkolenia: "
+                + ", ".join(missing_queue_times)
+                + "."
+            )
         if not candidates:
             return
 
@@ -3147,6 +3366,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._run_next_automatic_recruitment)
             return
 
+        batch_size = self._recruitment_batch_size_for_row(row)
+        queue_threshold = self._recruitment_queue_threshold_for_row(row)
+        if batch_size is None or queue_threshold is None:
+            self.recruitment_tab.recruitment_queue_status.setText(
+                f"Pominięto {row['unit']} w wiosce {row['village']}: "
+                "brak danych o czasie szkolenia."
+            )
+            QTimer.singleShot(0, self._run_next_automatic_recruitment)
+            return
+        # The live recheck in the game only guards against the queue having
+        # grown since this scan; the decision itself was made above.
+        queue_threshold = max(queue_threshold, row["count"])
+
         self.settings.recruitment.pending_orders.add(key)
         if not self._save_recruitment_settings():
             self.settings.recruitment.pending_orders.discard(key)
@@ -3161,8 +3393,8 @@ class MainWindow(QMainWindow):
         try:
             result = self.browser_session.queue_recruitment(
                 row,
-                self.settings.recruitment.batch_size,
-                self.settings.recruitment.queue_threshold,
+                batch_size,
+                queue_threshold,
             )
         except Exception as error:
             logger.exception("Automatic recruitment outcome is uncertain")
@@ -3178,9 +3410,10 @@ class MainWindow(QMainWindow):
         status = result["status"]
         if status == "submitted":
             request_id = result["request_id"]
-            self._pending_recruitment_responses[key] = 0
+            # (verification attempts, minimum queue count proving acceptance)
+            self._pending_recruitment_responses[key] = (0, row["count"] + 1)
             self.recruitment_tab.recruitment_queue_status.setText(
-                f"Wysłano zlecenie: {self.settings.recruitment.batch_size} "
+                f"Wysłano zlecenie: {batch_size} "
                 f"× {row['unit']} w wiosce {row['village']}. Sprawdzam "
                 "odpowiedź serwera…"
             )
@@ -3234,10 +3467,11 @@ class MainWindow(QMainWindow):
         if self.browser_session is None or key not in self._pending_recruitment_responses:
             return
 
+        attempts, minimum_count = self._pending_recruitment_responses[key]
         try:
             result = self.browser_session.read_recruitment_order_response(
                 request_id,
-                self.settings.recruitment.queue_threshold,
+                max(0, minimum_count - 1),
             )
         except Exception as error:
             logger.exception("Could not verify automatic recruitment response")
@@ -3250,9 +3484,12 @@ class MainWindow(QMainWindow):
             return
 
         if result["status"] == "pending":
-            attempts = self._pending_recruitment_responses[key] + 1
+            attempts += 1
             if attempts < 3:
-                self._pending_recruitment_responses[key] = attempts
+                self._pending_recruitment_responses[key] = (
+                    attempts,
+                    minimum_count,
+                )
                 QTimer.singleShot(
                     1500,
                     lambda: self._verify_automatic_recruitment_response(
@@ -3777,7 +4014,7 @@ class MainWindow(QMainWindow):
             confirmed = {
                 _recruitment_row_key(row)
                 for row in rows
-                if row["count"] > self.settings.recruitment.queue_threshold
+                if self._recruitment_queue_is_low(row) is False
             }
             cleared = pending_orders.intersection(confirmed)
             if cleared:

@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from src.app import MainWindow
+from src.app import MainWindow, RecruitmentWidget
 from src.config.settings import (
     AppSettings,
     VillageMillingSettings,
@@ -34,7 +34,12 @@ from src.database.repository import (
 )
 from src.core.account_manager import AccountManager
 from src.core.village_tracker import VillageTracker
-from src.core.recruitment_economics import estimate_recruitment_costs_per_hour
+from src.core.recruitment_economics import (
+    effective_training_interval_seconds,
+    estimate_recruitment_costs_per_hour,
+    recruitment_batch_for_duration,
+    recruitment_queue_threshold_for_duration,
+)
 
 
 class BaselineSmokeTests(unittest.TestCase):
@@ -108,10 +113,17 @@ class BaselineSmokeTests(unittest.TestCase):
             settings.recruitment.automatic_enabled = True
             settings.recruitment.batch_size = 8
             settings.recruitment.queue_threshold = 3
+            settings.recruitment.queue_strategy = "duration"
             settings.recruitment.pending_orders.add("101:Phalanx")
             settings.recruitment.villages["101"] = VillageRecruitmentSettings(
                 enabled=False,
                 units={"Phalanx"},
+                queue_minutes_by_unit={"21": 60},
+            )
+            settings.recruitment.villages["202"] = VillageRecruitmentSettings(
+                enabled=True,
+                units={"24"},
+                queue_minutes_by_unit={"24": 10},
             )
             settings.resource_milling.villages["101"] = VillageMillingSettings(
                 enabled=True,
@@ -129,6 +141,7 @@ class BaselineSmokeTests(unittest.TestCase):
 
             restored = AppSettings.load(path)
             self.assertTrue(restored.recruitment.automatic_enabled)
+            self.assertEqual("duration", restored.recruitment.queue_strategy)
             self.assertEqual(8, restored.recruitment.batch_size)
             self.assertEqual(3, restored.recruitment.queue_threshold)
             self.assertEqual(
@@ -139,6 +152,18 @@ class BaselineSmokeTests(unittest.TestCase):
             self.assertEqual(
                 {"21"},
                 restored.recruitment.villages["101"].units,
+            )
+            self.assertEqual(
+                {"24"},
+                restored.recruitment.villages["202"].units,
+            )
+            self.assertEqual(
+                {"21": 60},
+                restored.recruitment.villages["101"].queue_minutes_by_unit,
+            )
+            self.assertEqual(
+                {"24": 10},
+                restored.recruitment.villages["202"].queue_minutes_by_unit,
             )
             milling = restored.resource_milling
             self.assertEqual(450, milling.minimum_gold_balance)
@@ -162,6 +187,10 @@ class BaselineSmokeTests(unittest.TestCase):
             AppSettings(recruitment={"batch_size": 0})
         with self.assertRaises(ValueError):
             AppSettings(recruitment={"queue_threshold": 101})
+        with self.assertRaises(ValueError):
+            AppSettings(recruitment={"queue_strategy": "unknown"})
+        with self.assertRaises(ValueError):
+            VillageRecruitmentSettings(queue_minutes_by_unit={"21": 1441})
         with self.assertRaises(ValueError):
             VillageMillingSettings(trigger_percent=101)
         with self.assertRaises(ValueError):
@@ -449,7 +478,7 @@ class BaselineSmokeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     "Brak rekrutacji",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 3).text(),
+                    window.recruitment_tab.recruitment_queue_table.item(0, 4).text(),
                 )
                 self.assertEqual(
                     "Phalanx · Koszary",
@@ -458,6 +487,14 @@ class BaselineSmokeTests(unittest.TestCase):
                 self.assertEqual(
                     "0 szt.",
                     window.recruitment_tab.recruitment_queue_table.item(0, 2).text(),
+                )
+                self.assertEqual(
+                    "0 min",
+                    window.recruitment_tab.recruitment_queue_table.item(0, 3).text(),
+                )
+                self.assertEqual(
+                    5,
+                    window.recruitment_tab.recruitment_queue_table.columnCount(),
                 )
                 self.assertEqual(
                     window.village_list_widget.count(),
@@ -500,7 +537,7 @@ class BaselineSmokeTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "potwierdzanie",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 3).text(),
+                    window.recruitment_tab.recruitment_queue_table.item(0, 4).text(),
                 )
                 self.assertTrue(
                     window.recruitment_tab.clear_recruitment_pending_btn.isEnabled()
@@ -763,6 +800,38 @@ class BaselineSmokeTests(unittest.TestCase):
             rows[0]["costs"],
         )
         self.assertEqual([1800.0], rows[0]["training_times_seconds"])
+
+    def test_duration_recruitment_targets_include_parallel_training_buildings(self):
+        row = {
+            "count": 1,
+            "training_times_seconds": [1800, 3600],
+        }
+
+        self.assertEqual(
+            1200,
+            effective_training_interval_seconds(row),
+        )
+        self.assertEqual(
+            2,
+            recruitment_queue_threshold_for_duration(row, 60),
+        )
+        self.assertEqual(
+            2,
+            recruitment_batch_for_duration(row, 60, 5),
+        )
+        self.assertEqual(
+            1,
+            recruitment_batch_for_duration(
+                {"count": 0, "training_times_seconds": [3600]},
+                10,
+                5,
+            ),
+        )
+        self.assertIsNone(
+            effective_training_interval_seconds(
+                {"training_times_seconds": [None]}
+            )
+        )
 
     def test_estimates_continuous_recruitment_costs_per_village(self):
         rows = [
@@ -1448,7 +1517,7 @@ class BaselineSmokeTests(unittest.TestCase):
                 VillageTracker(VillageRepository(db)),
             )
             window.browser_session = FakeSession()
-            window._pending_recruitment_responses[key] = 0
+            window._pending_recruitment_responses[key] = (0, 1)
             row = {
                 "village_id": "101",
                 "village": "Testonia",
@@ -1512,7 +1581,7 @@ class BaselineSmokeTests(unittest.TestCase):
                 VillageTracker(VillageRepository(db)),
             )
             window.browser_session = FakeSession()
-            window._pending_recruitment_responses[key] = 0
+            window._pending_recruitment_responses[key] = (0, 1)
             row = {
                 "village_id": "101",
                 "village": "Giran",
@@ -1695,6 +1764,162 @@ class BaselineSmokeTests(unittest.TestCase):
             finally:
                 window.close()
                 db.close()
+
+    def test_duration_recruitment_targets_are_independent_per_village_and_unit(self):
+        recruitment_tab = RecruitmentWidget()
+        village_settings = {
+            "101": VillageRecruitmentSettings(
+                units={"21"},
+                queue_minutes_by_unit={"21": 60},
+            ),
+            "202": VillageRecruitmentSettings(
+                units={"24"},
+                queue_minutes_by_unit={"24": 10},
+            ),
+        }
+        recruitment_tab.update_village_recruitment_settings(
+            [
+                {
+                    "id": "101",
+                    "name": "Phalanx village",
+                    "recruitment_units": [{
+                        "unit_id": "21",
+                        "building": "Koszary",
+                        "unit": "Phalanx",
+                        "building_available": True,
+                    }],
+                },
+                {
+                    "id": "202",
+                    "name": "Cavalry village",
+                    "recruitment_units": [{
+                        "unit_id": "24",
+                        "building": "Stajnia",
+                        "unit": "Theutates Thunder",
+                        "building_available": True,
+                    }],
+                },
+            ],
+            village_settings,
+        )
+        recruitment_tab.set_recruitment_strategy("duration")
+
+        self.assertTrue(
+            recruitment_tab.village_recruitment_controls["101"]["21"].isChecked()
+        )
+        self.assertNotIn(
+            "21",
+            recruitment_tab.village_recruitment_controls["202"],
+        )
+        self.assertTrue(
+            recruitment_tab.village_recruitment_controls["202"]["24"].isChecked()
+        )
+        self.assertEqual(
+            60,
+            recruitment_tab.village_queue_duration_controls["101"]["21"].value(),
+        )
+        self.assertEqual(
+            10,
+            recruitment_tab.village_queue_duration_controls["202"]["24"].value(),
+        )
+        self.assertFalse(
+            recruitment_tab.auto_recruitment_batch_size.isHidden()
+        )
+        self.assertTrue(
+            recruitment_tab.auto_recruitment_threshold.isHidden()
+        )
+        self.assertFalse(
+            recruitment_tab.village_queue_duration_controls["101"]["21"].isHidden()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "duration-recruitment.db"))
+            db.init()
+            settings = AppSettings()
+            settings.recruitment.automatic_enabled = True
+            settings.recruitment.queue_strategy = "duration"
+            settings.recruitment.villages = village_settings
+            window = MainWindow(
+                settings,
+                AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+            )
+            rows = [
+                {
+                    "village_id": "101",
+                    "village": "Phalanx village",
+                    "unit": "Phalanx",
+                    "unit_id": "21",
+                    "count": 1,
+                    "building_available": True,
+                    "training_times_seconds": [1800],
+                },
+                {
+                    "village_id": "202",
+                    "village": "Cavalry village",
+                    "unit": "Phalanx",
+                    "unit_id": "21",
+                    "count": 0,
+                    "building_available": True,
+                    "training_times_seconds": [1800],
+                },
+                {
+                    "village_id": "202",
+                    "village": "Cavalry village",
+                    "unit": "Theutates Thunder",
+                    "unit_id": "24",
+                    "count": 0,
+                    "building_available": True,
+                    "training_times_seconds": [600],
+                },
+            ]
+            try:
+                window._begin_automatic_recruitment(rows)
+                self.assertEqual(
+                    ["Phalanx", "Theutates Thunder"],
+                    [
+                        row["unit"]
+                        for row in window._auto_recruitment_candidates
+                    ],
+                )
+                self.assertEqual(
+                    [1, 1],
+                    [
+                        window._recruitment_batch_size_for_row(row)
+                        for row in window._auto_recruitment_candidates
+                    ],
+                )
+            finally:
+                window.close()
+                db.close()
+
+    def test_selected_unit_can_be_deselected_when_building_is_unavailable(self):
+        recruitment_tab = RecruitmentWidget()
+        recruitment_tab.update_village_recruitment_settings(
+            [{
+                "id": "537968638",
+                "name": "Dion",
+                "recruitment_units": [{
+                    "unit_id": "21",
+                    "building": "Koszary",
+                    "unit": "Phalanx",
+                    "building_available": False,
+                }],
+            }],
+            {
+                "537968638": VillageRecruitmentSettings(units={"21"}),
+            },
+        )
+
+        phalanx = recruitment_tab.village_recruitment_controls[
+            "537968638"
+        ]["21"]
+        self.assertTrue(phalanx.isChecked())
+        self.assertTrue(phalanx.isEnabled())
+        self.assertIn("automat pominie", phalanx.toolTip())
+
+        phalanx.setChecked(False)
+        self.assertFalse(phalanx.isChecked())
 
     def test_resource_milling_respects_global_gold_reserve_before_order(self):
         class FakeSession:

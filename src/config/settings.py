@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -67,9 +68,8 @@ class VillageRecruitmentSettings(BaseModel):
     """Automatic recruitment choices for one village."""
 
     enabled: bool = True
-    units: set[str] = Field(
-        default_factory=lambda: {"21", "24"}
-    )
+    units: set[str] = Field(default_factory=set)
+    queue_minutes_by_unit: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("units", mode="before")
     @classmethod
@@ -88,10 +88,35 @@ class VillageRecruitmentSettings(BaseModel):
             raise ValueError("Automatic recruitment unit IDs must be positive.")
         return normalized
 
+    @field_validator("queue_minutes_by_unit", mode="before")
+    @classmethod
+    def validate_queue_minutes(
+        cls,
+        values: dict[str, int],
+    ) -> dict[str, int]:
+        if not isinstance(values, dict):
+            raise ValueError("Recruitment queue targets must be a mapping.")
+        normalized = {}
+        for unit, minutes in values.items():
+            unit_id = str(unit)
+            if not unit_id.isdigit() or int(unit_id) <= 0:
+                raise ValueError("Recruitment queue target unit IDs must be positive.")
+            if (
+                isinstance(minutes, bool)
+                or not isinstance(minutes, int)
+                or not 1 <= minutes <= 1440
+            ):
+                raise ValueError(
+                    "Recruitment queue targets must be between 1 and 1440 minutes."
+                )
+            normalized[unit_id] = minutes
+        return normalized
+
 
 class RecruitmentSettings(BaseModel):
     """Optional automatic replenishment of target troop queues."""
     automatic_enabled: bool = False
+    queue_strategy: Literal["count", "duration"] = "count"
     batch_size: int = Field(default=5, ge=1, le=100)
     queue_threshold: int = Field(default=1, ge=0, le=100)
     pending_orders: set[str] = Field(default_factory=set)

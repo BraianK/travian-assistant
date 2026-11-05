@@ -1,7 +1,7 @@
 """Estimates resource use from continuously running recruitment queues."""
 
 from collections.abc import Mapping
-from math import isfinite
+from math import ceil, isfinite
 
 RESOURCE_NAMES_BY_ID = {
     "1": "wood",
@@ -9,6 +9,90 @@ RESOURCE_NAMES_BY_ID = {
     "3": "iron",
     "4": "grain",
 }
+
+
+def _is_positive_number(value) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and isfinite(value)
+        and value > 0
+    )
+
+
+def effective_training_interval_seconds(row: Mapping) -> float | None:
+    """Return seconds per queued unit across available parallel buildings.
+
+    Every building able to train the unit (e.g. barracks and great barracks)
+    works through its own queue, so the combined rate is the sum of the
+    individual rates.  Missing or invalid timing for any building makes the
+    estimate unavailable instead of silently over- or under-estimating it.
+    """
+    training_times = row.get("training_times_seconds")
+    if not isinstance(training_times, list) or not training_times:
+        legacy_time = row.get("training_time_seconds")
+        training_times = [legacy_time] if legacy_time is not None else []
+    if not training_times or not all(
+        _is_positive_number(value) for value in training_times
+    ):
+        return None
+    return 1 / sum(1 / value for value in training_times)
+
+
+def recruitment_queue_duration_seconds(row: Mapping) -> float | None:
+    """Return the remaining queue time for one unit type.
+
+    Uses the exact remaining time read from the game when available,
+    otherwise estimates it from the queued count and training interval.
+    """
+    remaining = row.get("queue_seconds_remaining")
+    if (
+        not isinstance(remaining, bool)
+        and isinstance(remaining, (int, float))
+        and isfinite(remaining)
+        and remaining >= 0
+    ):
+        return float(remaining)
+
+    count = row.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    if count == 0:
+        return 0.0
+    interval = effective_training_interval_seconds(row)
+    if interval is None:
+        return None
+    return count * interval
+
+
+def recruitment_queue_threshold_for_duration(
+    row: Mapping,
+    target_minutes: int,
+) -> int | None:
+    """Return the largest unit count whose estimated queue is below target."""
+    interval = effective_training_interval_seconds(row)
+    if interval is None:
+        return None
+    return max(0, ceil(target_minutes * 60 / interval) - 1)
+
+
+def recruitment_batch_for_duration(
+    row: Mapping,
+    target_minutes: int,
+    maximum_batch_size: int,
+) -> int | None:
+    """Return units needed to bring the estimated queue up to its target.
+
+    The result is at least one unit and never exceeds *maximum_batch_size*.
+    Affordability is checked live in the game right before the order is sent.
+    """
+    interval = effective_training_interval_seconds(row)
+    current_duration = recruitment_queue_duration_seconds(row)
+    if interval is None or current_duration is None:
+        return None
+    missing_duration = target_minutes * 60 - current_duration
+    required_units = ceil(missing_duration / interval)
+    return max(1, min(maximum_batch_size, required_units))
 
 
 def estimate_recruitment_costs_per_hour(
