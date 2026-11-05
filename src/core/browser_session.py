@@ -2527,6 +2527,234 @@ class TravianBrowserSession:
             )
         return outcome
 
+    _VACATION_PLAYER_JS = """
+            if (typeof Player === "undefined" || !window.angular) {
+                throw new Error("Player data is unavailable.");
+            }
+            const injector = angular.element(document.body).injector();
+            if (!injector) {
+                throw new Error("The game data injector is unavailable.");
+            }
+            const ownedVillages = injector.get("VillageService").U();
+            const firstVillage = ownedVillages
+                && Array.isArray(ownedVillages.data)
+                && ownedVillages.data[0];
+            const playerId = firstVillage && firstVillage.data
+                ? String(firstVillage.data.playerId || "") : "";
+            const player = playerId ? Player.get(playerId) : null;
+            if (!player || !player.data) {
+                throw new Error("The player model is not loaded.");
+            }
+            const serverTime = Number(
+                injector.get("$rootScope").currentServerTime
+            );
+            if (!Number.isFinite(serverTime) || serverTime <= 0) {
+                throw new Error("The game server time is unavailable.");
+            }
+            const vacation = {
+                player_id: playerId,
+                vacation_state: Number(player.data.vacationState),
+                start: Number(player.data.vacationStateStart),
+                end: Number(player.data.vacationStateEnd),
+                used_days: Number(player.data.usedVacationDays),
+                server_time: serverTime
+            };
+            if (["vacation_state", "start", "end", "used_days"].some(key =>
+                !Number.isFinite(vacation[key]))) {
+                throw new Error("The player's vacation data is incomplete.");
+            }
+    """
+
+    @staticmethod
+    def _validate_vacation_state(value) -> dict:
+        if not isinstance(value, dict):
+            raise RuntimeError("The Travian page returned invalid vacation data.")
+        numeric_keys = ("vacation_state", "start", "end", "used_days", "server_time")
+        if (
+            not str(value.get("player_id") or "").isdigit()
+            or any(
+                isinstance(value.get(key), bool)
+                or not isinstance(value.get(key), (int, float))
+                or not math.isfinite(value[key])
+                for key in numeric_keys
+            )
+        ):
+            raise RuntimeError("The Travian page returned invalid vacation data.")
+        return {
+            "player_id": str(value["player_id"]),
+            "vacation_state": int(value["vacation_state"]),
+            "start": float(value["start"]),
+            "end": float(value["end"]),
+            "used_days": int(value["used_days"]),
+            "server_time": float(value["server_time"]),
+        }
+
+    def read_vacation_state(self) -> dict:
+        """Read the player's vacation mode state and the game server time."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        expression = "(() => {" + self._VACATION_PLAYER_JS + """
+            return vacation;
+        })()"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=expression,
+            returnByValue=True,
+            _timeout=5,
+        )
+        remote_result = result.get("result", {})
+        if remote_result.get("subtype") == "error":
+            raise RuntimeError("The Travian page could not read vacation mode.")
+        return self._validate_vacation_state(remote_result.get("value"))
+
+    def change_vacation_state(
+        self,
+        days: int | None,
+        cancel_safety_seconds: int = 60,
+    ) -> dict:
+        """Plan vacation mode (``days``) or cancel a planned one (``None``).
+
+        The page rechecks the live state first: planning requires no vacation,
+        cancelling requires a planned vacation that is not about to start.
+        """
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        if (
+            days is not None
+            and (
+                isinstance(days, bool)
+                or not isinstance(days, int)
+                or not 1 <= days <= 14
+            )
+        ) or (
+            isinstance(cancel_safety_seconds, bool)
+            or not isinstance(cancel_safety_seconds, int)
+            or cancel_safety_seconds < 0
+        ):
+            raise ValueError("Invalid vacation mode request.")
+
+        request_id = uuid.uuid4().hex
+        expression = "((days, safetySeconds, requestId) => {" + (
+            self._VACATION_PLAYER_JS
+        ) + """
+            if (!window.Travian || typeof Travian.writeRequest !== "function") {
+                throw new Error("The game request API is unavailable.");
+            }
+            if (days !== null) {
+                if (vacation.vacation_state !== 0) {
+                    return {status: "not_idle", state: vacation};
+                }
+            } else {
+                if (vacation.vacation_state !== 1) {
+                    return {status: "not_planned", state: vacation};
+                }
+                if (vacation.start - vacation.server_time <= safetySeconds) {
+                    return {status: "too_late", state: vacation};
+                }
+            }
+            const accepted = Travian.writeRequest(
+                "player/changeVacationState",
+                days !== null ? {days} : {},
+                response => {
+                    const playerCache = response && Array.isArray(response.cache)
+                        ? response.cache.find(item =>
+                            item.name === `Player:${vacation.player_id}`)
+                        : null;
+                    const data = playerCache && playerCache.data || null;
+                    window["__travianAssistantVacationResponse_" + requestId] = {
+                        requestId,
+                        error: response && response.error
+                            ? String(response.error.message || response.error)
+                            : null,
+                        vacation_state: data ? Number(data.vacationState) : null,
+                        start: data ? Number(data.vacationStateStart) : null,
+                        end: data ? Number(data.vacationStateEnd) : null,
+                        used_days: data ? Number(data.usedVacationDays) : null
+                    };
+                }
+            );
+            return {
+                status: accepted ? "submitted" : "request_busy",
+                request_id: requestId,
+                state: vacation
+            };
+        })"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=(
+                f"{expression}({json.dumps(days)}, {cancel_safety_seconds}, "
+                f"{json.dumps(request_id)})"
+            ),
+            returnByValue=True,
+            _timeout=5,
+        )
+        remote_result = result.get("result", {})
+        if remote_result.get("subtype") == "error":
+            raise RuntimeError("The Travian page could not change vacation mode.")
+        outcome = remote_result.get("value")
+        if not isinstance(outcome, dict) or outcome.get("status") not in {
+            "not_idle",
+            "not_planned",
+            "too_late",
+            "submitted",
+            "request_busy",
+        }:
+            raise RuntimeError("The Travian page returned an invalid vacation result.")
+        if outcome["status"] == "submitted" and outcome.get("request_id") != request_id:
+            raise RuntimeError("The Travian page returned an invalid vacation request ID.")
+        outcome["state"] = self._validate_vacation_state(outcome.get("state"))
+        return outcome
+
+    def read_vacation_response(self, request_id: str, planned: bool) -> dict:
+        """Read the game's answer to a vacation change request."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        if (
+            not isinstance(request_id, str)
+            or not re.fullmatch(r"[a-f0-9]{32}", request_id)
+            or not isinstance(planned, bool)
+        ):
+            raise ValueError("Invalid vacation response lookup.")
+        expression = """(requestId, planned) => {
+            const key = "__travianAssistantVacationResponse_" + requestId;
+            const response = window[key];
+            if (!response || response.requestId !== requestId) {
+                return {status: "pending"};
+            }
+            delete window[key];
+            const confirmed = planned
+                ? response.vacation_state === 1 && response.start > 0
+                : response.vacation_state === 0;
+            return {
+                status: confirmed ? "confirmed" : "unconfirmed",
+                error: response.error,
+                vacation_state: response.vacation_state,
+                start: response.start,
+                end: response.end,
+                used_days: response.used_days
+            };
+        }"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=(
+                f"({expression})({json.dumps(request_id)}, "
+                f"{json.dumps(planned)})"
+            ),
+            returnByValue=True,
+            _timeout=5,
+        )
+        remote_result = result.get("result", {})
+        if remote_result.get("subtype") == "error":
+            raise RuntimeError("The Travian page could not read the vacation response.")
+        outcome = remote_result.get("value")
+        if not isinstance(outcome, dict) or outcome.get("status") not in {
+            "pending",
+            "confirmed",
+            "unconfirmed",
+        }:
+            raise RuntimeError("The Travian page returned an invalid vacation response.")
+        return outcome
+
     def _selected_village_id(self) -> str:
         result = self._tab.call_method(
             "Runtime.evaluate",

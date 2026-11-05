@@ -169,6 +169,53 @@ class ResourceMillingSettings(BaseModel):
     villages: dict[str, VillageMillingSettings] = Field(default_factory=dict)
 
 
+VACATION_MOVEMENT_TYPES = ("Atak", "Oblężenie", "Napad", "Zwiad")
+
+
+class VacationSettings(BaseModel):
+    """Daily rolling vacation mode that only activates under attack.
+
+    Vacation mode starts 24 hours after it is planned and can be cancelled
+    (with the vacation day refunded) until then. The automation plans it
+    every day and, shortly before activation, cancels it unless enough
+    hostile movements are incoming.
+    """
+
+    enabled: bool = False
+    plan_time: str = "21:00"
+    plan_window_minutes: int = Field(default=30, ge=1, le=180)
+    decision_minutes_before: int = Field(default=10, ge=2, le=1440)
+    vacation_days: int = Field(default=1, ge=1, le=14)
+    attack_threshold: int = Field(default=1, ge=1, le=1000)
+    counted_movement_types: set[str] = Field(
+        default_factory=lambda: {"Atak", "Oblężenie", "Napad"}
+    )
+    last_plan_date: str | None = None
+
+    @field_validator("plan_time")
+    @classmethod
+    def validate_plan_time(cls, value: str) -> str:
+        parts = str(value).split(":")
+        if (
+            len(parts) != 2
+            or not all(part.isdigit() for part in parts)
+            or not 0 <= int(parts[0]) <= 23
+            or not 0 <= int(parts[1]) <= 59
+        ):
+            raise ValueError("Vacation plan time must use HH:MM format.")
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+
+    @field_validator("counted_movement_types", mode="before")
+    @classmethod
+    def validate_movement_types(cls, values) -> set[str]:
+        if not isinstance(values, (set, list, tuple)):
+            raise ValueError("Counted movement types must be a collection.")
+        normalized = {str(value) for value in values}
+        if not normalized <= set(VACATION_MOVEMENT_TYPES):
+            raise ValueError("Unknown movement type for vacation decisions.")
+        return normalized
+
+
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
@@ -183,6 +230,7 @@ class AppSettings(BaseModel):
     resource_milling: ResourceMillingSettings = Field(
         default_factory=ResourceMillingSettings
     )
+    vacation: VacationSettings = Field(default_factory=VacationSettings)
     
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)

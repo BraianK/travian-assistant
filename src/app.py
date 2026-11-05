@@ -4,7 +4,7 @@ import logging
 import json
 import sys
 import tempfile
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from time import monotonic
 
@@ -17,15 +17,17 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QPushButton, QLineEdit, QComboBox,
     QGroupBox, QFormLayout, QCheckBox, QScrollArea, QSpinBox,
-    QGridLayout, QFrame,
+    QGridLayout, QFrame, QTimeEdit,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon
 
 try:
     from src.config.settings import (
         AppSettings,
         RecruitmentSettings,
+        VACATION_MOVEMENT_TYPES,
+        VacationSettings,
         VillageMillingSettings,
         VillageRecruitmentSettings,
     )
@@ -43,6 +45,14 @@ try:
         launch_chrome_for_game,
     )
     from src.core.village_tracker import VillageTracker
+    from src.core.vacation_planner import (
+        ACTION_CANCEL,
+        ACTION_KEEP,
+        ACTION_PLAN,
+        CANCEL_SAFETY_SECONDS,
+        count_hostile_movements,
+        decide_vacation_action,
+    )
     from src.core.village_advisor import get_village_plan
     from src.core.recruitment_economics import (
         estimate_recruitment_costs_per_hour,
@@ -54,6 +64,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from config.settings import (
         AppSettings,
         RecruitmentSettings,
+        VACATION_MOVEMENT_TYPES,
+        VacationSettings,
         VillageMillingSettings,
         VillageRecruitmentSettings,
     )
@@ -71,6 +83,14 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         launch_chrome_for_game,
     )
     from core.village_tracker import VillageTracker
+    from core.vacation_planner import (
+        ACTION_CANCEL,
+        ACTION_KEEP,
+        ACTION_PLAN,
+        CANCEL_SAFETY_SECONDS,
+        count_hostile_movements,
+        decide_vacation_action,
+    )
     from core.village_advisor import get_village_plan
     from core.recruitment_economics import (
         estimate_recruitment_costs_per_hour,
@@ -281,13 +301,13 @@ QLabel#emptyState {
     color: #64748b;
     padding: 28px;
 }
-QSpinBox {
+QAbstractSpinBox {
     background: #ffffff;
     border: 1px solid #cbd5e1;
     border-radius: 6px;
     padding: 4px 6px;
 }
-QSpinBox:disabled {
+QAbstractSpinBox:disabled {
     background: #f1f5f9;
     color: #a0aec0;
 }
@@ -387,38 +407,38 @@ QCheckBox::indicator:disabled {{
     background: #eef1f5;
     border-color: #cbd5e1;
 }}
-QSpinBox {{
+QAbstractSpinBox {{
     padding-right: 20px;
 }}
-QSpinBox::up-button, QSpinBox::down-button {{
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
     subcontrol-origin: border;
     width: 18px;
     border: none;
     border-left: 1px solid #e2e8f0;
     background: transparent;
 }}
-QSpinBox::up-button {{
+QAbstractSpinBox::up-button {{
     subcontrol-position: top right;
     border-top-right-radius: 6px;
 }}
-QSpinBox::down-button {{
+QAbstractSpinBox::down-button {{
     subcontrol-position: bottom right;
     border-bottom-right-radius: 6px;
 }}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
     background: #eef2f7;
 }}
-QSpinBox::up-arrow {{
+QAbstractSpinBox::up-arrow {{
     image: url({base}/up.svg);
     width: 9px;
     height: 6px;
 }}
-QSpinBox::down-arrow {{
+QAbstractSpinBox::down-arrow {{
     image: url({base}/down.svg);
     width: 9px;
     height: 6px;
 }}
-QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled {{
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::down-arrow:disabled {{
     image: none;
 }}
 """
@@ -428,6 +448,7 @@ _TROOP_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 _RECRUITMENT_QUEUE_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 _RESOURCE_MILLING_REFRESH_INTERVAL_MS = 30 * 1000
 _AUTO_RECRUITMENT_ORDER_INTERVAL_MS = 6 * 1000
+_VACATION_CHECK_INTERVAL_MS = 30 * 1000
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
 DEFAULT_RECRUITMENT_QUEUE_MINUTES = 60
 _NPC_TRADER_ORDER_INTERVAL_MS = 6 * 1000
@@ -2305,6 +2326,283 @@ class MillingWidget(QWidget):
         )
 
 
+class VacationWidget(QWidget):
+    """Daily rolling vacation-mode safeguard controls and status."""
+
+    enabled_toggled = Signal(bool)
+    setting_changed = Signal(str, object)
+    check_requested = Signal()
+    plan_requested = Signal()
+    cancel_requested = Signal()
+
+    _STATE_CHIPS = {
+        "none": ("Brak zaplanowanych wakacji", "muted"),
+        "planned": ("Wakacje zaplanowane", "pending"),
+        "active": ("Wakacje aktywne", "active"),
+        "unknown": ("Stan nieznany", "muted"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer_layout.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Wakacje")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Automat codziennie planuje tryb wakacyjny (włącza się po 24 h) "
+            "i tuż przed aktywacją anuluje go, jeśli nie nadchodzą ataki. "
+            "Gdy nadchodzą — zostawia wakacje, więc atakujący zastaną Cię "
+            "na wakacjach. Anulowanie zwraca dzień wakacji."
+        )
+        subtitle.setObjectName("secondaryText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        # Status card ---------------------------------------------------------
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 16, 18, 16)
+        status_layout.setSpacing(12)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        self.enabled_toggle = _AutomationToggle()
+        self.enabled_toggle.toggled.connect(self.enabled_toggled.emit)
+        top_row.addWidget(self.enabled_toggle)
+        self.state_chip = QLabel()
+        top_row.addWidget(self.state_chip)
+        top_row.addStretch()
+        self.check_button = QPushButton("⟳  Sprawdź teraz")
+        self.check_button.clicked.connect(self.check_requested.emit)
+        top_row.addWidget(self.check_button)
+        status_layout.addLayout(top_row)
+
+        details = QGridLayout()
+        details.setHorizontalSpacing(18)
+        details.setVerticalSpacing(6)
+        self.detail_labels: dict[str, QLabel] = {}
+        for row, (key, caption) in enumerate((
+            ("activation", "Aktywacja wakacji"),
+            ("next_action", "Następny krok"),
+            ("attacks", "Nadchodzące wrogie ruchy"),
+            ("days", "Wykorzystane dni wakacji"),
+        )):
+            caption_label = QLabel(caption.upper())
+            caption_label.setObjectName("columnHeader")
+            details.addWidget(caption_label, row, 0)
+            value = QLabel("—")
+            value.setWordWrap(True)
+            details.addWidget(value, row, 1)
+            self.detail_labels[key] = value
+        details.setColumnStretch(1, 1)
+        status_layout.addLayout(details)
+
+        manual_row = QHBoxLayout()
+        manual_hint = QLabel("Ręcznie:")
+        manual_hint.setObjectName("fieldLabel")
+        manual_row.addWidget(manual_hint)
+        self.plan_button = QPushButton("Zaplanuj wakacje teraz…")
+        self.plan_button.clicked.connect(self.plan_requested.emit)
+        manual_row.addWidget(self.plan_button)
+        self.cancel_button = QPushButton("Anuluj zaplanowane…")
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        manual_row.addWidget(self.cancel_button)
+        manual_row.addStretch()
+        status_layout.addLayout(manual_row)
+        layout.addWidget(status_card)
+
+        # Settings card -------------------------------------------------------
+        settings_card = QFrame()
+        settings_card.setObjectName("card")
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setContentsMargins(18, 16, 18, 16)
+        settings_layout.setSpacing(10)
+        settings_title = QLabel("Ustawienia")
+        settings_title.setObjectName("sectionTitle")
+        settings_layout.addWidget(settings_title)
+
+        def sentence(*parts) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            for part in parts:
+                row.addWidget(QLabel(part) if isinstance(part, str) else part)
+            row.addStretch()
+            settings_layout.addLayout(row)
+            return row
+
+        self.plan_time = QTimeEdit()
+        self.plan_time.setDisplayFormat("HH:mm")
+        self.plan_time.setFixedWidth(95)
+        self.plan_window = self._spin(1, 180, " min", 90)
+        sentence(
+            "Planuj wakacje codziennie o", self.plan_time,
+            "(czas komputera), w ciągu", self.plan_window, ".",
+        )
+        self.vacation_days = self._spin(1, 14, " dni", 80)
+        sentence("Długość wakacji:", self.vacation_days)
+        self.decision_minutes = self._spin(2, 1440, " min", 100)
+        sentence(
+            "Decyzję podejmij", self.decision_minutes,
+            "przed aktywacją wakacji.",
+        )
+        self.attack_threshold = self._spin(1, 1000, "", 80)
+        sentence(
+            "Zostaw wakacje, gdy liczba nadchodzących wrogich ruchów wynosi "
+            "co najmniej",
+            self.attack_threshold, ".",
+        )
+        self.movement_checkboxes: dict[str, QCheckBox] = {}
+        movement_row = QHBoxLayout()
+        movement_row.setSpacing(14)
+        movement_row.addWidget(QLabel("Liczone ruchy:"))
+        for movement_type in VACATION_MOVEMENT_TYPES:
+            checkbox = QCheckBox(movement_type)
+            checkbox.toggled.connect(self._emit_movement_types)
+            movement_row.addWidget(checkbox)
+            self.movement_checkboxes[movement_type] = checkbox
+        movement_row.addStretch()
+        settings_layout.addLayout(movement_row)
+
+        self.plan_time.timeChanged.connect(
+            lambda value: self.setting_changed.emit(
+                "plan_time", value.toString("HH:mm")
+            )
+        )
+        for field, spin_box in (
+            ("plan_window_minutes", self.plan_window),
+            ("vacation_days", self.vacation_days),
+            ("decision_minutes_before", self.decision_minutes),
+            ("attack_threshold", self.attack_threshold),
+        ):
+            spin_box.valueChanged.connect(
+                lambda value, current_field=field:
+                    self.setting_changed.emit(current_field, value)
+            )
+        layout.addWidget(settings_card)
+
+        warning = QLabel(
+            "<b>Ważne:</b> aplikacja musi być włączona i połączona z grą "
+            "w chwili decyzji — inaczej nikt nie anuluje wakacji i włączą się "
+            "same. Gdy wakacje się włączą: zużywasz dni wakacji, oddajesz oazy, "
+            "posiłki innych graczy wracają, a produkcja drewna, gliny i żelaza "
+            "spada do zera. Atak wysłany już po decyzji o anulowaniu zastanie "
+            "Cię bez wakacji."
+        )
+        warning.setObjectName("footnote")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        # Event log -------------------------------------------------------------
+        log_title = QLabel("Dziennik")
+        log_title.setObjectName("sectionTitle")
+        layout.addWidget(log_title)
+        self.log_list = QListWidget()
+        self.log_list.setMinimumHeight(160)
+        layout.addWidget(self.log_list)
+        layout.addStretch()
+
+        self.set_disconnected()
+
+    @staticmethod
+    def _spin(minimum: int, maximum: int, suffix: str, width: int) -> QSpinBox:
+        spin_box = QSpinBox()
+        spin_box.setRange(minimum, maximum)
+        spin_box.setSuffix(suffix)
+        spin_box.setFixedWidth(width)
+        return spin_box
+
+    def _emit_movement_types(self, *_args):
+        self.setting_changed.emit(
+            "counted_movement_types",
+            {
+                movement_type
+                for movement_type, checkbox in self.movement_checkboxes.items()
+                if checkbox.isChecked()
+            },
+        )
+
+    def load_settings(self, settings: VacationSettings):
+        widgets = [
+            self.enabled_toggle, self.plan_time, self.plan_window,
+            self.vacation_days, self.decision_minutes, self.attack_threshold,
+            *self.movement_checkboxes.values(),
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.enabled_toggle.setChecked(settings.enabled)
+        self.plan_time.setTime(QTime.fromString(settings.plan_time, "HH:mm"))
+        self.plan_window.setValue(settings.plan_window_minutes)
+        self.vacation_days.setValue(settings.vacation_days)
+        self.decision_minutes.setValue(settings.decision_minutes_before)
+        self.attack_threshold.setValue(settings.attack_threshold)
+        for movement_type, checkbox in self.movement_checkboxes.items():
+            checkbox.setChecked(movement_type in settings.counted_movement_types)
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def set_state(self, state: dict | None, counted_attacks: int | None):
+        connected = state is not None
+        for button in (self.check_button, self.plan_button, self.cancel_button):
+            button.setEnabled(connected)
+        if state is None:
+            _set_status_chip(self.state_chip, "Nie połączono z grą", "muted")
+            for key in ("activation", "attacks", "days"):
+                self.detail_labels[key].setText("—")
+            return
+        vacation_state = state["vacation_state"]
+        if vacation_state == 0:
+            kind = "none"
+        elif vacation_state == 1 and state["server_time"] < state["start"]:
+            kind = "planned"
+        elif vacation_state in (1, 2):
+            kind = "active"
+        else:
+            kind = "unknown"
+        _set_status_chip(self.state_chip, *self._STATE_CHIPS[kind])
+        self.plan_button.setEnabled(kind == "none")
+        self.cancel_button.setEnabled(kind == "planned")
+        if kind == "planned":
+            remaining = state["start"] - state["server_time"]
+            hours, minutes = divmod(int(remaining // 60), 60)
+            self.detail_labels["activation"].setText(
+                f"{datetime.fromtimestamp(state['start']):%d.%m %H:%M:%S} "
+                f"(za {hours} h {minutes:02d} min)"
+            )
+        elif kind == "active" and state["end"] > 0:
+            self.detail_labels["activation"].setText(
+                f"Trwają do {datetime.fromtimestamp(state['end']):%d.%m %H:%M}"
+            )
+        else:
+            self.detail_labels["activation"].setText("—")
+        self.detail_labels["attacks"].setText(
+            "—" if counted_attacks is None else str(counted_attacks)
+        )
+        self.detail_labels["days"].setText(str(state["used_days"]))
+
+    def set_next_action(self, text: str):
+        self.detail_labels["next_action"].setText(text)
+
+    def set_disconnected(self):
+        self.set_state(None, None)
+        self.set_next_action("Połącz z grą, aby sterować wakacjami.")
+
+    def add_log(self, text: str):
+        self.log_list.insertItem(0, f"{datetime.now():%d.%m %H:%M:%S}  {text}")
+        while self.log_list.count() > 200:
+            self.log_list.takeItem(self.log_list.count() - 1)
+
+
 class IncomingAttacksWidget(QWidget):
     """Display the persisted history of attacks detected in owned villages."""
 
@@ -2835,6 +3133,9 @@ class MainWindow(QMainWindow):
         self._seen_incoming_attack_ids: set[str] = set()
         self._incoming_attacks_by_key: dict[str, dict] = {}
         self._dismissed_incoming_attack_ids: set[str] = set()
+        self._vacation_pending_request: tuple[str, bool, int] | None = None
+        self._vacation_retry_after = 0.0
+        self._vacation_last_logged: tuple | None = None
         
         self.setWindowTitle(settings.app_name)
         self.resize(1280, 860)
@@ -2873,6 +3174,9 @@ class MainWindow(QMainWindow):
         self.resource_milling_timer.timeout.connect(
             self._check_resource_milling
         )
+        self.vacation_timer = QTimer(self)
+        self.vacation_timer.setInterval(_VACATION_CHECK_INTERVAL_MS)
+        self.vacation_timer.timeout.connect(self._check_vacation)
         self.incoming_attack_eta_timer = QTimer(self)
         self.incoming_attack_eta_timer.setInterval(1000)
         self.incoming_attack_eta_timer.timeout.connect(
@@ -3004,6 +3308,15 @@ class MainWindow(QMainWindow):
                 self.incoming_attack_repo.get_recent_attacks()
             )
         self.content_tabs.addTab(self.incoming_attacks_tab, "Ataki")
+
+        self.vacation_tab = VacationWidget()
+        self.vacation_tab.load_settings(self.settings.vacation)
+        self.vacation_tab.enabled_toggled.connect(self._set_vacation_enabled)
+        self.vacation_tab.setting_changed.connect(self._set_vacation_setting)
+        self.vacation_tab.check_requested.connect(self._check_vacation)
+        self.vacation_tab.plan_requested.connect(self._plan_vacation_manually)
+        self.vacation_tab.cancel_requested.connect(self._cancel_vacation_manually)
+        self.content_tabs.addTab(self.vacation_tab, "Wakacje")
         
         layout.addWidget(self.content_tabs, stretch=3)
         
@@ -3054,6 +3367,7 @@ class MainWindow(QMainWindow):
                 self.troops_refresh_timer.start()
                 self.recruitment_queue_timer.start()
                 self.resource_milling_timer.start()
+                self.vacation_timer.start()
                 try:
                     village_count = (
                         self.browser_session.start_incoming_attack_listener(
@@ -3074,9 +3388,11 @@ class MainWindow(QMainWindow):
                 )
                 QTimer.singleShot(2000, self._check_recruitment_queues)
                 QTimer.singleShot(2500, self._check_resource_milling)
+                QTimer.singleShot(3500, self._check_vacation)
             else:
                 self.recruitment_queue_timer.stop()
                 self.resource_milling_timer.stop()
+                self.vacation_timer.stop()
                 self.incoming_attack_eta_timer.stop()
         except Exception as error:
             self.browser_session = None
@@ -4149,6 +4465,224 @@ class MainWindow(QMainWindow):
             "Sprawdź kolejkę w grze."
         )
 
+    # Vacation safeguard --------------------------------------------------------
+    def _set_vacation_enabled(self, enabled: bool):
+        if enabled:
+            answer = QMessageBox.question(
+                self,
+                "Włączyć automat wakacji?",
+                "Automat będzie codziennie planował tryb wakacyjny i anulował "
+                "go tuż przed aktywacją, jeśli nie nadchodzą ataki.\n\n"
+                "Jeśli w chwili decyzji aplikacja nie będzie połączona z grą, "
+                "wakacje włączą się same: zużyjesz dni wakacji, stracisz oazy, "
+                "a posiłki innych graczy wrócą do nich.\n\nWłączyć?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.vacation_tab.load_settings(self.settings.vacation)
+                return
+        self.settings.vacation.enabled = enabled
+        if not self._save_recruitment_settings():
+            self.settings.vacation.enabled = not enabled
+            self.vacation_tab.load_settings(self.settings.vacation)
+            return
+        self.vacation_tab.add_log(
+            "Automat wakacji włączony." if enabled else "Automat wakacji wyłączony."
+        )
+        self._check_vacation()
+
+    def _set_vacation_setting(self, field: str, value):
+        previous = getattr(self.settings.vacation, field)
+        try:
+            updated = VacationSettings.model_validate({
+                **self.settings.vacation.model_dump(),
+                field: value,
+            })
+        except ValueError as error:
+            self.vacation_tab.add_log(f"Nieprawidłowe ustawienie: {error}")
+            self.vacation_tab.load_settings(self.settings.vacation)
+            return
+        setattr(self.settings.vacation, field, getattr(updated, field))
+        if not self._save_recruitment_settings():
+            setattr(self.settings.vacation, field, previous)
+            self.vacation_tab.load_settings(self.settings.vacation)
+
+    def _read_vacation_attacks(self) -> list[dict] | None:
+        state = self.dashboard_tab._live_state
+        villages = state.get("villages", []) if isinstance(state, dict) else []
+        if not villages:
+            return None
+        try:
+            return self.browser_session.read_incoming_attacks(villages)
+        except Exception as error:
+            logger.warning("Vacation safeguard could not read attacks: %s", error)
+            return None
+
+    def _check_vacation(self):
+        if self.browser_session is None or self.dashboard_tab._live_state is None:
+            self.vacation_tab.set_disconnected()
+            return
+        if self._vacation_pending_request is not None:
+            return
+        try:
+            state = self.browser_session.read_vacation_state()
+        except Exception as error:
+            logger.warning("Could not read vacation state: %s", error)
+            self.vacation_tab.set_state(None, None)
+            self.vacation_tab.set_next_action(
+                f"Nie udało się odczytać stanu wakacji: {error}"
+            )
+            return
+
+        settings = self.settings.vacation
+        attacks = self._read_vacation_attacks()
+        counted = (
+            None if attacks is None
+            else count_hostile_movements(
+                attacks,
+                settings.counted_movement_types,
+                state["server_time"],
+            )
+        )
+        self.vacation_tab.set_state(state, counted)
+        if not settings.enabled:
+            self.vacation_tab.set_next_action(
+                "Automat wyłączony — nic nie zmieniam."
+            )
+            return
+
+        decision = decide_vacation_action(
+            state,
+            datetime.now(),
+            attacks,
+            plan_time=settings.plan_time,
+            plan_window_minutes=settings.plan_window_minutes,
+            decision_minutes_before=settings.decision_minutes_before,
+            attack_threshold=settings.attack_threshold,
+            counted_movement_types=settings.counted_movement_types,
+            last_plan_date=settings.last_plan_date,
+        )
+        self.vacation_tab.set_next_action(decision.reason)
+        if decision.action in (ACTION_KEEP, ACTION_PLAN, ACTION_CANCEL):
+            log_key = (decision.action, state["start"])
+            if log_key != self._vacation_last_logged:
+                self._vacation_last_logged = log_key
+                self.vacation_tab.add_log(decision.reason)
+        if (
+            decision.action in (ACTION_PLAN, ACTION_CANCEL)
+            and monotonic() >= self._vacation_retry_after
+        ):
+            self._send_vacation_change(
+                settings.vacation_days if decision.action == ACTION_PLAN else None
+            )
+
+    def _send_vacation_change(self, days: int | None, manual: bool = False):
+        planned = days is not None
+        try:
+            outcome = self.browser_session.change_vacation_state(
+                days,
+                CANCEL_SAFETY_SECONDS,
+            )
+        except Exception as error:
+            logger.exception("Vacation change failed")
+            self._vacation_retry_after = monotonic() + (300 if planned else 45)
+            self.vacation_tab.add_log(f"Błąd wysyłania do gry: {error}")
+            return
+
+        status = outcome["status"]
+        if status != "submitted":
+            messages = {
+                "not_idle": "wakacje są już zaplanowane lub aktywne",
+                "not_planned": "nie ma zaplanowanych wakacji do anulowania",
+                "too_late": "za mało czasu do aktywacji, by bezpiecznie anulować",
+                "request_busy": "gra przetwarza inne zlecenie",
+            }
+            self._vacation_retry_after = monotonic() + 45
+            self.vacation_tab.add_log(
+                f"Nie wysłano ({'planowanie' if planned else 'anulowanie'}): "
+                f"{messages[status]}."
+            )
+            self.vacation_tab.set_state(outcome["state"], None)
+            return
+
+        self._vacation_pending_request = (outcome["request_id"], planned, 0)
+        self.vacation_tab.add_log(
+            ("Wysłano planowanie wakacji" if planned else "Wysłano anulowanie wakacji")
+            + (" (ręcznie)." if manual else ".")
+        )
+        QTimer.singleShot(1500, self._verify_vacation_change)
+
+    def _verify_vacation_change(self):
+        if self._vacation_pending_request is None or self.browser_session is None:
+            self._vacation_pending_request = None
+            return
+        request_id, planned, attempts = self._vacation_pending_request
+        try:
+            result = self.browser_session.read_vacation_response(request_id, planned)
+        except Exception as error:
+            logger.exception("Could not verify vacation change")
+            result = {"status": "unconfirmed", "error": str(error)}
+
+        if result["status"] == "pending" and attempts < 5:
+            self._vacation_pending_request = (request_id, planned, attempts + 1)
+            QTimer.singleShot(1500, self._verify_vacation_change)
+            return
+
+        self._vacation_pending_request = None
+        if result["status"] == "confirmed":
+            if planned:
+                self.settings.vacation.last_plan_date = date.today().isoformat()
+                self._save_recruitment_settings()
+                self.vacation_tab.add_log(
+                    "Gra potwierdziła: wakacje zaplanowane na "
+                    f"{datetime.fromtimestamp(result['start']):%d.%m %H:%M:%S}."
+                )
+            else:
+                self.vacation_tab.add_log(
+                    "Gra potwierdziła: wakacje anulowane, dzień wakacji zwrócony."
+                )
+            self._vacation_retry_after = 0.0
+        else:
+            reason = result.get("error") or (
+                "brak odpowiedzi gry" if result["status"] == "pending"
+                else "stan gracza się nie zmienił"
+            )
+            self._vacation_retry_after = monotonic() + (300 if planned else 45)
+            self.vacation_tab.add_log(
+                f"Gra nie potwierdziła {'planowania' if planned else 'anulowania'}: "
+                f"{reason}. Ponowię przy kolejnej kontroli."
+            )
+        QTimer.singleShot(500, self._check_vacation)
+
+    def _plan_vacation_manually(self):
+        if self.browser_session is None or self._vacation_pending_request is not None:
+            return
+        days = self.settings.vacation.vacation_days
+        answer = QMessageBox.question(
+            self,
+            "Zaplanować wakacje?",
+            f"Zaplanować tryb wakacyjny na {days} d.? Włączy się za 24 h, "
+            "o ile wcześniej go nie anulujesz.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self._send_vacation_change(days, manual=True)
+
+    def _cancel_vacation_manually(self):
+        if self.browser_session is None or self._vacation_pending_request is not None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Anulować wakacje?",
+            "Anulować zaplanowany tryb wakacyjny? Dzień wakacji zostanie zwrócony.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self._send_vacation_change(None, manual=True)
+
     def _check_resource_milling(self):
         state = self.dashboard_tab._live_state
         if (
@@ -4639,6 +5173,8 @@ class MainWindow(QMainWindow):
         self.troops_refresh_timer.stop()
         self.recruitment_queue_timer.stop()
         self.resource_milling_timer.stop()
+        self.vacation_timer.stop()
+        self._vacation_pending_request = None
         self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
             self.browser_session.stop_incoming_attack_listener()
@@ -4649,6 +5185,7 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.refresh_troops_btn.setEnabled(False)
         self.dashboard_tab.connection_status.setText("Nie połączono z grą")
         self.incoming_attacks_tab.set_disconnected()
+        self.vacation_tab.set_disconnected()
         self.dashboard_tab.clear_live_state()
         self.dashboard_tab.clear_recruitment_queues()
         self.recruitment_tab.clear_recruitment_queues()
