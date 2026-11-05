@@ -476,60 +476,38 @@ class BaselineSmokeTests(unittest.TestCase):
                     "w kolejce: 2 szt.",
                     window.dashboard_tab.village_plan_label.text(),
                 )
+                phalanx_row = window.recruitment_tab.unit_rows[("101", "21")]
+                self.assertEqual("Phalanx", phalanx_row["checkbox"].text())
+                self.assertEqual("Koszary", phalanx_row["building"].text())
+                self.assertEqual("0 szt.", phalanx_row["count"].text())
+                self.assertEqual("0 min", phalanx_row["duration"].text())
                 self.assertEqual(
-                    "Brak rekrutacji",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 4).text(),
-                )
-                self.assertEqual(
-                    "Phalanx · Koszary",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 1).text(),
-                )
-                self.assertEqual(
-                    "0 szt.",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 2).text(),
-                )
-                self.assertEqual(
-                    "0 min",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 3).text(),
-                )
-                self.assertEqual(
-                    5,
-                    window.recruitment_tab.recruitment_queue_table.columnCount(),
+                    "2 szt.",
+                    window.recruitment_tab.unit_rows[("101", "24")]["count"].text(),
                 )
                 self.assertEqual(
                     window.village_list_widget.count(),
-                    window.recruitment_tab.recruitment_economics_table.rowCount(),
+                    len(window.recruitment_tab.village_economics_labels),
                 )
-                self.assertEqual(
-                    5,
-                    window.recruitment_tab.recruitment_economics_table.columnCount(),
-                )
-                self.assertEqual(
-                    "Drewno",
-                    window.recruitment_tab.recruitment_economics_table.horizontalHeaderItem(1).text(),
-                )
-                self.assertIn(
-                    "Przychód  +12/h",
-                    window.recruitment_tab.recruitment_economics_table.item(0, 1).text(),
-                )
+                wood_label = window.recruitment_tab.village_economics_labels[
+                    "101"
+                ]["Drewno"]
+                self.assertIn("Drewno", wood_label.text())
+                self.assertIn("Przychód  +12/h", wood_label.toolTip())
                 window.settings.recruitment.automatic_enabled = True
                 window.settings.recruitment.villages["101"] = (
                     VillageRecruitmentSettings(units={"21"})
                 )
                 window._render_recruitment_economics(queue_rows)
-                self.assertEqual(
-                    True,
-                    "Rekrutacja  20/h"
-                    in window.recruitment_tab.recruitment_economics_table.item(0, 1).text(),
-                )
-                self.assertEqual(
-                    True,
-                    "Bilans  −8/h"
-                    in window.recruitment_tab.recruitment_economics_table.item(0, 1).text(),
-                )
+                self.assertIn("Rekrutacja  20/h", wood_label.toolTip())
+                self.assertIn("Bilans  −8/h", wood_label.toolTip())
+                self.assertIn("−8/h", wood_label.text())
                 self.assertIn(
                     "bez rekrutacji",
                     window.recruitment_tab.recruitment_queue_status.text(),
+                )
+                self.assertFalse(
+                    window.recruitment_tab.clear_recruitment_pending_btn.isEnabled()
                 )
                 window._update_recruitment_queues(
                     window.dashboard_tab._recruitment_queue_rows,
@@ -537,11 +515,12 @@ class BaselineSmokeTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "potwierdzanie",
-                    window.recruitment_tab.recruitment_queue_table.item(0, 4).text(),
+                    phalanx_row["status"].text(),
                 )
                 self.assertTrue(
                     window.recruitment_tab.clear_recruitment_pending_btn.isEnabled()
                 )
+                self.assertFalse(window.recruitment_tab.pending_banner.isHidden())
                 window.dashboard_tab.refresh_resource_history("101")
                 self.assertEqual(1, len(window.dashboard_tab.resource_history_figure.axes))
             finally:
@@ -1889,6 +1868,81 @@ class BaselineSmokeTests(unittest.TestCase):
                         for row in window._auto_recruitment_candidates
                     ],
                 )
+            finally:
+                window.close()
+                db.close()
+
+    def test_recruitment_tab_controls_update_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "recruitment-ui.db"))
+            db.init()
+            settings = AppSettings()
+            settings.recruitment.villages["101"] = VillageRecruitmentSettings(
+                units={"21"},
+            )
+            window = MainWindow(
+                settings,
+                AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+            )
+            tab = window.recruitment_tab
+            try:
+                with patch.object(AppSettings, "save", return_value=None):
+                    window._render_village_recruitment_settings([{
+                        "id": "101",
+                        "name": "Testonia",
+                        "recruitment_units": [
+                            {
+                                "unit_id": "21",
+                                "building": "Koszary",
+                                "unit": "Phalanx",
+                                "building_available": True,
+                            },
+                            {
+                                "unit_id": "22",
+                                "building": "Koszary",
+                                "unit": "Swordsman",
+                                "building_available": True,
+                            },
+                            {
+                                "unit_id": "27",
+                                "building": "Warsztat",
+                                "unit": "Ram",
+                                "building_available": False,
+                            },
+                        ],
+                    }])
+                    self.assertNotIn(("101", "27"), tab.unit_rows)
+                    self.assertTrue(
+                        tab.village_queue_duration_controls["101"]["21"].isHidden()
+                    )
+
+                    tab.duration_strategy_button.click()
+                    self.assertEqual("duration", settings.recruitment.queue_strategy)
+                    self.assertTrue(tab.auto_recruitment_threshold.isHidden())
+                    self.assertFalse(
+                        tab.village_queue_duration_controls["101"]["21"].isHidden()
+                    )
+                    self.assertTrue(
+                        tab.village_queue_duration_controls["101"]["22"].isHidden()
+                    )
+
+                    tab.village_recruitment_controls["101"]["22"].setChecked(True)
+                    self.assertEqual({"21", "22"}, settings.recruitment.villages["101"].units)
+                    self.assertFalse(
+                        tab.village_queue_duration_controls["101"]["22"].isHidden()
+                    )
+                    tab.village_queue_duration_controls["101"]["22"].setValue(25)
+                    self.assertEqual(
+                        {"22": 25},
+                        settings.recruitment.villages["101"].queue_minutes_by_unit,
+                    )
+                    tab.village_recruitment_controls["101"]["enabled"].setChecked(False)
+                    self.assertFalse(settings.recruitment.villages["101"].enabled)
+                    self.assertIn(
+                        "wyłączony",
+                        tab.village_summary_labels["101"].text(),
+                    )
             finally:
                 window.close()
                 db.close()

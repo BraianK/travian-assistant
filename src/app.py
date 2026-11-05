@@ -3,6 +3,7 @@
 import logging
 import json
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QPushButton, QLineEdit, QComboBox,
     QGroupBox, QFormLayout, QCheckBox, QScrollArea, QSpinBox,
-    QGridLayout,
+    QGridLayout, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon
@@ -203,7 +204,205 @@ QProgressBar::chunk {
     background: #4b8bf4;
     border-radius: 4px;
 }
+QFrame#card, QFrame#villageCard {
+    background: #ffffff;
+    border: 1px solid #dfe5ec;
+    border-radius: 10px;
+}
+QFrame#card QLabel, QFrame#card QCheckBox,
+QFrame#villageCard QLabel, QFrame#villageCard QCheckBox,
+QFrame#pendingBanner QLabel {
+    background: transparent;
+}
+QFrame#divider {
+    background: #edf1f5;
+    border: none;
+}
+QFrame#pendingBanner {
+    background: #fff8e1;
+    border: 1px solid #f5d77a;
+    border-radius: 8px;
+}
+QLabel#columnHeader {
+    color: #8492a6;
+    font-size: 8pt;
+    font-weight: 600;
+}
+QLabel#pageTitle {
+    font-size: 17pt;
+    font-weight: 700;
+    color: #1e293b;
+}
+QLabel#sectionTitle {
+    font-size: 12pt;
+    font-weight: 700;
+    color: #1e293b;
+}
+QLabel#villageName {
+    font-size: 12pt;
+    font-weight: 700;
+    color: #1e293b;
+}
+QCheckBox#unitUnselected {
+    color: #64748b;
+}
+QLabel#fieldLabel {
+    color: #475569;
+    font-weight: 600;
+}
+QLabel#footnote {
+    color: #94a3b8;
+    font-size: 9pt;
+}
+QLabel#emptyState {
+    background: #ffffff;
+    border: 1px dashed #cbd5e1;
+    border-radius: 10px;
+    color: #64748b;
+    padding: 28px;
+}
+QSpinBox {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 4px 6px;
+}
+QSpinBox:disabled {
+    background: #f1f5f9;
+    color: #a0aec0;
+}
+QCheckBox {
+    spacing: 7px;
+}
+QPushButton#automationToggle {
+    background: #eef1f5;
+    border: 1px solid #cbd5e1;
+    border-radius: 17px;
+    color: #475569;
+    font-weight: 600;
+    padding: 8px 18px;
+}
+QPushButton#automationToggle:checked {
+    background: #dcfce7;
+    border-color: #86efac;
+    color: #166534;
+}
+QPushButton#segmentLeft, QPushButton#segmentRight {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    color: #475569;
+    padding: 7px 14px;
+}
+QPushButton#segmentLeft {
+    border-top-left-radius: 7px;
+    border-bottom-left-radius: 7px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+QPushButton#segmentRight {
+    border-left: none;
+    border-top-right-radius: 7px;
+    border-bottom-right-radius: 7px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+QPushButton#segmentLeft:checked, QPushButton#segmentRight:checked {
+    background: #2563eb;
+    border-color: #2563eb;
+    color: #ffffff;
+    font-weight: 600;
+}
 """
+
+_UI_ICONS = {
+    "check.svg": (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
+        "<path d='M3.5 8.5l3 3 6-7' fill='none' stroke='#ffffff' "
+        "stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/>"
+        "</svg>"
+    ),
+    "up.svg": (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'>"
+        "<path d='M1 5l4-4 4 4' fill='none' stroke='#64748b' "
+        "stroke-width='1.6' stroke-linecap='round'/></svg>"
+    ),
+    "down.svg": (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'>"
+        "<path d='M1 1l4 4 4-4' fill='none' stroke='#64748b' "
+        "stroke-width='1.6' stroke-linecap='round'/></svg>"
+    ),
+}
+
+
+def _icon_stylesheet() -> str:
+    """Return QSS rules for check boxes and spin boxes with drawn icons."""
+    try:
+        icon_dir = Path(tempfile.gettempdir()) / "travian_assistant_ui"
+        icon_dir.mkdir(parents=True, exist_ok=True)
+        for name, svg in _UI_ICONS.items():
+            path = icon_dir / name
+            if not path.exists() or path.read_text(encoding="utf-8") != svg:
+                path.write_text(svg, encoding="utf-8")
+    except OSError:
+        logger.warning("Could not prepare UI icons", exc_info=True)
+        return ""
+    base = icon_dir.as_posix()
+    return f"""
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid #94a3b8;
+    border-radius: 4px;
+    background: #ffffff;
+}}
+QCheckBox::indicator:hover {{
+    border-color: #2563eb;
+}}
+QCheckBox::indicator:checked {{
+    background: #2563eb;
+    border-color: #2563eb;
+    image: url({base}/check.svg);
+}}
+QCheckBox::indicator:disabled {{
+    background: #eef1f5;
+    border-color: #cbd5e1;
+}}
+QSpinBox {{
+    padding-right: 20px;
+}}
+QSpinBox::up-button, QSpinBox::down-button {{
+    subcontrol-origin: border;
+    width: 18px;
+    border: none;
+    border-left: 1px solid #e2e8f0;
+    background: transparent;
+}}
+QSpinBox::up-button {{
+    subcontrol-position: top right;
+    border-top-right-radius: 6px;
+}}
+QSpinBox::down-button {{
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: 6px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+    background: #eef2f7;
+}}
+QSpinBox::up-arrow {{
+    image: url({base}/up.svg);
+    width: 9px;
+    height: 6px;
+}}
+QSpinBox::down-arrow {{
+    image: url({base}/down.svg);
+    width: 9px;
+    height: 6px;
+}}
+QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled {{
+    image: none;
+}}
+"""
+
 
 _TROOP_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 _RECRUITMENT_QUEUE_REFRESH_INTERVAL_MS = 3 * 60 * 1000
@@ -948,513 +1147,788 @@ class DashboardWidget(QWidget):
         self._refresh_data()
 
 
-class RecruitmentWidget(QWidget):
-    """Dedicated view for village recruitment queues and automation controls."""
+_RECRUITMENT_STATUS_COLORS = {
+    "active": ("#e7f6ec", "#1f7a3f"),
+    "waiting": ("#fff4d6", "#8a5a00"),
+    "pending": ("#e0ecff", "#1d4ed8"),
+    "muted": ("#eef1f5", "#64748b"),
+}
+
+_RECRUITMENT_RESOURCE_LABELS = ("Drewno", "Glina", "Żelazo", "Zboże")
+
+
+def _set_status_chip(label: QLabel, text: str, kind: str):
+    background, foreground = _RECRUITMENT_STATUS_COLORS[kind]
+    label.setText(text)
+    label.setStyleSheet(
+        f"background: {background}; color: {foreground};"
+        "border-radius: 9px; padding: 2px 10px;"
+        "font-size: 9pt; font-weight: 600;"
+    )
+
+
+def _format_queue_minutes(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    minutes = round(seconds / 60)
+    if minutes >= 60:
+        return f"{minutes // 60} h {minutes % 60:02d} min"
+    return f"{minutes} min"
+
+
+class _AutomationToggle(QPushButton):
+    """Pill-shaped on/off switch for the main recruitment automation."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 16)
-        layout.setSpacing(12)
+        self.setObjectName("automationToggle")
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.toggled.connect(self._refresh_text)
+        self._refresh_text()
 
+    def setChecked(self, checked: bool):
+        super().setChecked(checked)
+        self._refresh_text()
+
+    def _refresh_text(self, *_args):
+        self.setText(
+            "●  Automat włączony" if self.isChecked()
+            else "○  Automat wyłączony"
+        )
+
+
+class RecruitmentWidget(QWidget):
+    """Village-by-village recruitment automation and live queue overview."""
+
+    village_enabled_toggled = Signal(str, bool)
+    unit_toggled = Signal(str, str, bool)
+    queue_minutes_changed = Signal(str, str, int)
+    strategy_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._recruitment_pending_keys: set[str] = set()
+        self._settings_by_village: dict = {}
+        self._villages: dict[str, dict] = {}
+        self._queue_rows: dict[tuple[str, str], dict] = {}
+        self._economics: dict[str, dict] = {}
+        self.village_recruitment_controls: dict[str, dict[str, QCheckBox]] = {}
+        self.village_queue_duration_controls: dict[str, dict[str, QSpinBox]] = {}
+        self.unit_rows: dict[tuple[str, str], dict] = {}
+        self.village_summary_labels: dict[str, QLabel] = {}
+        self.village_economics_labels: dict[str, dict[str, QLabel]] = {}
+        self._target_column_widgets: list[QWidget] = []
+        self._unit_grids: list[QGridLayout] = []
+        self._strategy = "count"
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer_layout.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(14)
+
+        # Header -------------------------------------------------------------
+        header_layout = QHBoxLayout()
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(2)
         title = QLabel("Rekrutacja")
-        title.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        layout.addWidget(title)
-
-        description = QLabel(
-            "Automatycznie wykrywaj jednostki dostępne dla plemienia każdej "
-            "wioski i monitoruj ich kolejki. Stan odświeża się co 3 minuty."
+        title.setObjectName("pageTitle")
+        title_layout.addWidget(title)
+        subtitle = QLabel(
+            "Automat uzupełnia kolejki szkolenia w wybranych wioskach. "
+            "Kolejki są sprawdzane co 3 minuty."
         )
-        description.setObjectName("secondaryText")
-        description.setWordWrap(True)
-        layout.addWidget(description)
-
-        automation_group = QGroupBox("Automatyczne uzupełnianie")
-        automation_layout = QVBoxLayout(automation_group)
-        automation_layout.setContentsMargins(14, 16, 14, 14)
-        automation_layout.setSpacing(10)
-
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(12)
-        self.auto_recruitment_checkbox = QCheckBox(
-            "Włącz automatyczne uzupełnianie"
+        subtitle.setObjectName("secondaryText")
+        subtitle.setWordWrap(True)
+        title_layout.addWidget(subtitle)
+        header_layout.addLayout(title_layout, stretch=1)
+        self.check_recruitment_queues_btn = QPushButton("⟳  Odśwież kolejki")
+        self.check_recruitment_queues_btn.setToolTip(
+            "Odczytaj aktualne kolejki we wszystkich wioskach."
         )
+        header_layout.addWidget(
+            self.check_recruitment_queues_btn,
+            alignment=Qt.AlignTop,
+        )
+        layout.addLayout(header_layout)
+
+        # Automation settings card -----------------------------------------
+        automation_card = QFrame()
+        automation_card.setObjectName("card")
+        automation_layout = QVBoxLayout(automation_card)
+        automation_layout.setContentsMargins(18, 16, 18, 16)
+        automation_layout.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        self.auto_recruitment_checkbox = _AutomationToggle()
         self.auto_recruitment_checkbox.setToolTip(
-            "Włącza główny przełącznik automatu. Wybierz osobno wioski "
-            "i typy jednostek, które automat ma uzupełniać."
+            "Główny przełącznik automatu. Poniżej wybierz wioski i jednostki, "
+            "które mają być uzupełniane."
         )
-        controls_layout.addWidget(self.auto_recruitment_checkbox)
-        controls_layout.addWidget(QLabel("Tryb:"))
-        self.queue_strategy_combobox = QComboBox()
-        self.queue_strategy_combobox.addItem("Liczba jednostek", "count")
-        self.queue_strategy_combobox.addItem("Czas kolejki", "duration")
-        self.queue_strategy_combobox.setFixedWidth(150)
-        self.queue_strategy_combobox.setToolTip(
-            "Liczba jednostek: dodaje stałą partię, gdy w kolejce zostanie "
-            "podana liczba jednostek lub mniej.\n"
-            "Czas kolejki: utrzymuje kolejkę o docelowej długości w minutach, "
-            "ustawianej osobno dla każdej wioski i jednostki."
-        )
-        controls_layout.addWidget(self.queue_strategy_combobox)
-        self.auto_recruitment_batch_size_label = QLabel("Liczebność partii:")
-        controls_layout.addWidget(self.auto_recruitment_batch_size_label)
-        self.auto_recruitment_batch_size = QSpinBox()
-        self.auto_recruitment_batch_size.setRange(1, 100)
-        self.auto_recruitment_batch_size.setSuffix(" jednostek")
-        self.auto_recruitment_batch_size.setFixedWidth(150)
-        self.auto_recruitment_batch_size.setToolTip(
-            "Zlecenie zostanie wysłane tylko, jeśli wioska ma zasoby "
-            "na całą partię."
-        )
-        controls_layout.addWidget(self.auto_recruitment_batch_size)
-        self.auto_recruitment_threshold_label = QLabel("Uzupełnij, gdy zostanie:")
-        controls_layout.addWidget(self.auto_recruitment_threshold_label)
+        top_row.addWidget(self.auto_recruitment_checkbox)
+        top_row.addSpacing(10)
+        mode_label = QLabel("Sposób uzupełniania:")
+        mode_label.setObjectName("fieldLabel")
+        top_row.addWidget(mode_label)
+        self.count_strategy_button = QPushButton("Stała partia")
+        self.count_strategy_button.setObjectName("segmentLeft")
+        self.duration_strategy_button = QPushButton("Docelowy czas kolejki")
+        self.duration_strategy_button.setObjectName("segmentRight")
+        self._strategy_buttons = {
+            "count": self.count_strategy_button,
+            "duration": self.duration_strategy_button,
+        }
+        segment_layout = QHBoxLayout()
+        segment_layout.setSpacing(0)
+        for strategy, button in self._strategy_buttons.items():
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumWidth(
+                button.fontMetrics().horizontalAdvance(button.text()) + 44
+            )
+            button.clicked.connect(
+                lambda _checked=False, value=strategy:
+                    self._choose_strategy(value)
+            )
+            segment_layout.addWidget(button)
+        self.count_strategy_button.setChecked(True)
+        top_row.addLayout(segment_layout)
+        top_row.addStretch()
+        automation_layout.addLayout(top_row)
+
+        rule_row = QHBoxLayout()
+        rule_row.setSpacing(8)
+        self._rule_prefix = QLabel()
+        rule_row.addWidget(self._rule_prefix)
         self.auto_recruitment_threshold = QSpinBox()
         self.auto_recruitment_threshold.setRange(0, 100)
-        self.auto_recruitment_threshold.setSuffix(" szt. lub mniej")
-        self.auto_recruitment_threshold.setFixedWidth(130)
+        self.auto_recruitment_threshold.setSuffix(" szt.")
+        self.auto_recruitment_threshold.setFixedWidth(90)
         self.auto_recruitment_threshold.setToolTip(
-            "Automat doda partię, gdy liczba docelowych jednostek w kolejce "
-            "spadnie do tej wartości lub niżej. Wartość 0 oznacza pustą kolejkę."
+            "Wartość 0 oznacza: uzupełniaj dopiero, gdy kolejka jest pusta."
         )
-        controls_layout.addWidget(self.auto_recruitment_threshold)
-        controls_layout.addStretch()
-        self.clear_recruitment_pending_btn = QPushButton(
-            "Wyczyść oczekujące zlecenia…"
-        )
+        rule_row.addWidget(self.auto_recruitment_threshold)
+        self._rule_middle = QLabel("lub mniej — dodaj")
+        rule_row.addWidget(self._rule_middle)
+        self.auto_recruitment_batch_size = QSpinBox()
+        self.auto_recruitment_batch_size.setRange(1, 100)
+        self.auto_recruitment_batch_size.setSuffix(" jedn.")
+        self.auto_recruitment_batch_size.setFixedWidth(100)
+        rule_row.addWidget(self.auto_recruitment_batch_size)
+        self._rule_suffix = QLabel()
+        rule_row.addWidget(self._rule_suffix)
+        rule_row.addStretch()
+        automation_layout.addLayout(rule_row)
+
+        self._strategy_hint = QLabel()
+        self._strategy_hint.setObjectName("secondaryText")
+        self._strategy_hint.setWordWrap(True)
+        automation_layout.addWidget(self._strategy_hint)
+        layout.addWidget(automation_card)
+
+        # Pending orders banner ----------------------------------------------
+        self.pending_banner = QFrame()
+        self.pending_banner.setObjectName("pendingBanner")
+        banner_layout = QHBoxLayout(self.pending_banner)
+        banner_layout.setContentsMargins(14, 10, 10, 10)
+        self.pending_banner_label = QLabel()
+        self.pending_banner_label.setWordWrap(True)
+        banner_layout.addWidget(self.pending_banner_label, stretch=1)
+        self.clear_recruitment_pending_btn = QPushButton("Wyczyść blokady…")
         self.clear_recruitment_pending_btn.setToolTip(
             "Wyłącza automat i usuwa blokady oczekujących zleceń. "
             "Najpierw sprawdź stan kolejek w grze."
         )
         self.clear_recruitment_pending_btn.setEnabled(False)
-        controls_layout.addWidget(self.clear_recruitment_pending_btn)
-        automation_layout.addLayout(controls_layout)
+        banner_layout.addWidget(self.clear_recruitment_pending_btn)
+        self.pending_banner.hide()
+        layout.addWidget(self.pending_banner)
 
-        automation_help = QLabel(
-            "Dla każdej wioski wybierz typy jednostek, które automat ma "
-            "uzupełniać. Aplikacja wykrywa jednostki i wymagane budynki "
-            "na podstawie plemienia wioski. Niedostępne budynki "
-            "są wyłączone. Partia zostanie dodana tylko przy wystarczających "
-            "surowcach. Główny automat jest domyślnie wyłączony."
-        )
-        automation_help.setObjectName("secondaryText")
-        automation_help.setWordWrap(True)
-        automation_layout.addWidget(automation_help)
-
-        village_settings_group = QGroupBox("Zakres automatu — osobno dla wioski")
-        village_settings_layout = QVBoxLayout(village_settings_group)
-        village_settings_layout.setContentsMargins(10, 12, 10, 10)
-        self.village_settings_scroll = QScrollArea()
-        self.village_settings_scroll.setWidgetResizable(True)
-        self.village_settings_scroll.setMinimumHeight(105)
-        self.village_settings_scroll.setMaximumHeight(180)
-        self.village_settings_content = QWidget()
-        self.village_settings_content_layout = QVBoxLayout(
-            self.village_settings_content
-        )
-        self.village_settings_content_layout.setContentsMargins(4, 4, 4, 4)
-        self.village_settings_content_layout.setSpacing(6)
-        self.village_settings_empty_label = QLabel(
-            "Połącz z grą, aby skonfigurować rekrutację dla każdej wioski."
-        )
-        self.village_settings_empty_label.setObjectName("secondaryText")
-        self.village_settings_scroll.setWidget(self.village_settings_content)
-        village_settings_layout.addWidget(self.village_settings_scroll)
-        automation_layout.addWidget(village_settings_group)
-        layout.addWidget(automation_group)
-
-        economics_group = QGroupBox("Bilans surowców przy ciągłej rekrutacji")
-        economics_layout = QVBoxLayout(economics_group)
-        economics_layout.setContentsMargins(14, 14, 14, 12)
-        self.recruitment_economics_status = QLabel(
-            "Połącz z grą, aby oszacować koszt rekrutacji na godzinę."
-        )
-        self.recruitment_economics_status.setObjectName("secondaryText")
-        self.recruitment_economics_status.setWordWrap(True)
-        economics_layout.addWidget(self.recruitment_economics_status)
-        self.recruitment_economics_table = QTableWidget(0, 5)
-        self.recruitment_economics_table.setHorizontalHeaderLabels(
-            [
-                "Wioska",
-                "Drewno",
-                "Glina",
-                "Żelazo",
-                "Zboże",
-            ]
-        )
-        DashboardWidget._configure_table(
-            self.recruitment_economics_table,
-            stretch_columns=(0, 1, 2, 3, 4),
-        )
-        self.recruitment_economics_table.setMinimumHeight(150)
-        self.recruitment_economics_table.setMaximumHeight(280)
-        self.recruitment_economics_table.setWordWrap(True)
-        economics_layout.addWidget(self.recruitment_economics_table)
-        layout.addWidget(economics_group)
-
-        queues_group = QGroupBox("Stan kolejek")
-        queues_layout = QVBoxLayout(queues_group)
-        queues_layout.setContentsMargins(14, 16, 14, 14)
-        queues_layout.setSpacing(8)
+        # Villages -------------------------------------------------------------
+        villages_header = QHBoxLayout()
+        villages_title = QLabel("Wioski")
+        villages_title.setObjectName("sectionTitle")
+        villages_header.addWidget(villages_title)
+        villages_header.addSpacing(8)
         self.recruitment_queue_status = QLabel(
             "Połącz z grą, aby odczytać kolejki."
         )
         self.recruitment_queue_status.setObjectName("secondaryText")
         self.recruitment_queue_status.setWordWrap(True)
-        queues_layout.addWidget(self.recruitment_queue_status)
+        villages_header.addWidget(self.recruitment_queue_status, stretch=1)
+        layout.addLayout(villages_header)
 
-        self.recruitment_queue_table = QTableWidget(0, 5)
-        self.recruitment_queue_table.setHorizontalHeaderLabels(
-            ["Wioska", "Jednostka · budynek", "W kolejce", "Czas kolejki", "Status"]
+        self.village_cards_layout = QVBoxLayout()
+        self.village_cards_layout.setSpacing(12)
+        layout.addLayout(self.village_cards_layout)
+        self.village_settings_empty_label = QLabel(
+            "Połącz z grą, aby wykryć wioski i dostępne jednostki."
         )
-        DashboardWidget._configure_table(
-            self.recruitment_queue_table,
-            stretch_columns=(0, 1, 4),
-        )
-        self.recruitment_queue_table.setMinimumHeight(180)
-        queues_layout.addWidget(self.recruitment_queue_table, stretch=1)
+        self.village_settings_empty_label.setObjectName("emptyState")
+        self.village_settings_empty_label.setAlignment(Qt.AlignCenter)
+        self.village_cards_layout.addWidget(self.village_settings_empty_label)
 
-        queue_actions_layout = QHBoxLayout()
-        self.check_recruitment_queues_btn = QPushButton("Odśwież kolejki")
-        self.check_recruitment_queues_btn.setToolTip(
-            "Odczytaj aktualne kolejki we wszystkich wioskach."
+        self.recruitment_economics_status = QLabel(
+            "Bilans na godzinę zakłada nieprzerwane szkolenie zaznaczonych "
+            "jednostek (czas gry, szybkość świata i poziom budynku). "
+            "Gdy kilka zaznaczonych typów dzieli koszary lub stajnię, "
+            "koszt jest nieokreślony. Najedź na wartość, aby zobaczyć "
+            "przychód i koszt rekrutacji."
         )
-        queue_actions_layout.addStretch()
-        queue_actions_layout.addWidget(self.check_recruitment_queues_btn)
-        queues_layout.addLayout(queue_actions_layout)
-        layout.addWidget(queues_group, stretch=1)
+        self.recruitment_economics_status.setObjectName("footnote")
+        self.recruitment_economics_status.setWordWrap(True)
+        layout.addWidget(self.recruitment_economics_status)
+        layout.addStretch()
 
-        self._recruitment_pending_keys: set[str] = set()
-        self.village_recruitment_controls: dict[str, dict[str, QCheckBox]] = {}
-        self.village_queue_duration_controls: dict[str, dict[str, QSpinBox]] = {}
-        self.queue_strategy_combobox.currentIndexChanged.connect(
-            self._apply_recruitment_strategy_visibility
-        )
         self._apply_recruitment_strategy_visibility()
 
+    # Strategy ---------------------------------------------------------------
     def recruitment_strategy(self) -> str:
-        return self.queue_strategy_combobox.currentData() or "count"
+        return self._strategy
 
     def set_recruitment_strategy(self, strategy: str):
-        index = self.queue_strategy_combobox.findData(strategy)
-        self.queue_strategy_combobox.blockSignals(True)
-        self.queue_strategy_combobox.setCurrentIndex(max(0, index))
-        self.queue_strategy_combobox.blockSignals(False)
+        self._strategy = strategy if strategy in self._strategy_buttons else "count"
+        for value, button in self._strategy_buttons.items():
+            button.setChecked(value == self._strategy)
         self._apply_recruitment_strategy_visibility()
+
+    def _choose_strategy(self, strategy: str):
+        previous = self._strategy
+        self.set_recruitment_strategy(strategy)
+        if previous != strategy:
+            self.strategy_changed.emit(strategy)
 
     def _apply_recruitment_strategy_visibility(self, *_args):
         duration = self.recruitment_strategy() == "duration"
-        self.auto_recruitment_threshold_label.setHidden(duration)
         self.auto_recruitment_threshold.setHidden(duration)
-        self.auto_recruitment_batch_size_label.setText(
-            "Maks. partia:" if duration else "Liczebność partii:"
-        )
-        self.auto_recruitment_batch_size.setToolTip(
-            "Maksymalna liczba jednostek w jednym zleceniu. Automat dodaje "
-            "tylko brakujący czas kolejki, nie więcej niż ta wartość."
-            if duration else
-            "Zlecenie zostanie wysłane tylko, jeśli wioska ma zasoby "
-            "na całą partię."
-        )
-        for controls in self.village_queue_duration_controls.values():
-            for spin_box in controls.values():
-                spin_box.setHidden(not duration)
+        self._rule_middle.setHidden(duration)
+        if duration:
+            self._rule_prefix.setText(
+                "Dobieraj liczbę jednostek do celu ustawionego przy "
+                "jednostce, maksymalnie"
+            )
+            self._rule_suffix.setText("w jednym zleceniu.")
+            self._strategy_hint.setText(
+                "Cel (w minutach) ustawiasz osobno dla każdej jednostki "
+                "w karcie wioski. Automat dodaje tylko brakujący czas kolejki."
+            )
+        else:
+            self._rule_prefix.setText("Gdy w kolejce zostanie")
+            self._rule_suffix.setText("")
+            self._strategy_hint.setText(
+                "Zlecenie zostanie wysłane tylko, gdy wioska ma surowce "
+                "na całą partię."
+            )
+        for widget in self._target_column_widgets:
+            widget.setHidden(not duration)
+        for grid in self._unit_grids:
+            grid.setColumnMinimumWidth(4, 105 if duration else 0)
+        for key in self.unit_rows:
+            self._refresh_unit_row(*key)
 
+    # Village cards ----------------------------------------------------------
     def update_village_recruitment_settings(
         self,
         villages: list[dict],
         settings_by_village: dict,
     ):
-        while self.village_settings_content_layout.count():
-            item = self.village_settings_content_layout.takeAt(0)
+        self._settings_by_village = settings_by_village
+        structure = {
+            str(village["id"]): {
+                "name": village.get("name") or f"Wioska {village['id']}",
+                "units": list(village.get("recruitment_units", [])),
+            }
+            for village in villages
+        }
+        if self._structure_signature(structure) != self._structure_signature(
+            self._villages
+        ):
+            self._villages = structure
+            self._rebuild_village_cards()
+        else:
+            self._sync_controls_with_settings()
+
+    @staticmethod
+    def _structure_signature(villages: dict[str, dict]) -> tuple:
+        return tuple(
+            (
+                village_id,
+                village["name"],
+                tuple(
+                    (
+                        str(unit["unit_id"]),
+                        unit.get("unit"),
+                        unit.get("building"),
+                        unit.get("building_available") is not False,
+                    )
+                    for unit in village["units"]
+                ),
+            )
+            for village_id, village in villages.items()
+        )
+
+    def _village_settings(self, village_id: str):
+        return self._settings_by_village.get(
+            village_id,
+            VillageRecruitmentSettings(),
+        )
+
+    def _merge_village(
+        self,
+        village_id: str,
+        name: str | None,
+        unit: dict | None = None,
+    ) -> bool:
+        changed = False
+        village = self._villages.get(village_id)
+        if village is None:
+            village = {"name": name or f"Wioska {village_id}", "units": []}
+            self._villages[village_id] = village
+            changed = True
+        if unit is not None:
+            unit_id = str(unit["unit_id"])
+            if all(
+                str(existing["unit_id"]) != unit_id
+                for existing in village["units"]
+            ):
+                village["units"].append({**unit, "unit_id": unit_id})
+                changed = True
+        return changed
+
+    def _rebuild_village_cards(self):
+        while self.village_cards_layout.count():
+            item = self.village_cards_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None:
-                if widget is self.village_settings_empty_label:
-                    widget.hide()
-                    widget.setParent(self.village_settings_content)
-                else:
-                    widget.deleteLater()
+            if widget is None:
+                continue
+            if widget is self.village_settings_empty_label:
+                widget.hide()
+            else:
+                widget.deleteLater()
 
         self.village_recruitment_controls.clear()
         self.village_queue_duration_controls.clear()
-        if not villages:
-            self.village_settings_content_layout.addWidget(
+        self.unit_rows.clear()
+        self.village_summary_labels.clear()
+        self.village_economics_labels.clear()
+        self._target_column_widgets.clear()
+        self._unit_grids.clear()
+
+        if not self._villages:
+            self.village_cards_layout.addWidget(
                 self.village_settings_empty_label
             )
             self.village_settings_empty_label.show()
             return
 
-        self.village_settings_empty_label.hide()
-        for village in villages:
-            village_id = str(village["id"])
-            village_settings = settings_by_village[village_id]
-            row = QWidget()
-            row_layout = QVBoxLayout(row)
-            row_layout.setContentsMargins(2, 0, 2, 0)
-            row_layout.setSpacing(12)
-            header_layout = QHBoxLayout()
-            header_layout.setContentsMargins(0, 0, 0, 0)
-            name_label = QLabel(village.get("name") or f"Wioska {village_id}")
-            name_label.setMinimumWidth(110)
-            header_layout.addWidget(name_label)
-
-            enabled = QCheckBox("Automat")
-            enabled.setChecked(village_settings.enabled)
-            enabled.setToolTip(
-                "Włącz lub wyłącz automatyczną rekrutację w tej wiosce."
+        for village_id, village in self._villages.items():
+            self.village_cards_layout.addWidget(
+                self._build_village_card(village_id, village)
             )
-            header_layout.addWidget(enabled)
-            header_layout.addStretch()
-            row_layout.addLayout(header_layout)
-
-            units = {}
-            duration_inputs = {}
-            units_layout = QGridLayout()
-            units_layout.setContentsMargins(0, 0, 0, 0)
-            units_layout.setHorizontalSpacing(8)
-            columns_per_row = 3
-            for index, unit in enumerate(village.get("recruitment_units", [])):
-                unit_id = str(unit["unit_id"])
-                building_available = unit.get("building_available") is True
-                selected = unit_id in village_settings.units
-                checkbox = QCheckBox(f"{unit['building']} · {unit['unit']}")
-                checkbox.setChecked(selected)
-                # A selected unit stays editable so it can be deselected even
-                # when its building is missing; the automation skips it.
-                checkbox.setEnabled(building_available or selected)
-                if not building_available:
-                    checkbox.setToolTip(
-                        "W tej wiosce nie ma odpowiedniego budynku — "
-                        "automat pominie tę jednostkę."
-                    )
-
-                spin_box = QSpinBox()
-                spin_box.setRange(1, 1440)
-                spin_box.setSuffix(" min")
-                spin_box.setFixedWidth(90)
-                spin_box.setValue(
-                    village_settings.queue_minutes_by_unit.get(
-                        unit_id,
-                        DEFAULT_RECRUITMENT_QUEUE_MINUTES,
-                    )
-                )
-                spin_box.setEnabled(building_available)
-                spin_box.setToolTip(
-                    f"Docelowa długość kolejki dla {unit['unit']} w tej "
-                    "wiosce. Automat dobierze liczbę jednostek tak, aby "
-                    "uzupełnić brakujący czas."
-                )
-
-                grid_row = index // columns_per_row
-                grid_column = (index % columns_per_row) * 2
-                units_layout.addWidget(checkbox, grid_row, grid_column)
-                units_layout.addWidget(spin_box, grid_row, grid_column + 1)
-                units[unit_id] = checkbox
-                duration_inputs[unit_id] = spin_box
-
-            row_layout.addLayout(units_layout)
-            self.village_settings_content_layout.addWidget(row)
-            self.village_recruitment_controls[village_id] = {
-                "enabled": enabled,
-                **units,
-            }
-            self.village_queue_duration_controls[village_id] = duration_inputs
-
         self._apply_recruitment_strategy_visibility()
+        self._apply_queue_rows()
+        self._apply_economics()
 
+    def _build_village_card(self, village_id: str, village: dict) -> QFrame:
+        village_settings = self._village_settings(village_id)
+        card = QFrame()
+        card.setObjectName("villageCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        name_label = QLabel(village["name"])
+        name_label.setObjectName("villageName")
+        header.addWidget(name_label)
+        header.addSpacing(10)
+        summary = QLabel()
+        summary.setObjectName("secondaryText")
+        header.addWidget(summary, stretch=1)
+        enabled = QCheckBox("Automat w tej wiosce")
+        enabled.setChecked(village_settings.enabled)
+        enabled.setToolTip(
+            "Włącz lub wyłącz automatyczną rekrutację tylko w tej wiosce."
+        )
+        enabled.toggled.connect(
+            lambda checked, current_id=village_id: (
+                self._refresh_village_summary(current_id),
+                self.village_enabled_toggled.emit(current_id, checked),
+            )
+        )
+        header.addWidget(enabled)
+        card_layout.addLayout(header)
+        self.village_summary_labels[village_id] = summary
+
+        units_grid = QGridLayout()
+        units_grid.setHorizontalSpacing(18)
+        units_grid.setVerticalSpacing(2)
+        self._unit_grids.append(units_grid)
+        units_grid.setColumnStretch(0, 1)
+        for column, width in enumerate((0, 90, 80, 95, 105, 180)):
+            if width:
+                units_grid.setColumnMinimumWidth(column, width)
+        headers = (
+            "Uzupełniaj", "Budynek", "W kolejce", "Czas kolejki",
+            "Cel", "Status",
+        )
+        for column, text in enumerate(headers):
+            header_label = QLabel(text.upper())
+            header_label.setObjectName("columnHeader")
+            units_grid.addWidget(header_label, 0, column)
+            if text == "Cel":
+                self._target_column_widgets.append(header_label)
+
+        controls = {"enabled": enabled}
+        duration_controls = {}
+        unavailable = []
+        grid_row = 1
+        for unit in village["units"]:
+            unit_id = str(unit["unit_id"])
+            available = unit.get("building_available") is not False
+            selected = unit_id in village_settings.units
+            if not available and not selected:
+                unavailable.append(
+                    f"{unit.get('unit', unit_id)} ({unit.get('building', '?')})"
+                )
+                continue
+
+            checkbox = QCheckBox(str(unit.get("unit", unit_id)))
+            checkbox.setChecked(selected)
+            if not available:
+                checkbox.setToolTip(
+                    "W tej wiosce nie ma odpowiedniego budynku — "
+                    "automat pominie tę jednostkę. Możesz ją odznaczyć."
+                )
+            building = QLabel(str(unit.get("building", "")))
+            building.setObjectName("secondaryText")
+            count = QLabel("—")
+            duration = QLabel("—")
+            target = QSpinBox()
+            target.setRange(1, 1440)
+            target.setSuffix(" min")
+            target.setFixedWidth(95)
+            target.setValue(
+                village_settings.queue_minutes_by_unit.get(
+                    unit_id,
+                    DEFAULT_RECRUITMENT_QUEUE_MINUTES,
+                )
+            )
+            target.setEnabled(available)
+            target.setToolTip(
+                "Docelowa długość kolejki tej jednostki w tej wiosce."
+            )
+            status = QLabel()
+            _set_status_chip(status, "Nieodczytana", "muted")
+
+            checkbox.toggled.connect(
+                lambda checked, current_id=village_id,
+                current_unit_id=unit_id: (
+                    self._refresh_unit_row(current_id, current_unit_id),
+                    self._refresh_village_summary(current_id),
+                    self.unit_toggled.emit(
+                        current_id, current_unit_id, checked
+                    ),
+                )
+            )
+            target.valueChanged.connect(
+                lambda minutes, current_id=village_id,
+                current_unit_id=unit_id:
+                    self.queue_minutes_changed.emit(
+                        current_id, current_unit_id, minutes
+                    )
+            )
+
+            for column, widget in enumerate(
+                (checkbox, building, count, duration, target, status)
+            ):
+                units_grid.addWidget(
+                    widget,
+                    grid_row,
+                    column,
+                    alignment=Qt.AlignLeft | Qt.AlignVCenter,
+                )
+            controls[unit_id] = checkbox
+            duration_controls[unit_id] = target
+            self.unit_rows[(village_id, unit_id)] = {
+                "checkbox": checkbox,
+                "building": building,
+                "count": count,
+                "duration": duration,
+                "target": target,
+                "status": status,
+                "available": available,
+            }
+            units_grid.setRowMinimumHeight(grid_row, 30)
+            grid_row += 1
+
+        if grid_row == 1:
+            empty = QLabel(
+                "Brak wykrytych jednostek — połącz z grą, aby je odczytać."
+                if not unavailable
+                else "Żadna jednostka nie ma tu wymaganego budynku."
+            )
+            empty.setObjectName("secondaryText")
+            card_layout.addWidget(empty)
+        else:
+            card_layout.addLayout(units_grid)
+        if unavailable:
+            note = QLabel("Brak budynku: " + ", ".join(unavailable))
+            note.setObjectName("footnote")
+            note.setWordWrap(True)
+            card_layout.addWidget(note)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        card_layout.addWidget(divider)
+        economics = QGridLayout()
+        economics.setHorizontalSpacing(12)
+        economics_title = QLabel("BILANS / H")
+        economics_title.setObjectName("columnHeader")
+        economics_title.setToolTip(self.recruitment_economics_status.text())
+        economics.addWidget(economics_title, 0, 0, alignment=Qt.AlignVCenter)
+        resource_labels = {}
+        for column, resource in enumerate(_RECRUITMENT_RESOURCE_LABELS, 1):
+            label = QLabel()
+            label.setTextFormat(Qt.RichText)
+            economics.addWidget(label, 0, column)
+            economics.setColumnStretch(column, 1)
+            resource_labels[resource] = label
+        card_layout.addLayout(economics)
+
+        self.village_recruitment_controls[village_id] = controls
+        self.village_queue_duration_controls[village_id] = duration_controls
+        self.village_economics_labels[village_id] = resource_labels
+        self._refresh_village_summary(village_id)
+        return card
+
+    def _sync_controls_with_settings(self):
+        for village_id, controls in self.village_recruitment_controls.items():
+            village_settings = self._village_settings(village_id)
+            controls["enabled"].blockSignals(True)
+            controls["enabled"].setChecked(village_settings.enabled)
+            controls["enabled"].blockSignals(False)
+            for unit_id, checkbox in controls.items():
+                if unit_id == "enabled":
+                    continue
+                selected = unit_id in village_settings.units
+                checkbox.blockSignals(True)
+                checkbox.setChecked(selected)
+                checkbox.blockSignals(False)
+                self._refresh_unit_row(village_id, unit_id)
+            self._refresh_village_summary(village_id)
+
+    def _refresh_village_summary(self, village_id: str):
+        label = self.village_summary_labels.get(village_id)
+        controls = self.village_recruitment_controls.get(village_id)
+        if label is None or controls is None:
+            return
+        if not controls["enabled"].isChecked():
+            label.setText("Automat wyłączony w tej wiosce")
+            return
+        selected = [
+            checkbox.text()
+            for unit_id, checkbox in controls.items()
+            if unit_id != "enabled" and checkbox.isChecked()
+        ]
+        label.setText(
+            "Uzupełniane: " + ", ".join(selected)
+            if selected
+            else "Nic nie wybrano — zaznacz jednostki do uzupełniania"
+        )
+
+    # Queue state ------------------------------------------------------------
     def update_recruitment_queues(
         self,
         rows: list[dict],
         pending_keys: set[str] | None = None,
     ):
         self._recruitment_pending_keys = set(pending_keys or ())
-        self.recruitment_queue_table.setRowCount(len(rows))
-        inactive_queues = 0
-        unavailable_buildings = 0
-        for row_index, queue in enumerate(rows):
-            self.recruitment_queue_table.setItem(
-                row_index, 0, QTableWidgetItem(queue["village"])
+        self._queue_rows = {}
+        structure_changed = False
+        for row in rows:
+            village_id = str(row["village_id"])
+            unit_id = str(row.get("unit_id", row.get("unit_type", row["unit"])))
+            self._queue_rows[(village_id, unit_id)] = row
+            structure_changed |= self._merge_village(
+                village_id,
+                row.get("village"),
+                {
+                    "unit_id": unit_id,
+                    "unit": row["unit"],
+                    "building": row.get("building", ""),
+                    "building_available": row.get("building_available"),
+                },
             )
-            self.recruitment_queue_table.setItem(
-                row_index,
-                1,
-                QTableWidgetItem(f"{queue['unit']} · {queue['building']}"),
-            )
-            key = _recruitment_queue_key(
-                queue["village_id"],
-                queue.get("unit_id", queue["unit"]),
-            )
-            legacy_key = _recruitment_queue_key(
-                queue["village_id"],
-                queue["unit"],
-            )
-            if (
-                key in self._recruitment_pending_keys
-                or legacy_key in self._recruitment_pending_keys
-            ):
-                count_text = "—"
-                status = "Wysłano · potwierdzanie"
-                color = QColor("#fff3cd")
-            elif queue.get("building_available") is False:
-                count_text = "—"
-                status = "Brak budynku"
-                color = QColor("#edf0f4")
-                unavailable_buildings += 1
-            elif queue["count"]:
-                count_text = f"{queue['count']} szt."
-                status = "Rekrutacja trwa"
-                color = QColor("#e8f5e9")
-            elif queue.get("other_count", 0):
-                count_text = f"{queue['other_count']} szt."
-                status = "Inna jednostka"
-                color = QColor("#fff3cd")
-            else:
-                count_text = "0 szt."
-                status = "Brak rekrutacji"
-                color = QColor("#fff3cd")
-            if (
-                queue.get("building_available") is not False
-                and not queue["count"]
-                and not queue.get("other_count", 0)
-            ):
-                inactive_queues += 1
-            self.recruitment_queue_table.setItem(
-                row_index, 2, QTableWidgetItem(count_text)
-            )
-            queue_seconds = (
-                recruitment_queue_duration_seconds(queue)
-                if count_text != "—"
-                else None
-            )
-            self.recruitment_queue_table.setItem(
-                row_index,
-                3,
-                QTableWidgetItem(
-                    f"{queue_seconds / 60:.0f} min"
-                    if queue_seconds is not None
-                    else "—"
-                ),
-            )
-            status_item = QTableWidgetItem(status)
-            status_item.setBackground(color)
-            if (
-                key in self._recruitment_pending_keys
-                or legacy_key in self._recruitment_pending_keys
-            ):
-                status_item.setToolTip(
-                    "Zlecenie wysłano. Automat nie ponowi go, dopóki "
-                    "kolejka nie potwierdzi przyjęcia jednostek."
-                )
-            self.recruitment_queue_table.setItem(row_index, 4, status_item)
+        if structure_changed:
+            self._rebuild_village_cards()
+        else:
+            self._apply_queue_rows()
 
+        inactive_queues = sum(
+            1 for row in rows
+            if row.get("building_available") is not False
+            and not row["count"]
+            and not row.get("other_count", 0)
+        )
+        unavailable_buildings = sum(
+            1 for row in rows if row.get("building_available") is False
+        )
         village_count = len({row["village_id"] for row in rows})
-        active_queues = len(rows) - inactive_queues
         summary_parts = [
             f"Kontrola {datetime.now():%H:%M}",
             f"{village_count} wiosek",
-            f"{active_queues} aktywnych kolejek",
+            f"{len(rows) - inactive_queues - unavailable_buildings} "
+            "aktywnych kolejek",
         ]
         if inactive_queues:
             summary_parts.append(f"{inactive_queues} bez rekrutacji")
-        if unavailable_buildings:
-            summary_parts.append(f"{unavailable_buildings} bez budynku")
-        if self._recruitment_pending_keys:
-            summary_parts.append(
-                f"{len(self._recruitment_pending_keys)} zleceń do potwierdzenia"
-            )
         self.recruitment_queue_status.setText(
-            "  ·  ".join(summary_parts) + "  ·  następna kontrola za 3 min"
+            "  ·  ".join(summary_parts) + "  ·  następna za 3 min"
         )
-        self.clear_recruitment_pending_btn.setEnabled(
-            bool(self._recruitment_pending_keys)
+        self._refresh_pending_banner()
+
+    def _is_pending(self, village_id: str, unit_id: str, unit: str) -> bool:
+        return bool(
+            {
+                _recruitment_queue_key(village_id, unit_id),
+                _recruitment_queue_key(village_id, unit),
+            } & self._recruitment_pending_keys
         )
 
+    def _apply_queue_rows(self):
+        for key in self.unit_rows:
+            self._refresh_unit_row(*key)
+
+    def _refresh_unit_row(self, village_id: str, unit_id: str):
+        widgets = self.unit_rows.get((village_id, unit_id))
+        if widgets is None:
+            return
+        checkbox = widgets["checkbox"]
+        selected = checkbox.isChecked()
+        checkbox.setObjectName("" if selected else "unitUnselected")
+        checkbox.style().unpolish(checkbox)
+        checkbox.style().polish(checkbox)
+        widgets["target"].setHidden(
+            self._strategy != "duration" or not selected
+        )
+
+        queue = self._queue_rows.get((village_id, unit_id))
+        count_text, duration_text = "—", "—"
+        status_label = widgets["status"]
+        status_label.setToolTip("")
+        if queue is not None and widgets["available"]:
+            count_text = f"{queue['count']} szt."
+            duration_text = _format_queue_minutes(
+                recruitment_queue_duration_seconds(queue)
+            )
+        if self._is_pending(village_id, unit_id, checkbox.text()):
+            status = ("Wysłano · potwierdzanie", "pending")
+            status_label.setToolTip(
+                "Zlecenie wysłano. Automat nie ponowi go, dopóki "
+                "kolejka nie potwierdzi przyjęcia jednostek."
+            )
+        elif not widgets["available"]:
+            status = ("Brak budynku · pominięta", "muted")
+        elif queue is None:
+            status = ("Nieodczytana", "muted")
+        elif queue["count"]:
+            status = ("Rekrutacja trwa", "active")
+        elif not selected:
+            status = None
+        elif queue.get("other_count", 0):
+            status = ("Budynek zajęty innymi", "waiting")
+            status_label.setToolTip(
+                f"W budynku szkoli się {queue['other_count']} szt. "
+                "innych jednostek."
+            )
+        else:
+            status = ("Brak rekrutacji", "waiting")
+        widgets["count"].setText(count_text)
+        widgets["duration"].setText(duration_text)
+        if status is None:
+            status_label.setText("")
+            status_label.setStyleSheet("")
+        else:
+            _set_status_chip(status_label, *status)
+
+    def _refresh_pending_banner(self):
+        pending_count = len(self._recruitment_pending_keys)
+        self.clear_recruitment_pending_btn.setEnabled(bool(pending_count))
+        self.pending_banner.setVisible(bool(pending_count))
+        if pending_count:
+            noun = "zlecenie czeka" if pending_count == 1 else "zlecenia czekają"
+            self.pending_banner_label.setText(
+                f"<b>{pending_count} {noun}</b> na potwierdzenie przez grę. "
+                "Automat nie ponowi tych jednostek, dopóki kolejka nie "
+                "potwierdzi przyjęcia."
+            )
+
+    # Economics --------------------------------------------------------------
     def update_recruitment_economics(self, rows: list[dict]):
-        resource_order = ("Drewno", "Glina", "Żelazo", "Zboże")
-        grouped_rows: dict[str, dict] = {}
-        unknown_costs = 0
-        unknown_production = 0
+        self._economics = {}
+        structure_changed = False
         for row in rows:
-            village_id = row.get("village_id", row["village"])
-            village_row = grouped_rows.setdefault(
-                village_id,
-                {"name": row["village"], "resources": {}},
-            )
-            village_row["resources"][row["resource"]] = row
-            if row["recruitment_cost"] is None:
-                unknown_costs += 1
-            if row["production_rate"] is None:
-                unknown_production += 1
+            village_id = str(row.get("village_id", row["village"]))
+            self._economics.setdefault(village_id, {})[row["resource"]] = row
+            structure_changed |= self._merge_village(village_id, row["village"])
+        if structure_changed:
+            self._rebuild_village_cards()
+        else:
+            self._apply_economics()
 
-        self.recruitment_economics_table.setRowCount(len(grouped_rows))
-        for row_index, village_row in enumerate(grouped_rows.values()):
-            village_item = QTableWidgetItem(village_row["name"])
-            village_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self.recruitment_economics_table.setItem(
-                row_index,
-                0,
-                village_item,
-            )
-            for column, resource in enumerate(resource_order, start=1):
-                resource_row = village_row["resources"].get(resource)
-                if resource_row is None:
+    def _apply_economics(self):
+        for village_id, labels in self.village_economics_labels.items():
+            resources = self._economics.get(village_id, {})
+            for resource, label in labels.items():
+                row = resources.get(resource)
+                if row is None:
+                    label.setText(
+                        f"<span style='color:#64748b'>{resource}</span>&nbsp; "
+                        "<span style='color:#94a3b8'>—</span>"
+                    )
+                    label.setToolTip("Brak danych o przychodzie.")
                     continue
-                details = (
-                    f"Przychód  {_format_hourly_rate(resource_row['production_rate'])}\n"
+                net = row["net_rate"]
+                color = (
+                    "#94a3b8" if net is None
+                    else "#b42318" if net < 0
+                    else "#237a45"
+                )
+                label.setText(
+                    f"<span style='color:#64748b'>{resource}</span>&nbsp; "
+                    f"<b style='color:{color}'>{_format_hourly_rate(net)}</b>"
+                )
+                tooltip = (
+                    f"Przychód  {_format_hourly_rate(row['production_rate'])}\n"
                     "Rekrutacja  "
-                    f"{_format_hourly_rate(resource_row['recruitment_cost'], signed=False)}\n"
-                    f"Bilans  {_format_hourly_rate(resource_row['net_rate'])}"
+                    f"{_format_hourly_rate(row['recruitment_cost'], signed=False)}\n"
+                    f"Bilans  {_format_hourly_rate(net)}"
                 )
-                item = QTableWidgetItem(details)
-                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                item.setToolTip(
-                    f"Przychód i koszt rekrutacji na godzinę — {resource}."
-                )
-                if resource_row.get("last_updated"):
-                    item.setToolTip(
-                        f"Ostatni odczyt przychodu: "
-                        f"{resource_row['last_updated']:%Y-%m-%d %H:%M}"
+                if row.get("last_updated"):
+                    tooltip += (
+                        f"\nOstatni odczyt: {row['last_updated']:%Y-%m-%d %H:%M}"
                     )
-                if resource_row["net_rate"] is not None:
-                    item.setForeground(
-                        QColor(
-                            "#b42318"
-                            if resource_row["net_rate"] < 0
-                            else "#237a45"
-                        )
-                    )
-                self.recruitment_economics_table.setItem(
-                    row_index,
-                    column,
-                    item,
-                )
-            self.recruitment_economics_table.setRowHeight(row_index, 72)
-
-        status = (
-            "Szacunek dla zaznaczonych jednostek przy nieprzerwanym szkoleniu. "
-            "Koszt jednostki mnożony jest przez liczbę jednostek możliwych "
-            "do wyszkolenia w godzinę, z uwzględnieniem bazowego czasu gry, "
-            "szybkości świata i efektu poziomu budynku. "
-            "Jeśli kilka zaznaczonych typów korzysta z tych samych koszar "
-            "lub stajni, koszt jest nieokreślony ze względu na współdzieloną kolejkę."
-        )
-        if unknown_costs or unknown_production:
-            status += (
-                f" Brak danych: koszt rekrutacji w {unknown_costs} wierszach, "
-                f"przychód w {unknown_production} wierszach."
-            )
-        self.recruitment_economics_status.setText(status)
+                label.setToolTip(tooltip)
 
     def clear_recruitment_economics(self):
-        self.recruitment_economics_table.setRowCount(0)
-        self.recruitment_economics_status.setText(
-            "Połącz z grą, aby oszacować koszt rekrutacji na godzinę."
-        )
+        self._economics = {}
+        self._apply_economics()
 
     def clear_recruitment_queues(self):
         self._recruitment_pending_keys.clear()
-        self.recruitment_queue_table.setRowCount(0)
-        self.clear_recruitment_pending_btn.setEnabled(False)
+        self._queue_rows = {}
+        self._apply_queue_rows()
+        self._refresh_pending_banner()
         self.recruitment_queue_status.setText(
             "Połącz z grą, aby odczytać kolejki."
         )
@@ -2259,7 +2733,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(settings.app_name)
         self.resize(1280, 860)
         self.setMinimumSize(980, 680)
-        self.setStyleSheet(_APP_STYLESHEET)
+        self.setStyleSheet(_APP_STYLESHEET + _icon_stylesheet())
         
         self._create_menu_bar()
         self._createCentralWidget()
@@ -2333,8 +2807,15 @@ class MainWindow(QMainWindow):
         self.recruitment_tab.auto_recruitment_threshold.valueChanged.connect(
             self._set_recruitment_queue_threshold
         )
-        self.recruitment_tab.queue_strategy_combobox.currentIndexChanged.connect(
-            self._set_queue_strategy
+        self.recruitment_tab.strategy_changed.connect(self._set_queue_strategy)
+        self.recruitment_tab.village_enabled_toggled.connect(
+            self._set_village_recruitment_enabled
+        )
+        self.recruitment_tab.unit_toggled.connect(
+            self._set_village_recruitment_unit
+        )
+        self.recruitment_tab.queue_minutes_changed.connect(
+            self._set_village_queue_minutes
         )
         self.recruitment_tab.clear_recruitment_pending_btn.clicked.connect(
             self._clear_pending_recruitment_orders
@@ -2403,6 +2884,9 @@ class MainWindow(QMainWindow):
         self.content_tabs.addTab(self.dashboard_tab, "Przegląd")
 
         self.recruitment_tab = RecruitmentWidget()
+        self.recruitment_tab._settings_by_village = (
+            self.settings.recruitment.villages
+        )
         self.content_tabs.addTab(self.recruitment_tab, "Rekrutacja")
 
         self.village_detail_tab = VillageDetailWidget(self.tracker)
@@ -2900,7 +3384,10 @@ class MainWindow(QMainWindow):
         unit_id: str,
         minutes: int,
     ):
-        village_settings = self.settings.recruitment.villages[village_id]
+        village_settings = self.settings.recruitment.villages.setdefault(
+            village_id,
+            VillageRecruitmentSettings(),
+        )
         previous = village_settings.queue_minutes_by_unit.get(unit_id)
         village_settings.queue_minutes_by_unit[unit_id] = minutes
         if not self._save_recruitment_settings():
@@ -2920,7 +3407,7 @@ class MainWindow(QMainWindow):
             self.settings.recruitment.pending_orders,
         )
 
-    def _set_queue_strategy(self, _index: int):
+    def _set_queue_strategy(self, _strategy: str):
         previous = self.settings.recruitment.queue_strategy
         self.settings.recruitment.queue_strategy = (
             self.recruitment_tab.recruitment_strategy()
@@ -3100,46 +3587,16 @@ class MainWindow(QMainWindow):
             villages,
             self.settings.recruitment.villages,
         )
-        for village_id, controls in (
-            self.recruitment_tab.village_recruitment_controls.items()
-        ):
-            controls["enabled"].toggled.connect(
-                lambda enabled, current_id=village_id:
-                    self._set_village_recruitment_enabled(current_id, enabled)
-            )
-            for unit_id, spin_box in (
-                self.recruitment_tab.village_queue_duration_controls
-                .get(village_id, {})
-                .items()
-            ):
-                spin_box.valueChanged.connect(
-                    lambda minutes, current_id=village_id,
-                    current_unit_id=unit_id:
-                        self._set_village_queue_minutes(
-                            current_id,
-                            current_unit_id,
-                            minutes,
-                        )
-                )
-            for unit_id, checkbox in controls.items():
-                if unit_id == "enabled":
-                    continue
-                checkbox.toggled.connect(
-                    lambda enabled, current_id=village_id,
-                    current_unit_id=unit_id:
-                        self._set_village_recruitment_unit(
-                            current_id,
-                            current_unit_id,
-                            enabled,
-                        )
-                )
 
     def _set_village_recruitment_enabled(
         self,
         village_id: str,
         enabled: bool,
     ):
-        village_settings = self.settings.recruitment.villages[village_id]
+        village_settings = self.settings.recruitment.villages.setdefault(
+            village_id,
+            VillageRecruitmentSettings(),
+        )
         previous = village_settings.enabled
         village_settings.enabled = enabled
         if not self._save_recruitment_settings():
@@ -3169,7 +3626,10 @@ class MainWindow(QMainWindow):
         unit: str,
         enabled: bool,
     ):
-        village_settings = self.settings.recruitment.villages[village_id]
+        village_settings = self.settings.recruitment.villages.setdefault(
+            village_id,
+            VillageRecruitmentSettings(),
+        )
         previous = set(village_settings.units)
         if enabled:
             village_settings.units.add(unit)
