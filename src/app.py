@@ -25,6 +25,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon
 try:
     from src.config.settings import (
         AppSettings,
+        AttackSettings,
         RecruitmentSettings,
         VACATION_MOVEMENT_TYPES,
         VacationSettings,
@@ -45,6 +46,10 @@ try:
         launch_chrome_for_game,
     )
     from src.core.village_tracker import VillageTracker
+    from src.core.attack_automation import AttackAutomation
+    from src.core.attack_bridge import GameAttackBridge
+    from src.core.attack_clicker import ClickAttackExecutor
+    from src.core.tktools_client import TkToolsSession
     from src.core.vacation_planner import (
         ACTION_CANCEL,
         ACTION_KEEP,
@@ -63,6 +68,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from config.settings import (
         AppSettings,
+        AttackSettings,
         RecruitmentSettings,
         VACATION_MOVEMENT_TYPES,
         VacationSettings,
@@ -83,6 +89,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
         launch_chrome_for_game,
     )
     from core.village_tracker import VillageTracker
+    from core.attack_automation import AttackAutomation
+    from core.attack_bridge import GameAttackBridge
+    from core.attack_clicker import ClickAttackExecutor
+    from core.tktools_client import TkToolsSession
     from core.vacation_planner import (
         ACTION_CANCEL,
         ACTION_KEEP,
@@ -2603,6 +2613,358 @@ class VacationWidget(QWidget):
             self.log_list.takeItem(self.log_list.count() - 1)
 
 
+class AttackPlanWidget(QWidget):
+    """TK-Tools attack plan execution: settings, live plan and log."""
+
+    enabled_toggled = Signal(bool)
+    setting_changed = Signal(str, object)
+    refresh_requested = Signal()
+
+    _COLUMNS = ("Operacja", "Atak", "Wyjście", "Dotarcie", "Fale", "Status", "Skład / uwagi")
+    _STATUS_KINDS = {
+        "waiting": "muted",
+        "prepared": "pending",
+        "fired": "pending",
+        "sent": "active",
+        "partial": "waiting",
+        "failed": "waiting",
+        "skipped": "waiting",
+        "done_elsewhere": "muted",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer_layout.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Plan ataków")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Automat pobiera Twoje ataki z planera TK-Tools (zaloguj się do "
+            "tk-tools.fr w tej samej przeglądarce co gra), składa fejki i offy, "
+            "wysyła je tak, by dotarły w sekundzie z planu, i zgłasza wynik "
+            "w TK-Tools."
+        )
+        subtitle.setObjectName("secondaryText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        # Status card -----------------------------------------------------------
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 16, 18, 16)
+        status_layout.setSpacing(12)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        self.enabled_toggle = _AutomationToggle()
+        self.enabled_toggle.toggled.connect(self.enabled_toggled.emit)
+        top_row.addWidget(self.enabled_toggle)
+        self.state_chip = QLabel()
+        top_row.addWidget(self.state_chip)
+        top_row.addStretch()
+        self.refresh_button = QPushButton("⟳  Odśwież plan")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        top_row.addWidget(self.refresh_button)
+        status_layout.addLayout(top_row)
+
+        details = QGridLayout()
+        details.setHorizontalSpacing(18)
+        details.setVerticalSpacing(6)
+        self.detail_labels: dict[str, QLabel] = {}
+        for row, (key, caption) in enumerate((
+            ("plan", "Plan TK-Tools"),
+            ("clock", "Zegar serwera"),
+            ("hero", "Bohater"),
+            ("warnings", "Ostrzeżenia"),
+        )):
+            caption_label = QLabel(caption.upper())
+            caption_label.setObjectName("columnHeader")
+            details.addWidget(caption_label, row, 0, Qt.AlignTop)
+            value = QLabel("—")
+            value.setWordWrap(True)
+            details.addWidget(value, row, 1)
+            self.detail_labels[key] = value
+        details.setColumnStretch(1, 1)
+        status_layout.addLayout(details)
+        layout.addWidget(status_card)
+
+        # Attacks table ---------------------------------------------------------
+        table_title = QLabel("Wysyłki")
+        table_title.setObjectName("sectionTitle")
+        layout.addWidget(table_title)
+        self.table = QTableWidget(0, len(self._COLUMNS))
+        self.table.setHorizontalHeaderLabels(self._COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setWordWrap(True)
+        header = self.table.horizontalHeader()
+        for column in range(len(self._COLUMNS) - 1):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(self._COLUMNS) - 1, QHeaderView.Stretch)
+        self.table.setMinimumHeight(300)
+        layout.addWidget(self.table)
+
+        # Settings card ---------------------------------------------------------
+        settings_card = QFrame()
+        settings_card.setObjectName("card")
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setContentsMargins(18, 16, 18, 16)
+        settings_layout.setSpacing(10)
+        settings_title = QLabel("Ustawienia")
+        settings_title.setObjectName("sectionTitle")
+        settings_layout.addWidget(settings_title)
+
+        def sentence(*parts) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            for part in parts:
+                row.addWidget(QLabel(part) if isinstance(part, str) else part)
+            row.addStretch()
+            settings_layout.addLayout(row)
+            return row
+
+        self.mode_buttons: dict[str, QPushButton] = {}
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(0)
+        mode_label = QLabel("Sposób wysyłki:")
+        mode_row.addWidget(mode_label)
+        mode_row.addSpacing(8)
+        for mode, text, object_name in (
+            ("requests", "Polecenia gry", "segmentLeft"),
+            ("clicks", "Klikanie w przeglądarce", "segmentRight"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName(object_name)
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            bold_font = QFont(button.font())
+            bold_font.setBold(True)
+            button.setMinimumWidth(QFontMetrics(bold_font).horizontalAdvance(text) + 34)
+            button.clicked.connect(
+                lambda _checked=False, value=mode: self._choose_mode(value)
+            )
+            mode_row.addWidget(button)
+            self.mode_buttons[mode] = button
+        mode_row.addStretch()
+        settings_layout.addLayout(mode_row)
+        mode_hint = QLabel(
+            "Polecenia gry: najdokładniej, wszystkie fale w tej samej sekundzie. "
+            "Klikanie: aplikacja otwiera osobną kartę gry, wypełnia okna wysyłki "
+            "i klika „Wyślij” w docelowej sekundzie."
+        )
+        mode_hint.setObjectName("footnote")
+        mode_hint.setWordWrap(True)
+        settings_layout.addWidget(mode_hint)
+
+        self.server_name = QLineEdit()
+        self.server_name.setPlaceholderText("np. tr2nx3")
+        self.server_name.setFixedWidth(120)
+        self.refresh_minutes = self._spin(1, 60, " min", 80)
+        sentence(
+            "Serwer w TK-Tools:", self.server_name,
+            "  Odświeżaj plan co", self.refresh_minutes,
+            "(do pierwszej wysyłki operacji).",
+        )
+        self.prepare_seconds = self._spin(15, 300, " s", 80)
+        sentence("Przygotuj wysyłkę", self.prepare_seconds, "przed wyjściem.")
+        self.report_checkbox = QCheckBox(
+            "Zgłaszaj w TK-Tools wysłane i niewysłane ataki"
+        )
+        settings_layout.addWidget(self.report_checkbox)
+
+        fake_title = QLabel("Fejki (gdy plan nie podaje liczby jednostek)")
+        fake_title.setObjectName("fieldLabel")
+        settings_layout.addWidget(fake_title)
+        self.fake_base = self._spin(1, 5000, "", 70)
+        self.fake_tier2 = self._spin(1, 5000, "", 70)
+        self.fake_tier3 = self._spin(1, 5000, "", 70)
+        self.fake_tier2_at = QLineEdit()
+        self.fake_tier2_at.setFixedWidth(130)
+        self.fake_tier3_at = QLineEdit()
+        self.fake_tier3_at.setFixedWidth(130)
+        sentence("Na start", self.fake_base, "+1 maszyna;  od", self.fake_tier2_at,
+                 self.fake_tier2, "+1;  od", self.fake_tier3_at, self.fake_tier3, "+1.")
+
+        self.pt_policy = QComboBox()
+        self.pt_policy.addItem("tylko ostrzegaj", "warn")
+        self.pt_policy.addItem("rozbudowuj zawczasu", "upgrade")
+        sentence("Gdy plac turniejowy jest niższy niż w planie:", self.pt_policy)
+
+        self.hero_checkbox = QCheckBox(
+            "Ukrywaj bohatera: trzymaj go jako posiłek w innej wiosce i wycofuj "
+            "tak, by wrócił przed wysyłką ataku z bohaterem"
+        )
+        settings_layout.addWidget(self.hero_checkbox)
+        self.hero_village = QComboBox()
+        self.hero_village.setMinimumWidth(180)
+        self.hero_margin = self._spin(1, 60, " s", 70)
+        sentence("Postój bohatera:", self.hero_village,
+                 "  Powrót", self.hero_margin, "przed wysyłką.")
+
+        self.server_name.editingFinished.connect(
+            lambda: self.setting_changed.emit("server_name", self.server_name.text())
+        )
+        self.fake_tier2_at.editingFinished.connect(
+            lambda: self.setting_changed.emit("fake_tier2_at", self.fake_tier2_at.text())
+        )
+        self.fake_tier3_at.editingFinished.connect(
+            lambda: self.setting_changed.emit("fake_tier3_at", self.fake_tier3_at.text())
+        )
+        for field, spin_box in (
+            ("refresh_minutes", self.refresh_minutes),
+            ("prepare_seconds", self.prepare_seconds),
+            ("fake_base_units", self.fake_base),
+            ("fake_tier2_units", self.fake_tier2),
+            ("fake_tier3_units", self.fake_tier3),
+            ("hero_return_margin_seconds", self.hero_margin),
+        ):
+            spin_box.valueChanged.connect(
+                lambda value, current_field=field:
+                    self.setting_changed.emit(current_field, value)
+            )
+        self.report_checkbox.toggled.connect(
+            lambda value: self.setting_changed.emit("report_to_tktools", value)
+        )
+        self.hero_checkbox.toggled.connect(
+            lambda value: self.setting_changed.emit("hero_evasion", value)
+        )
+        self.pt_policy.currentIndexChanged.connect(
+            lambda _index: self.setting_changed.emit("pt_policy", self.pt_policy.currentData())
+        )
+        self.hero_village.currentIndexChanged.connect(
+            lambda _index: self.setting_changed.emit(
+                "hero_parking_village_id", self.hero_village.currentData()
+            )
+        )
+        layout.addWidget(settings_card)
+
+        warning = QLabel(
+            "<b>Ważne:</b> aplikacja i przeglądarka muszą być włączone przez cały "
+            "czas operacji, a komputer nie może przejść w uśpienie. Aplikacja "
+            "sama wybudza kartę gry, którą przeglądarka usypia w tle. Godziny "
+            "w tabeli to czas serwera gry."
+        )
+        warning.setObjectName("footnote")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        log_title = QLabel("Dziennik")
+        log_title.setObjectName("sectionTitle")
+        layout.addWidget(log_title)
+        self.log_list = QListWidget()
+        self.log_list.setMinimumHeight(160)
+        layout.addWidget(self.log_list)
+        layout.addStretch()
+        self.set_state("Nie połączono z grą", "muted")
+
+    @staticmethod
+    def _spin(minimum: int, maximum: int, suffix: str, width: int) -> QSpinBox:
+        spin_box = QSpinBox()
+        spin_box.setRange(minimum, maximum)
+        spin_box.setSuffix(suffix)
+        spin_box.setFixedWidth(width)
+        return spin_box
+
+    def _choose_mode(self, mode: str):
+        for value, button in self.mode_buttons.items():
+            button.setChecked(value == mode)
+        self.setting_changed.emit("execution_mode", mode)
+
+    def set_villages(self, villages: list[dict], selected: str | None):
+        self.hero_village.blockSignals(True)
+        self.hero_village.clear()
+        self.hero_village.addItem("najbliższa wioska (auto)", None)
+        for village in villages:
+            self.hero_village.addItem(str(village.get("name") or village["id"]), str(village["id"]))
+        index = self.hero_village.findData(selected) if selected else 0
+        self.hero_village.setCurrentIndex(max(0, index))
+        self.hero_village.blockSignals(False)
+
+    def load_settings(self, settings):
+        widgets = [
+            self.enabled_toggle, self.server_name, self.refresh_minutes,
+            self.prepare_seconds, self.report_checkbox, self.fake_base,
+            self.fake_tier2, self.fake_tier3, self.fake_tier2_at,
+            self.fake_tier3_at, self.pt_policy, self.hero_checkbox,
+            self.hero_margin, self.hero_village,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.enabled_toggle.setChecked(settings.enabled)
+        self.server_name.setText(settings.server_name)
+        self.refresh_minutes.setValue(settings.refresh_minutes)
+        self.prepare_seconds.setValue(settings.prepare_seconds)
+        self.report_checkbox.setChecked(settings.report_to_tktools)
+        self.fake_base.setValue(settings.fake_base_units)
+        self.fake_tier2.setValue(settings.fake_tier2_units)
+        self.fake_tier3.setValue(settings.fake_tier3_units)
+        self.fake_tier2_at.setText(settings.fake_tier2_at)
+        self.fake_tier3_at.setText(settings.fake_tier3_at)
+        self.pt_policy.setCurrentIndex(max(0, self.pt_policy.findData(settings.pt_policy)))
+        self.hero_checkbox.setChecked(settings.hero_evasion)
+        self.hero_margin.setValue(settings.hero_return_margin_seconds)
+        index = self.hero_village.findData(settings.hero_parking_village_id)
+        self.hero_village.setCurrentIndex(max(0, index))
+        for value, button in self.mode_buttons.items():
+            button.setChecked(value == settings.execution_mode)
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def set_state(self, text: str, kind: str):
+        _set_status_chip(self.state_chip, text, kind)
+
+    def set_detail(self, key: str, text: str):
+        self.detail_labels[key].setText(text)
+
+    def update_rows(self, rows: list[dict], server_now: float | None):
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            departure = row["departure"]
+            countdown = ""
+            if server_now is not None and row["status_key"] in ("waiting", "prepared"):
+                remaining = int(departure - server_now)
+                if remaining >= 0:
+                    hours, rest = divmod(remaining, 3600)
+                    minutes, seconds = divmod(rest, 60)
+                    countdown = f"  (za {hours}:{minutes:02d}:{seconds:02d})"
+            values = (
+                row["operation"],
+                row["label"],
+                f"{datetime.fromtimestamp(departure):%d.%m %H:%M:%S}{countdown}",
+                f"{datetime.fromtimestamp(row['arrival']):%d.%m %H:%M:%S}",
+                str(row["waves"]),
+                row["status"],
+                "  ".join(part for part in (row["composition"], row["message"]) if part),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 5:
+                    background, foreground = _RECRUITMENT_STATUS_COLORS[
+                        self._STATUS_KINDS.get(row["status_key"], "muted")
+                    ]
+                    item.setBackground(QColor(background))
+                    item.setForeground(QColor(foreground))
+                self.table.setItem(index, column, item)
+        self.table.resizeRowsToContents()
+
+    def add_log(self, text: str):
+        self.log_list.insertItem(0, f"{datetime.now():%d.%m %H:%M:%S}  {text}")
+        while self.log_list.count() > 300:
+            self.log_list.takeItem(self.log_list.count() - 1)
+
+
 class IncomingAttacksWidget(QWidget):
     """Display the persisted history of attacks detected in owned villages."""
 
@@ -3112,6 +3474,7 @@ class MainWindow(QMainWindow):
 
     incoming_attack_update = Signal(dict)
     village_names_update = Signal(dict)
+    attack_log_message = Signal(str)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -3177,6 +3540,11 @@ class MainWindow(QMainWindow):
         self.vacation_timer = QTimer(self)
         self.vacation_timer.setInterval(_VACATION_CHECK_INTERVAL_MS)
         self.vacation_timer.timeout.connect(self._check_vacation)
+        self.attack_automation = None
+        self.attack_log_message.connect(self._on_attack_log)
+        self.attack_timer = QTimer(self)
+        self.attack_timer.setInterval(1000)
+        self.attack_timer.timeout.connect(self._attack_tick)
         self.incoming_attack_eta_timer = QTimer(self)
         self.incoming_attack_eta_timer.setInterval(1000)
         self.incoming_attack_eta_timer.timeout.connect(
@@ -3317,6 +3685,13 @@ class MainWindow(QMainWindow):
         self.vacation_tab.plan_requested.connect(self._plan_vacation_manually)
         self.vacation_tab.cancel_requested.connect(self._cancel_vacation_manually)
         self.content_tabs.addTab(self.vacation_tab, "Wakacje")
+
+        self.attack_tab = AttackPlanWidget()
+        self.attack_tab.load_settings(self.settings.attacks)
+        self.attack_tab.enabled_toggled.connect(self._set_attacks_enabled)
+        self.attack_tab.setting_changed.connect(self._set_attack_setting)
+        self.attack_tab.refresh_requested.connect(self._refresh_attack_plan)
+        self.content_tabs.addTab(self.attack_tab, "Plan ataków")
         
         layout.addWidget(self.content_tabs, stretch=3)
         
@@ -3389,6 +3764,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(2000, self._check_recruitment_queues)
                 QTimer.singleShot(2500, self._check_resource_milling)
                 QTimer.singleShot(3500, self._check_vacation)
+                self._start_attack_automation()
             else:
                 self.recruitment_queue_timer.stop()
                 self.resource_milling_timer.stop()
@@ -4465,6 +4841,161 @@ class MainWindow(QMainWindow):
             "Sprawdź kolejkę w grze."
         )
 
+    # Attack plan automation -------------------------------------------------
+    def _game_server_name(self) -> str:
+        if self.settings.attacks.server_name:
+            return self.settings.attacks.server_name
+        tab = getattr(self.browser_session, "_tab", None)
+        url = (getattr(tab, "_kwargs", {}) or {}).get("url") or ""
+        host = url.split("//", 1)[-1].split("/", 1)[0]
+        return host.split(".", 1)[0] if host.endswith("kingdoms.com") else ""
+
+    def _start_attack_automation(self):
+        if self.browser_session is None:
+            return
+        server_name = self._game_server_name()
+        if server_name and not self.settings.attacks.server_name:
+            self.settings.attacks.server_name = server_name
+            self._save_recruitment_settings()
+            self.attack_tab.load_settings(self.settings.attacks)
+        bridge = GameAttackBridge(self.browser_session)
+        tktools = TkToolsSession(self.browser_session._cdp_url)
+        self.attack_automation = AttackAutomation(
+            bridge,
+            tktools,
+            lambda: self.settings.attacks,
+            self.attack_log_message.emit,
+            click_executor=ClickAttackExecutor(self.browser_session),
+        )
+        villages = (self.dashboard_tab._live_state or {}).get("villages", [])
+        self.attack_tab.set_villages(villages, self.settings.attacks.hero_parking_village_id)
+        self.attack_timer.start()
+        self.attack_tab.set_state("Połączono z grą", "active")
+
+    def _on_attack_log(self, text: str):
+        self.attack_tab.add_log(text)
+
+    def _stop_attack_automation(self):
+        self.attack_timer.stop()
+        if self.attack_automation is not None:
+            self.attack_automation.tktools.disconnect()
+            if self.attack_automation.click_executor is not None:
+                self.attack_automation.click_executor.close()
+        self.attack_automation = None
+        self.attack_tab.set_state("Nie połączono z grą", "muted")
+
+    def _attack_tick(self):
+        automation = self.attack_automation
+        if automation is None:
+            return
+        try:
+            if self.browser_session is not None:
+                self.browser_session.keep_page_awake()
+            automation.tick()
+        except Exception as error:
+            logger.exception("Attack automation tick failed")
+            self.attack_tab.set_detail("plan", f"Błąd: {error}")
+        self._render_attack_state()
+
+    def _render_attack_state(self):
+        automation = self.attack_automation
+        if automation is None:
+            return
+        settings = self.settings.attacks
+        server_now = automation.server_now() if automation.context else None
+        self.attack_tab.update_rows(automation.rows(), server_now)
+        if automation.last_error:
+            self.attack_tab.set_detail("plan", f"Błąd: {automation.last_error}")
+        elif automation.last_refresh:
+            ago = int(monotonic() - automation.last_refresh)
+            pending = sum(1 for run in automation.runs.values() if not run.finished)
+            self.attack_tab.set_detail(
+                "plan",
+                f"Serwer {settings.server_name or '?'}: {len(automation.runs)} ataków "
+                f"({pending} do wysłania). Odczyt {ago} s temu."
+                + ("" if not automation.plan_problems else
+                   " " + " ".join(automation.plan_problems)),
+            )
+        elif not settings.enabled:
+            self.attack_tab.set_detail(
+                "plan", "Włącz automat albo kliknij „Odśwież plan”, aby pobrać plan."
+            )
+        if server_now is not None:
+            self.attack_tab.set_detail(
+                "clock",
+                f"{datetime.fromtimestamp(server_now):%H:%M:%S} "
+                f"(komputer {automation.server_offset_ms / 1000:+.1f} s względem "
+                f"serwera, ping {automation.rtt_ms:.0f} ms)",
+            )
+        self.attack_tab.set_detail(
+            "hero",
+            automation.hero_status_text if settings.hero_evasion else "Ukrywanie wyłączone.",
+        )
+        self.attack_tab.set_detail(
+            "warnings", "\n".join(automation.pt_warnings) or "Brak.",
+        )
+
+    def _refresh_attack_plan(self):
+        if self.attack_automation is None:
+            self.attack_tab.add_log("Najpierw połącz się z grą.")
+            return
+        try:
+            self.attack_automation.refresh_plan()
+            self.attack_tab.add_log(
+                f"Pobrano plan: {len(self.attack_automation.runs)} ataków."
+            )
+        except Exception as error:
+            self.attack_automation.last_error = str(error)
+            self.attack_tab.add_log(f"Nie udało się pobrać planu: {error}")
+        self._render_attack_state()
+
+    def _set_attacks_enabled(self, enabled: bool):
+        if enabled:
+            answer = QMessageBox.question(
+                self,
+                "Włączyć automat ataków?",
+                "Automat będzie sam wysyłał wojska według planu TK-Tools "
+                "(fejki, offy, katapulty, bohater) i zgłaszał wynik w TK-Tools.\n\n"
+                "Wysłanych wojsk nie da się cofnąć. Upewnij się, że plan jest "
+                "aktualny, a aplikacja i przeglądarka będą włączone przez całą "
+                "operację.\n\nWłączyć?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.attack_tab.load_settings(self.settings.attacks)
+                return
+        self.settings.attacks.enabled = enabled
+        if not self._save_recruitment_settings():
+            self.settings.attacks.enabled = not enabled
+            self.attack_tab.load_settings(self.settings.attacks)
+            return
+        self.attack_tab.add_log(
+            "Automat ataków włączony." if enabled else "Automat ataków wyłączony."
+        )
+
+    def _set_attack_setting(self, field: str, value):
+        previous = getattr(self.settings.attacks, field)
+        try:
+            updated = AttackSettings.model_validate({
+                **self.settings.attacks.model_dump(),
+                field: value,
+            })
+        except ValueError as error:
+            self.attack_tab.add_log(f"Nieprawidłowe ustawienie: {error}")
+            self.attack_tab.load_settings(self.settings.attacks)
+            return
+        setattr(self.settings.attacks, field, getattr(updated, field))
+        if not self._save_recruitment_settings():
+            setattr(self.settings.attacks, field, previous)
+            self.attack_tab.load_settings(self.settings.attacks)
+            return
+        if field == "execution_mode":
+            self.attack_tab.add_log(
+                "Tryb wysyłki: "
+                + ("klikanie w przeglądarce." if value == "clicks" else "polecenia gry.")
+            )
+
     # Vacation safeguard --------------------------------------------------------
     def _set_vacation_enabled(self, enabled: bool):
         if enabled:
@@ -5175,6 +5706,7 @@ class MainWindow(QMainWindow):
         self.resource_milling_timer.stop()
         self.vacation_timer.stop()
         self._vacation_pending_request = None
+        self._stop_attack_automation()
         self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
             self.browser_session.stop_incoming_attack_listener()

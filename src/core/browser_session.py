@@ -1144,7 +1144,16 @@ class TravianBrowserSession:
         """Attach to an existing Travian tab without creating or navigating tabs."""
         self._browser = pychrome.Browser(url=self._cdp_url)
         tabs = self._browser.list_tab(timeout=3)
-        game_tabs = [tab for tab in tabs if _is_game_url(_tab_url(tab))]
+        try:
+            from src.core.attack_clicker import DEDICATED_TAB_IDS
+        except ModuleNotFoundError:  # pragma: no cover - script fallback
+            from core.attack_clicker import DEDICATED_TAB_IDS
+
+        game_tabs = [
+            tab for tab in tabs
+            if _is_game_url(_tab_url(tab))
+            and getattr(tab, "id", None) not in DEDICATED_TAB_IDS
+        ]
         if not game_tabs:
             self._browser = None
             raise RuntimeError(
@@ -1156,10 +1165,28 @@ class TravianBrowserSession:
             self._attach_network_listeners()
             self._tab.start()
             self._tab.call_method("Network.enable")
+            self.keep_page_awake()
             return self.read_game_state()
         except Exception:
             self.disconnect()
             raise
+
+    def keep_page_awake(self) -> None:
+        """Stop the browser from freezing the game tab in the background.
+
+        Edge and Chrome freeze hidden tabs: timers stop and queued game
+        requests are never sent, which would silently break every
+        automation (including cancelling vacation mode).
+        """
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        try:
+            self._tab.call_method("Page.setWebLifecycleState", state="active", _timeout=5)
+            self._tab.call_method(
+                "Emulation.setFocusEmulationEnabled", enabled=True, _timeout=5,
+            )
+        except Exception as error:  # pragma: no cover - depends on the browser
+            logger.warning("Could not keep the game tab awake: %s", error)
 
     def read_game_state(self) -> dict:
         if self._tab is None:

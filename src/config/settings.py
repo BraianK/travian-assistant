@@ -216,10 +216,53 @@ class VacationSettings(BaseModel):
         return normalized
 
 
+ATTACK_EXECUTION_MODES = ("requests", "clicks")
+ATTACK_PT_POLICIES = ("warn", "upgrade")
+
+
+class AttackSettings(BaseModel):
+    """Automatic execution of TK-Tools attack plans."""
+
+    enabled: bool = False
+    execution_mode: Literal["requests", "clicks"] = "requests"
+    server_name: str = Field(default="", max_length=40)
+    refresh_minutes: int = Field(default=3, ge=1, le=60)
+    prepare_seconds: int = Field(default=45, ge=15, le=300)
+    report_to_tktools: bool = True
+    fake_base_units: int = Field(default=32, ge=1, le=5000)
+    fake_tier2_units: int = Field(default=36, ge=1, le=5000)
+    fake_tier3_units: int = Field(default=44, ge=1, le=5000)
+    fake_tier2_at: str = "2026-11-10 14:00"
+    fake_tier3_at: str = "2026-11-23 14:00"
+    pt_policy: Literal["warn", "upgrade"] = "warn"
+    hero_evasion: bool = False
+    hero_parking_village_id: str | None = None
+    hero_return_margin_seconds: int = Field(default=1, ge=1, le=60)
+
+    @field_validator("fake_tier2_at", "fake_tier3_at")
+    @classmethod
+    def validate_tier_time(cls, value: str) -> str:
+        from datetime import datetime
+
+        try:
+            parsed = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+        except ValueError as error:
+            raise ValueError("Use the YYYY-MM-DD HH:MM format.") from error
+        return parsed.strftime("%Y-%m-%d %H:%M")
+
+    @field_validator("server_name")
+    @classmethod
+    def validate_server_name(cls, value: str) -> str:
+        value = value.strip()
+        if value and not all(char.isalnum() or char in "-_" for char in value):
+            raise ValueError("Invalid server name.")
+        return value
+
+
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="0.2.0")
+    version: str = Field(default="0.3.0")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
@@ -231,7 +274,8 @@ class AppSettings(BaseModel):
         default_factory=ResourceMillingSettings
     )
     vacation: VacationSettings = Field(default_factory=VacationSettings)
-    
+    attacks: AttackSettings = Field(default_factory=AttackSettings)
+
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)
     
