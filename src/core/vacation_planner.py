@@ -77,6 +77,8 @@ def decide_vacation_action(
     attack_threshold: int,
     counted_movement_types: set[str],
     last_plan_date: str | None,
+    next_own_attack: float | None = None,
+    vacation_days: int = 1,
 ) -> VacationDecision:
     """Return what the safeguard should do right now.
 
@@ -88,6 +90,36 @@ def decide_vacation_action(
     server_time = float(state["server_time"])
     start = float(state.get("start") or 0)
     end = float(state.get("end") or 0)
+
+    # The game refuses to send troops while vacation mode is planned or
+    # active (PlayerInVacationActivation), so own planned attacks win.
+    if vacation_state == VACATION_STATE_NONE and next_own_attack is not None:
+        blocked_until = server_time + 86400 * (1 + max(1, vacation_days))
+        if next_own_attack < blocked_until:
+            return VacationDecision(
+                ACTION_WAIT,
+                "Masz zaplanowane ataki z TK-Tools (najbliższy "
+                f"{datetime.fromtimestamp(next_own_attack):%d.%m %H:%M}) — "
+                "nie planuję wakacji, bo zablokowałyby wysyłkę.",
+            )
+    if (
+        vacation_state == VACATION_STATE_PLANNED
+        and server_time < start
+        and next_own_attack is not None
+        and next_own_attack < (end or start + 86400)
+    ):
+        if start - server_time <= CANCEL_SAFETY_SECONDS:
+            return VacationDecision(
+                ACTION_KEEP,
+                "Za mało czasu na bezpieczne anulowanie — wakacje się włączą, "
+                "zaplanowane ataki nie wyjdą.",
+            )
+        return VacationDecision(
+            ACTION_CANCEL,
+            "Zaplanowane wakacje blokują Twoje ataki z TK-Tools (najbliższy "
+            f"{datetime.fromtimestamp(next_own_attack):%d.%m %H:%M}) — "
+            "anuluję wakacje, dzień wakacji wróci.",
+        )
 
     if vacation_state == VACATION_STATE_NONE:
         window_start, window_end = plan_window(

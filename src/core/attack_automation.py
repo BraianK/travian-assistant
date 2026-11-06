@@ -136,6 +136,28 @@ class AttackRun:
         return self.status in FINAL_STATUSES
 
 
+def waves_text(count: int) -> str:
+    """Polish plural: 1 fala, 2-4 fale, 5+ fal (12-14 fal)."""
+    if count == 1:
+        return "1 fala"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return f"{count} fale"
+    return f"{count} fal"
+
+
+def waves_on_time(lags: list[int]) -> bool:
+    """True if every wave landed in its slot.
+
+    The server never lets two of the player's attacks reach the same target
+    in the same second: waves sent together land one second apart (seen live:
+    +0 s, +1 s, +2 s). Wave *k* is on time up to ``k + 1`` seconds late.
+    """
+    return all(
+        lag <= index + LATE_TOLERANCE_SECONDS
+        for index, lag in enumerate(sorted(lags))
+    )
+
+
 class PreciseTimer:
     """Run callbacks at an exact local time on a background thread."""
 
@@ -395,9 +417,15 @@ class AttackAutomation:
         if not settings.enabled:
             return
         self.bridge.keep_awake()
-        if (
-            self.last_refresh is None
-            or time.monotonic() - self.last_refresh >= settings.refresh_minutes * 60
+        now = self.server_now() if self.context else None
+        send_is_close = now is not None and any(
+            run.status == STATUS_WAITING
+            and run.departure - now <= settings.prepare_seconds + 90
+            for run in self.runs.values()
+        )
+        if self.last_refresh is None or (
+            not send_is_close
+            and time.monotonic() - self.last_refresh >= settings.refresh_minutes * 60
         ):
             try:
                 self.refresh_plan()
@@ -405,7 +433,10 @@ class AttackAutomation:
                 self.last_error = str(error)
                 self.last_refresh = time.monotonic() - settings.refresh_minutes * 60 + 30
                 logger.warning("Attack plan refresh failed: %s", error)
-                return
+                if not self.runs:
+                    return
+                # Keep executing the plan we already have: a TK-Tools hiccup
+                # must never stop attacks that are due.
         now = self.server_now()
         runs = sorted(self.runs.values(), key=lambda item: item.departure)
         for run in runs:
@@ -497,7 +528,7 @@ class AttackAutomation:
         notes = [note for send in sends for note in send.notes]
         run.message = "; ".join(notes)
         self._log(
-            f"Przygotowano {attack.label}: {len(sends)} fal, wyjście "
+            f"Przygotowano {attack.label}: {waves_text(len(sends))}, wyjście "
             f"{datetime.fromtimestamp(departure):%H:%M:%S} (czas serwera)."
             + (f" Uwagi: {run.message}" if notes else "")
         )
@@ -573,10 +604,12 @@ class AttackAutomation:
                 f"Wysłano {sent}/{len(results)} fal. Błędy: {'; '.join(errors)}.{lag_text}",
                 "PARTIALLY_NOT_SENT",
             )
-        elif lags and max(lags) > LATE_TOLERANCE_SECONDS:
+        elif not waves_on_time(
+            [int(movement["arrival"] - attack.arrival) for movement in matching]
+        ):
             self._finish(run, STATUS_PARTIAL, f"Wysłano z opóźnieniem.{lag_text}", "TIME_LAG")
         else:
-            self._finish(run, STATUS_SENT, f"Wysłano {sent} fal.{lag_text}", None)
+            self._finish(run, STATUS_SENT, f"Wysłano {waves_text(sent)}.{lag_text}", None)
 
     def _finish(self, run: AttackRun, status: str, message: str, deny_reason: str | None) -> None:
         run.status = status

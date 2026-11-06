@@ -121,6 +121,23 @@ class VacationPlannerTests(unittest.TestCase):
             _decide({**_planned(500), "vacation_state": 2}, attacks=[]).action,
         )
 
+    def test_does_not_plan_when_own_attacks_are_due(self):
+        decision = _decide(IDLE, next_own_attack=SERVER_NOW + 3600)
+        self.assertEqual(ACTION_WAIT, decision.action)
+        self.assertIn("ataki", decision.reason)
+        far = _decide(IDLE, next_own_attack=SERVER_NOW + 4 * 86400)
+        self.assertEqual(ACTION_PLAN, far.action)
+
+    def test_cancels_planned_vacation_that_blocks_own_attacks(self):
+        decision = _decide(_planned(20 * 3600), next_own_attack=SERVER_NOW + 600)
+        self.assertEqual(ACTION_CANCEL, decision.action)
+        self.assertEqual(
+            ACTION_KEEP,
+            _decide(_planned(30), next_own_attack=SERVER_NOW + 10).action,
+        )
+        later = _decide(_planned(20 * 3600), next_own_attack=SERVER_NOW + 5 * 86400)
+        self.assertEqual(ACTION_WAIT, later.action)
+
     def test_settings_validation(self):
         self.assertEqual("07:05", VacationSettings(plan_time="7:5").plan_time)
         with self.assertRaises(ValueError):

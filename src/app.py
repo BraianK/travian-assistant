@@ -5122,6 +5122,8 @@ class MainWindow(QMainWindow):
             attack_threshold=settings.attack_threshold,
             counted_movement_types=settings.counted_movement_types,
             last_plan_date=settings.last_plan_date,
+            next_own_attack=self._next_own_attack_departure(),
+            vacation_days=settings.vacation_days,
         )
         self.vacation_tab.set_next_action(decision.reason)
         if decision.action in (ACTION_KEEP, ACTION_PLAN, ACTION_CANCEL):
@@ -5173,6 +5175,17 @@ class MainWindow(QMainWindow):
         )
         QTimer.singleShot(1500, self._verify_vacation_change)
 
+    def _next_own_attack_departure(self) -> float | None:
+        """Server time of the next attack the attack automation will send."""
+        automation = self.attack_automation
+        if automation is None or not self.settings.attacks.enabled:
+            return None
+        departures = [
+            run.departure for run in list(automation.runs.values())
+            if run.status in ("waiting", "prepared")
+        ]
+        return min(departures) if departures else None
+
     def _verify_vacation_change(self):
         if self._vacation_pending_request is None or self.browser_session is None:
             self._vacation_pending_request = None
@@ -5188,6 +5201,20 @@ class MainWindow(QMainWindow):
             self._vacation_pending_request = (request_id, planned, attempts + 1)
             QTimer.singleShot(1500, self._verify_vacation_change)
             return
+
+        if result["status"] == "unconfirmed" and not result.get("error"):
+            # The game's answer does not always carry the player data; check
+            # the live state instead of assuming the change failed.
+            try:
+                state = self.browser_session.read_vacation_state()
+                changed = (
+                    state["vacation_state"] == 1 and state["start"] > 0
+                    if planned else state["vacation_state"] == 0
+                )
+                if changed:
+                    result = {**result, **state, "status": "confirmed"}
+            except Exception as error:
+                logger.warning("Could not re-read vacation state: %s", error)
 
         self._vacation_pending_request = None
         if result["status"] == "confirmed":

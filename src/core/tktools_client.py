@@ -147,8 +147,21 @@ class TkToolsSession:
         self._tab = tab
         return tab
 
+    @staticmethod
+    def _wake(tab) -> None:
+        """Browsers freeze hidden tabs; a frozen tab never finishes fetch()."""
+        for method, params in (
+            ("Page.setWebLifecycleState", {"state": "active"}),
+            ("Emulation.setFocusEmulationEnabled", {"enabled": True}),
+        ):
+            try:
+                tab.call_method(method, _timeout=5, **params)
+            except Exception:
+                pass
+
     def _evaluate(self, expression: str, timeout: int = 20):
         tab = self._ensure_tab()
+        self._wake(tab)
         try:
             result = tab.call_method(
                 "Runtime.evaluate",

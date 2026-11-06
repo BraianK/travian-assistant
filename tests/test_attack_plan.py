@@ -432,6 +432,58 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(77, requests[0]["params"]["troopId"])
         self.assertTrue(automation.runs["a1"].hero_recall_scheduled)
 
+    def test_tktools_failure_does_not_stop_due_sends(self):
+        departure = ARRIVAL_TS - 23530
+        automation, bridge, *_ = self._automation(departure - 600)
+        automation.refresh_plan()
+        bridge.server_time = departure - 30
+
+        def broken(name):
+            raise RuntimeError("TK-Tools frozen")
+
+        automation.tktools.read_planner = broken
+        automation.last_refresh = -10_000.0
+        automation.tick()
+        self.assertTrue(bridge.fired)
+
+    def test_no_plan_refresh_right_before_a_send(self):
+        departure = ARRIVAL_TS - 23530
+        automation, bridge, *_ = self._automation(departure - 600)
+        automation.refresh_plan()
+        bridge.server_time = departure - 100
+        automation.last_refresh = -10_000.0
+        calls = []
+        automation.tktools.read_planner = lambda name: calls.append(name) or {"serverId": "s", "rows": _plan_rows()}
+        automation.tick()
+        self.assertEqual([], calls)
+
+    def test_waves_one_second_apart_count_as_on_time(self):
+        from src.core.attack_automation import waves_on_time
+
+        self.assertTrue(waves_on_time([0, 1, 2]))
+        self.assertTrue(waves_on_time([1, 2, 3]))
+        self.assertFalse(waves_on_time([2, 3, 4]))
+        self.assertFalse(waves_on_time([0, 1, 5]))
+
+    def test_waves_text_plural(self):
+        from src.core.attack_automation import waves_text
+
+        self.assertEqual(["1 fala", "3 fale", "5 fal", "12 fal", "22 fale"],
+                         [waves_text(n) for n in (1, 3, 5, 12, 22)])
+
+    def test_live_wave_spacing_is_confirmed(self):
+        departure = ARRIVAL_TS - 23530
+        automation, bridge, tk, *_ = self._automation(departure - 30)
+        bridge.read_movements = lambda village_id: [
+            {"target": "538427428", "movement_type": 3, "arrival": ARRIVAL_TS + lag, "units": {}}
+            for lag in (0, 1, 2)
+        ]
+        automation.tick()
+        bridge.server_time = departure + 5
+        automation.tick()
+        self.assertEqual(STATUS_SENT, automation.runs["a2"].status)
+        self.assertIn("a2", tk.confirmed)
+
     def test_frozen_operation_keeps_its_plan(self):
         departure = ARRIVAL_TS - 23530
         automation, *_ = self._automation(departure - 30)
