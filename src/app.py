@@ -4906,7 +4906,7 @@ class MainWindow(QMainWindow):
         self.attack_tab.update_rows(automation.rows(), server_now)
         if automation.last_error:
             self.attack_tab.set_detail("plan", f"Błąd: {automation.last_error}")
-        elif automation.last_refresh:
+        elif automation.last_refresh is not None:
             ago = int(monotonic() - automation.last_refresh)
             pending = sum(1 for run in automation.runs.values() if not run.finished)
             self.attack_tab.set_detail(

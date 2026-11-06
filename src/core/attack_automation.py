@@ -186,7 +186,7 @@ class AttackAutomation:
         self.context: dict | None = None
         self.server_offset_ms: float = 0.0
         self.rtt_ms: float = 150.0
-        self.last_refresh: float = 0.0
+        self.last_refresh: float | None = None
         self.last_error: str | None = None
         self.plan_problems: list[str] = []
         self.pt_warnings: list[str] = []
@@ -372,8 +372,8 @@ class AttackAutomation:
             if not location:
                 warnings[-1] += " Brak placu — zbuduj go ręcznie."
                 continue
-            last = self._pt_attempts.get(village_id, 0.0)
-            if time.monotonic() - last < 600:
+            last = self._pt_attempts.get(village_id)
+            if last is not None and time.monotonic() - last < 600:
                 continue
             self._pt_attempts[village_id] = time.monotonic()
             try:
@@ -396,7 +396,7 @@ class AttackAutomation:
             return
         self.bridge.keep_awake()
         if (
-            not self.runs
+            self.last_refresh is None
             or time.monotonic() - self.last_refresh >= settings.refresh_minutes * 60
         ):
             try:
