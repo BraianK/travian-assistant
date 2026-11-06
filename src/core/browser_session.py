@@ -357,6 +357,13 @@ _READ_GAME_STATE = """(() => {
         resources,
         capacities,
         stockPoints,
+        modelProduction: currentVillage && currentVillage.data
+            && currentVillage.data.production ? {
+            wood: Number(currentVillage.data.production["1"]),
+            clay: Number(currentVillage.data.production["2"]),
+            iron: Number(currentVillage.data.production["3"]),
+            grain: Number(currentVillage.data.production["4"])
+        } : null,
         buildings,
         resource_fields: resourceFields,
         selected_village_id: selectedVillageId,
@@ -414,6 +421,36 @@ _READ_TROOPS = """(() => {
 })()"""
 
 
+_READ_ALL_TROOPS = """((villageIds) => {
+    if (typeof Troops === "undefined" || typeof Village === "undefined") {
+        return {complete: false};
+    }
+    const result = {complete: true, tribe_id: 0, villages: {}};
+    for (const villageId of villageIds) {
+        const village = Village.get(villageId);
+        const collection = Troops.getCollection("stationary", villageId);
+        if (!village || !village.data || !collection || !collection.filled) {
+            return {complete: false};
+        }
+        const playerId = String(village.data.playerId);
+        result.tribe_id = Number(village.data.tribeId) || result.tribe_id;
+        const units = {};
+        let hero = 0;
+        for (const row of collection.data || []) {
+            const data = row.data || {};
+            if (String(data.playerId) !== playerId || data.status !== "home") continue;
+            for (const [unit, count] of Object.entries(data.units || {})) {
+                const amount = Number(count) || 0;
+                if (Number(unit) === 11) hero += amount;
+                else units[unit] = (units[unit] || 0) + amount;
+            }
+        }
+        result.villages[villageId] = {units, hero};
+    }
+    return result;
+})"""
+
+
 def _cdp_url(address: str, port: int) -> str:
     """Build a loopback-only Chrome DevTools URL."""
     candidate = address.strip()
@@ -459,6 +496,23 @@ def _tab_url(tab: pychrome.Tab) -> str:
     """Read the URL from pychrome's initial CDP target metadata."""
     metadata = getattr(tab, "_kwargs", {})
     return str(metadata.get("url", "")) if isinstance(metadata, dict) else ""
+
+
+def _model_production_rates(value) -> dict[str, int] | None:
+    """Hourly production from the game's village model, if complete."""
+    if not isinstance(value, dict):
+        return None
+    rates: dict[str, int] = {}
+    for name in ("wood", "clay", "iron", "grain"):
+        rate = value.get(name)
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(rate)
+        ):
+            return None
+        rates[name] = int(round(rate))
+    return rates
 
 
 def _parse_game_state(result: dict) -> dict:
@@ -1198,11 +1252,18 @@ class TravianBrowserSession:
             _timeout=3,
         )
         state = _parse_game_state(result)
-        state["production_rates"] = self._read_production_rates(
-            result.get("result", {}).get("value", {}).get("stockPoints", {}),
-            state["resources"],
-            state["capacities"],
-        )
+        value = result.get("result", {}).get("value", {}) or {}
+        model_rates = _model_production_rates(value.get("modelProduction"))
+        if model_rates is not None:
+            # The game model already holds hourly net production; hovering the
+            # resource bar to read tooltips took ~4 s and blocked the UI.
+            state["production_rates"] = model_rates
+        else:
+            state["production_rates"] = self._read_production_rates(
+                value.get("stockPoints", {}),
+                state["resources"],
+                state["capacities"],
+            )
         return state
 
     def read_incoming_attacks(self, villages: list[dict]) -> list[dict]:
@@ -1426,9 +1487,52 @@ class TravianBrowserSession:
         return attacks
 
     def read_troops_for_villages(self, villages: list[dict]) -> list[dict]:
-        """Read stationed own-tribe units in each village, restoring the selection."""
+        """Read own units stationed at home in every village.
+
+        The game keeps every village's stationary troops in memory, so one
+        script reads them all without switching the selected village. Only
+        when that data is missing does it fall back to selecting each village.
+        """
         if self._tab is None:
             raise RuntimeError("Not connected to Chrome.")
+        village_ids = [
+            str(village.get("id") or "") for village in villages
+            if str(village.get("id") or "").isdigit()
+        ]
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=f"{_READ_ALL_TROOPS}({json.dumps(village_ids)})",
+            returnByValue=True,
+            _timeout=5,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict) or not value.get("complete"):
+            return self._read_troops_by_switching(villages)
+        names = {str(village.get("id")): village.get("name", "") for village in villages}
+        rows = []
+        for village_id in village_ids:
+            data = value["villages"].get(village_id) or {}
+            units = data.get("units") or {}
+            for unit_number in range(1, 11):
+                rows.append({
+                    "village_id": village_id,
+                    "village": names.get(village_id, ""),
+                    "unit": _GAUL_UNIT_NAMES.get(
+                        unit_number,
+                        f"Tribe {value.get('tribe_id', 0)} unit {unit_number}",
+                    ),
+                    "count": int(units.get(str(unit_number), 0) or 0),
+                })
+            rows.append({
+                "village_id": village_id,
+                "village": names.get(village_id, ""),
+                "unit": "Hero",
+                "count": int(data.get("hero", 0) or 0),
+            })
+        return rows
+
+    def _read_troops_by_switching(self, villages: list[dict]) -> list[dict]:
+        """Fallback: select each village and read the troops panel."""
         initial_state = self.read_game_state()
         original_village_id = initial_state["selected_village_id"]
         rows = []

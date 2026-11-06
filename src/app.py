@@ -4,6 +4,7 @@ import logging
 import json
 import sys
 import tempfile
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from time import monotonic
@@ -3541,6 +3542,7 @@ class MainWindow(QMainWindow):
         self.vacation_timer.setInterval(_VACATION_CHECK_INTERVAL_MS)
         self.vacation_timer.timeout.connect(self._check_vacation)
         self.attack_automation = None
+        self._attack_worker = None
         self.attack_log_message.connect(self._on_attack_log)
         self.attack_timer = QTimer(self)
         self.attack_timer.setInterval(1000)
@@ -4884,17 +4886,37 @@ class MainWindow(QMainWindow):
         self.attack_automation = None
         self.attack_tab.set_state("Nie połączono z grą", "muted")
 
+    def _run_attack_work(self, work, description: str) -> bool:
+        """Run slow attack automation work off the GUI thread (one at a time)."""
+        worker = self._attack_worker
+        if worker is not None and worker.is_alive():
+            return False
+
+        def run():
+            try:
+                work()
+            except Exception as error:
+                logger.exception("Attack automation %s failed", description)
+                self.attack_log_message.emit(f"Błąd ({description}): {error}")
+
+        self._attack_worker = threading.Thread(
+            target=run, daemon=True, name=f"attack-{description}",
+        )
+        self._attack_worker.start()
+        return True
+
     def _attack_tick(self):
         automation = self.attack_automation
         if automation is None:
             return
-        try:
-            if self.browser_session is not None:
-                self.browser_session.keep_page_awake()
+        session = self.browser_session
+
+        def work():
+            if session is not None:
+                session.keep_page_awake()
             automation.tick()
-        except Exception as error:
-            logger.exception("Attack automation tick failed")
-            self.attack_tab.set_detail("plan", f"Błąd: {error}")
+
+        self._run_attack_work(work, "tick")
         self._render_attack_state()
 
     def _render_attack_state(self):
@@ -4936,18 +4958,25 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_attack_plan(self):
-        if self.attack_automation is None:
+        automation = self.attack_automation
+        if automation is None:
             self.attack_tab.add_log("Najpierw połącz się z grą.")
             return
-        try:
-            self.attack_automation.refresh_plan()
-            self.attack_tab.add_log(
-                f"Pobrano plan: {len(self.attack_automation.runs)} ataków."
-            )
-        except Exception as error:
-            self.attack_automation.last_error = str(error)
-            self.attack_tab.add_log(f"Nie udało się pobrać planu: {error}")
-        self._render_attack_state()
+
+        def work():
+            try:
+                automation.refresh_plan()
+                self.attack_log_message.emit(
+                    f"Pobrano plan: {len(automation.runs)} ataków."
+                )
+            except Exception as error:
+                automation.last_error = str(error)
+                self.attack_log_message.emit(f"Nie udało się pobrać planu: {error}")
+
+        if self._run_attack_work(work, "refresh"):
+            self.attack_tab.set_detail("plan", "Pobieram plan z TK-Tools…")
+        else:
+            self.attack_tab.add_log("Automat jest zajęty — spróbuj za chwilę.")
 
     def _set_attacks_enabled(self, enabled: bool):
         if enabled:
