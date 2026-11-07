@@ -47,6 +47,11 @@ FAKE_FILLER_UNITS = {
     TRIBE_GAULS: (1, 2),          # Phalanx, Swordsman
 }
 SCOUT_UNITS = {TRIBE_ROMANS: 4, TRIBE_TEUTONS: 4, TRIBE_GAULS: 3}
+INFANTRY_ESCORT_UNITS = {
+    TRIBE_ROMANS: (1, 3),         # Legionnaire, Imperian
+    TRIBE_TEUTONS: (1, 3),        # Clubswinger, Axefighter
+    TRIBE_GAULS: (2,),            # Swordsman
+}
 
 UNIT_NAMES = {
     TRIBE_ROMANS: {
@@ -146,6 +151,9 @@ class PlanWave:
     chiefs: int = 0
     target1: str | None = None
     target2: str | None = None
+    # Empty ATTACK waves: send every free catapult with infantry escort.
+    all_catapults: bool = False
+    infantry_escort: bool = False
 
 
 @dataclass(frozen=True)
@@ -287,15 +295,24 @@ def parse_wave(row: dict) -> PlanWave:
             target1=row.get("conquestTarget1") or None,
             target2=row.get("conquestTarget2") or None,
         )
+    has_off = bool(row.get("attackHasOff"))
+    has_hero = bool(row.get("attackHasHero"))
+    catapults = _int(row.get("attackNbCatapults"))
+    empty_attack = kind == KIND_ATTACK and not (has_off or has_hero or catapults)
     return PlanWave(
         index=_int(row.get("waveIndex")),
         kind=kind,
         fake_units=_int(row.get("fakeNbUnits")) or None,
-        has_off=bool(row.get("attackHasOff")),
-        has_hero=bool(row.get("attackHasHero")),
-        catapults=_int(row.get("attackNbCatapults")),
+        has_off=has_off,
+        # The hero joins the real attack (it returns from hiding 1 s before).
+        has_hero=has_hero or empty_attack,
+        catapults=catapults,
         target1=row.get("attackTarget1") or None,
         target2=row.get("attackTarget2") or None,
+        # An attack without off, hero or catapults is the alliance's
+        # catapult strike: all free catapults plus offensive infantry.
+        all_catapults=empty_attack,
+        infantry_escort=empty_attack,
     )
 
 
@@ -480,7 +497,18 @@ def compose_wave(
             rams = free(RAM)
             if rams > 0:
                 units[RAM] = rams
-        if wave.catapults:
+        if wave.infantry_escort:
+            filler_reserve = reserve.filler
+            free_fillers = {unit: pool.get(unit, 0) for unit in order}
+            kept = _take_fillers(free_fillers, order, filler_reserve) or free_fillers
+            for unit in INFANTRY_ESCORT_UNITS[tribe]:
+                amount = pool.get(unit, 0) - kept.get(unit, 0)
+                if amount > 0:
+                    units[unit] = amount
+        if wave.all_catapults:
+            if free(CATAPULT) > 0:
+                units[CATAPULT] = free(CATAPULT)
+        elif wave.catapults:
             catapults = min(wave.catapults, free(CATAPULT))
             if catapults < wave.catapults:
                 notes.append(

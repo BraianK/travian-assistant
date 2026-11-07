@@ -284,26 +284,32 @@ class AttackAutomation:
         data = self.tktools.read_planner(server_name)
         attacks, problems = parse_planner(data["rows"], context["player_id"])
         self.plan_problems = problems
-        frozen = {
-            run.attack.operation_id
-            for run in self.runs.values()
-            if run.status != STATUS_WAITING
-        }
         with self._lock:
             fresh: dict[str, AttackRun] = {}
+            # Prepared, sent or finished attacks are never touched again.
             for run in self.runs.values():
-                if run.attack.operation_id in frozen:
+                if run.status != STATUS_WAITING:
                     fresh[run.attack.id] = run
+            # Waiting attacks always follow the latest plan (planners fix
+            # arrival times, add or remove attacks until the very end).
             for attack in attacks:
-                if attack.operation_id in frozen and attack.id not in fresh:
-                    continue
                 if attack.id in fresh:
                     continue
                 previous = self.runs.get(attack.id)
                 run = AttackRun(attack=attack, tribe=int(context["tribe"]))
-                if previous is not None and previous.status != STATUS_WAITING:
-                    run = previous
-                if not attack.is_pending and run.status == STATUS_WAITING:
+                if previous is not None:
+                    run.hero_recall_scheduled = previous.hero_recall_scheduled
+                    if (
+                        previous.attack.arrival != attack.arrival
+                        or previous.attack.waves != attack.waves
+                    ):
+                        self._log(
+                            f"Plan zmieniony: {attack.label} — dotarcie "
+                            f"{datetime.fromtimestamp(attack.arrival):%H:%M:%S}."
+                        )
+                elif self.runs:
+                    self._log(f"Nowy atak w planie: {attack.label}.")
+                if not attack.is_pending:
                     run.status = STATUS_DONE_ELSEWHERE
                     run.message = f"Stan w TK-Tools: {attack.state}"
                 unsupported = {wave.kind for wave in attack.waves} - SUPPORTED_KINDS
@@ -311,6 +317,9 @@ class AttackAutomation:
                     run.status = STATUS_SKIPPED
                     run.message = f"Nieobsługiwany typ: {', '.join(sorted(unsupported))}"
                 fresh[attack.id] = run
+            for attack_id, run in self.runs.items():
+                if attack_id not in fresh and run.status == STATUS_WAITING:
+                    self._log(f"Usunięto z planu: {run.attack.label}.")
             self.runs = fresh
         self._preview_all()
         self._check_tournament_squares()
@@ -330,7 +339,7 @@ class AttackAutomation:
                 if siege:
                     units[siege] = 1
                 continue
-            if wave.catapults:
+            if wave.catapults or wave.all_catapults:
                 units[CATAPULT] = 1
             if wave.chiefs:
                 units[CHIEF] = 1

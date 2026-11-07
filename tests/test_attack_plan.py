@@ -138,6 +138,24 @@ class PlanParsingTests(unittest.TestCase):
         self.assertEqual(ARRIVAL_TS, attacks[0].arrival)
         self.assertEqual(4, attacks[0].pt_level)
 
+    def test_empty_attack_wave_is_a_catapult_strike(self):
+        wave = parse_wave(_attack_wave(0))
+        self.assertEqual("ATTACK", wave.kind)
+        self.assertTrue(wave.all_catapults and wave.infantry_escort and wave.has_hero)
+        self.assertFalse(parse_wave(_attack_wave(0, catapults=1)).all_catapults)
+
+    def test_catapult_strike_keeps_reserve_for_later_fakes(self):
+        rows = [
+            _row("s", "2026-11-06T20:00:00.000Z", [_attack_wave(0)]),
+            _row("f", "2026-11-06T21:00:00.000Z", [_fake(i) for i in range(5)],
+                 targetVillageId="538427431"),
+        ]
+        attacks, _ = parse_planner(rows, "199")
+        army = _gaul_army(u1=2155, u2=105, u4=891, u6=0, u7=1, u8=295)
+        sends = compose_attack(attacks[0], army, later_sends(attacks[0], attacks, set()), RULE)
+        self.assertEqual({2: 105, CATAPULT: 290, HERO: 1}, sends[0].units)
+        self.assertEqual((RANDOM_TARGET, RANDOM_TARGET), sends[0].catapult_targets)
+
     def test_conquest_wave(self):
         wave = parse_wave({
             "waveIndex": 1, "attackType": "CONQUEST", "conquestHasOff": True,
@@ -484,14 +502,20 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(STATUS_SENT, automation.runs["a2"].status)
         self.assertIn("a2", tk.confirmed)
 
-    def test_frozen_operation_keeps_its_plan(self):
+    def test_sent_attacks_are_kept_and_waiting_ones_follow_the_plan(self):
         departure = ARRIVAL_TS - 23530
-        automation, *_ = self._automation(departure - 30)
-        automation.tick()
-        self.assertIn(automation.runs["a2"].status, (STATUS_FIRED, STATUS_PREPARED))
-        automation.tktools.read_planner = lambda name: {"serverId": "s", "rows": []}
+        automation, bridge, tk, logs, _ = self._automation(departure - 3600)
+        automation.refresh_plan()
+        automation.runs["a2"].status = STATUS_FIRED
+        rows = _plan_rows()
+        rows[3]["arrivalTime"] = "2026-11-07T05:02:00.000Z"
+        automation.tktools.read_planner = lambda name: {"serverId": "s", "rows": [rows[3]]}
         automation.refresh_plan()
         self.assertIn("a2", automation.runs)
+        self.assertNotIn("a3", automation.runs)
+        self.assertEqual(ARRIVAL_TS + 60, automation.runs["a4"].attack.arrival)
+        self.assertTrue(any("Plan zmieniony" in text for text in logs))
+        self.assertTrue(any("Usunięto z planu" in text for text in logs))
 
 
 class TkToolsClientTests(unittest.TestCase):
