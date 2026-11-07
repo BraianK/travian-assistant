@@ -65,5 +65,73 @@ class TroopReadTests(unittest.TestCase):
         self.assertEqual(1, len(called))
 
 
+class PartialRecruitmentTests(unittest.TestCase):
+    def test_passes_minimum_and_share_and_validates_quantity(self):
+        class FakeTab:
+            def call_method(self, method, **kwargs):
+                import re
+                self.expression = kwargs["expression"]
+                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
+                return {"result": {"value": {
+                    "status": "submitted", "request_id": request_id, "quantity": 37,
+                }}}
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+        row = {"village_id": "101", "building_type": 19, "unit_type": 21, "unit": "Phalanx"}
+        outcome = session.queue_recruitment(row, 500, 3, min_quantity=1, resource_share=0.5)
+        self.assertEqual(37, outcome["quantity"])
+        self.assertIn(", 1, 0.5)", session._tab.expression)
+        self.assertIn("Math.floor(available * resourceShare / cost)", session._tab.expression)
+        with self.assertRaises(ValueError):
+            session.queue_recruitment(row, 5, 3, min_quantity=6)
+        with self.assertRaises(ValueError):
+            session.queue_recruitment(row, 5, 3, resource_share=0)
+
+
+class RecruitmentLockExpiryTests(unittest.TestCase):
+    def test_unconfirmed_locks_expire_after_restart(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        import src.app as app_module
+        from src.config.settings import AppSettings
+        from src.core.account_manager import AccountManager
+        from src.core.village_tracker import VillageTracker
+        from src.database.connection import DatabaseManager
+        from src.database.repository import AccountRepository, VillageRepository
+
+        QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "locks.db"))
+            db.init()
+            settings = AppSettings()
+            settings.recruitment.pending_orders = {"101:21", "101:24"}
+            with patch.object(app_module, "monotonic", return_value=1000.0):
+                window = app_module.MainWindow(
+                    settings,
+                    AccountManager(AccountRepository(db)),
+                    VillageTracker(VillageRepository(db)),
+                )
+            try:
+                window._pending_recruitment_responses["101:24"] = (0, 1)
+                with patch.object(AppSettings, "save", return_value=None):
+                    with patch.object(app_module, "monotonic", return_value=1100.0):
+                        window._expire_stale_recruitment_locks()
+                    self.assertEqual({"101:21", "101:24"}, settings.recruitment.pending_orders)
+                    with patch.object(app_module, "monotonic", return_value=1400.0):
+                        window._expire_stale_recruitment_locks()
+                # The lock with a verification still in flight is kept.
+                self.assertEqual({"101:24"}, settings.recruitment.pending_orders)
+            finally:
+                window.close()
+                db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

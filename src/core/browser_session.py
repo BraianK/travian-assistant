@@ -147,6 +147,7 @@ _RECRUITMENT_BUILDING_NAMES = {
 _RECRUITMENT_BUILDING_TYPES = (19, 20, 21, 25, 26, 29, 30)
 # Duration targets (up to 24 h) can translate into large unit counts.
 _MAX_RECRUITMENT_QUEUE_THRESHOLD = 1_000_000
+_MAX_RECRUITMENT_BATCH = 10_000
 
 NPC_TRADER_PRICE = 5
 
@@ -2405,8 +2406,15 @@ class TravianBrowserSession:
         row: dict,
         batch_size: int,
         queue_threshold: int = 1,
+        min_quantity: int | None = None,
+        resource_share: float = 1.0,
     ) -> dict:
-        """Queue a target troop batch after rechecking the live queue and resources."""
+        """Queue up to *batch_size* units after rechecking queue and resources.
+
+        The page orders as many units as the village can afford (using only
+        *resource_share* of its stock, so several queues can share it), but
+        never fewer than *min_quantity* (defaults to the full batch).
+        """
         if self._tab is None:
             raise RuntimeError("Not connected to Chrome.")
         if (
@@ -2418,7 +2426,7 @@ class TravianBrowserSession:
             or row["unit_type"] <= 0
             or isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
-            or not 1 <= batch_size <= 100
+            or not 1 <= batch_size <= _MAX_RECRUITMENT_BATCH
             or isinstance(queue_threshold, bool)
             or not isinstance(queue_threshold, int)
             or not 0 <= queue_threshold <= _MAX_RECRUITMENT_QUEUE_THRESHOLD
@@ -2440,10 +2448,22 @@ class TravianBrowserSession:
         ):
             raise ValueError("Invalid recruitment building choices.")
 
+        if min_quantity is None:
+            min_quantity = batch_size
+        if (
+            isinstance(min_quantity, bool)
+            or not isinstance(min_quantity, int)
+            or not 1 <= min_quantity <= batch_size
+            or not isinstance(resource_share, (int, float))
+            or isinstance(resource_share, bool)
+            or not 0 < float(resource_share) <= 1
+        ):
+            raise ValueError("Invalid automatic recruitment request.")
+
         request_id = uuid.uuid4().hex
         expression = """(
-            villageId, buildingType, buildingTypes, unitType, quantity,
-            queueThreshold, requestId
+            villageId, buildingType, buildingTypes, unitType, maxQuantity,
+            queueThreshold, requestId, minQuantity, resourceShare
         ) => {
             if (typeof UnitQueue === "undefined"
                 || typeof Building === "undefined"
@@ -2491,13 +2511,21 @@ class TravianBrowserSession:
                 throw new Error("Recruitment costs or village resources are unavailable.");
             }
             const availableResources = village.getResources();
+            let quantity = maxQuantity;
             for (const [resourceId, unitCost] of Object.entries(troop.costs)) {
-                const required = Number(unitCost) * quantity;
+                const cost = Number(unitCost);
                 const available = Number(availableResources[resourceId]);
-                if (!Number.isFinite(required) || required < 0
-                    || !Number.isFinite(available) || available < required) {
+                if (!Number.isFinite(cost) || cost < 0 || !Number.isFinite(available)) {
                     return {status: "insufficient_resources"};
                 }
+                if (cost > 0) {
+                    quantity = Math.min(
+                        quantity, Math.floor(available * resourceShare / cost)
+                    );
+                }
+            }
+            if (!(quantity >= minQuantity)) {
+                return {status: "insufficient_resources"};
             }
 
             const accepted = Travian.writeRequest(
@@ -2529,13 +2557,17 @@ class TravianBrowserSession:
                         "__travianAssistantRecruitmentResponse_" + requestId
                     ] = {
                         requestId,
-                        count: responseCount
+                        count: responseCount,
+                        villageId: String(villageId),
+                        unitType,
+                        buildingTypes
                     };
                 }
             );
             return {
                 status: accepted ? "submitted" : "request_busy",
-                request_id: requestId
+                request_id: requestId,
+                quantity
             };
         }"""
         result = self._tab.call_method(
@@ -2545,7 +2577,8 @@ class TravianBrowserSession:
                 f"{json.dumps(village_id)}, "
                 f"{building_type}, {json.dumps(building_types)}, "
                 f"{unit_type}, {batch_size}, "
-                f"{queue_threshold}, {json.dumps(request_id)}"
+                f"{queue_threshold}, {json.dumps(request_id)}, "
+                f"{min_quantity}, {float(resource_share)}"
                 ")"
             ),
             returnByValue=True,
@@ -2569,6 +2602,9 @@ class TravianBrowserSession:
             )
         if outcome["status"] == "submitted" and (
             outcome.get("request_id") != request_id
+            or isinstance(outcome.get("quantity"), bool)
+            or not isinstance(outcome.get("quantity"), (int, float))
+            or not min_quantity <= outcome["quantity"] <= batch_size
         ):
             raise RuntimeError(
                 "The Travian page returned an invalid recruitment request ID."
@@ -2608,7 +2644,23 @@ class TravianBrowserSession:
             }
             delete window[key];
             if (!Number.isInteger(response.count) || response.count < 0) {
-                return {status: "unconfirmed"};
+                // The answer did not carry the queue: read the live model,
+                // which the game updates before calling back.
+                const queue = typeof UnitQueue !== "undefined"
+                    ? UnitQueue.get(response.villageId) : null;
+                const types = queue && queue.data && queue.data.buildingTypes;
+                if (!types || !Array.isArray(response.buildingTypes)) {
+                    return {status: "unconfirmed"};
+                }
+                response.count = response.buildingTypes.reduce((total, type) => {
+                    const entries = types[String(type)];
+                    return total + (Array.isArray(entries)
+                        ? entries.reduce((sum, entry) =>
+                            Number(entry.unitType) === response.unitType
+                                ? sum + Math.max(0, Number(entry.count) || 0)
+                                : sum, 0)
+                        : 0);
+                }, 0);
             }
             return {
                 status: response.count > queueThreshold

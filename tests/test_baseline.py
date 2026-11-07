@@ -1395,6 +1395,7 @@ class BaselineSmokeTests(unittest.TestCase):
                         "value": {
                             "status": "submitted",
                             "request_id": request_id,
+                            "quantity": 5,
                         }
                     }
                 }
@@ -1422,6 +1423,8 @@ class BaselineSmokeTests(unittest.TestCase):
         self.assertIn('"101"', session._tab.expression)
         self.assertIn("19, [19], 21, 5, 3", session._tab.expression)
         self.assertIn("count > queueThreshold", session._tab.expression)
+        self.assertIn("quantity >= minQuantity", session._tab.expression)
+        self.assertIn(", 5, 1.0)", session._tab.expression)
         self.assertIn("response.cache", session._tab.expression)
         self.assertIn("UnitQueue:${villageId}", session._tab.expression)
         self.assertEqual("submitted", outcome["status"])
@@ -1438,6 +1441,7 @@ class BaselineSmokeTests(unittest.TestCase):
                         "value": {
                             "status": "submitted",
                             "request_id": request_id,
+                            "quantity": 5,
                         }
                     }
                 }
@@ -1645,11 +1649,15 @@ class BaselineSmokeTests(unittest.TestCase):
                     },
                 ]
 
-            def queue_recruitment(self, row, batch_size, queue_threshold):
+            def queue_recruitment(self, row, batch_size, queue_threshold, **kwargs):
                 self.queued.append(
                     (row["unit"], batch_size, queue_threshold)
                 )
-                return {"status": "submitted", "request_id": "a" * 32}
+                return {
+                    "status": "submitted",
+                    "request_id": "a" * 32,
+                    "quantity": batch_size,
+                }
 
             def read_recruitment_order_response(
                 self,

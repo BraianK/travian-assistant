@@ -459,6 +459,8 @@ _TROOP_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 _RECRUITMENT_QUEUE_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 _RESOURCE_MILLING_REFRESH_INTERVAL_MS = 30 * 1000
 _AUTO_RECRUITMENT_ORDER_INTERVAL_MS = 6 * 1000
+_RECRUITMENT_LOCK_EXPIRY_SECONDS = 5 * 60
+_DURATION_MODE_MAX_BATCH = 10_000
 _VACATION_CHECK_INTERVAL_MS = 30 * 1000
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
 DEFAULT_RECRUITMENT_QUEUE_MINUTES = 60
@@ -3489,6 +3491,11 @@ class MainWindow(QMainWindow):
         self._auto_recruitment_candidates: list[dict] = []
         self._auto_recruitment_active = False
         self._pending_recruitment_responses: dict[str, int] = {}
+        # When each pending (unconfirmed) order lock was set in this session;
+        # locks loaded from disk start counting at launch.
+        self._pending_order_since: dict[str, float] = {
+            key: monotonic() for key in settings.recruitment.pending_orders
+        }
         self._milling_candidates: list[dict] = []
         self._milling_order_active = False
         self._milling_scan_active = False
@@ -4544,10 +4551,12 @@ class MainWindow(QMainWindow):
         batch_size = recruitment.batch_size_for(row["village_id"])
         if recruitment.strategy_for(row["village_id"]) != "duration":
             return batch_size
+        # Duration mode orders what the queue lacks; the page trims the
+        # order to what the village can currently afford.
         return recruitment_batch_for_duration(
             row,
             self._recruitment_target_minutes(row),
-            batch_size,
+            _DURATION_MODE_MAX_BATCH,
         )
 
     def _clear_pending_recruitment_orders(self):
@@ -4589,6 +4598,31 @@ class MainWindow(QMainWindow):
             set(),
         )
 
+    def _expire_stale_recruitment_locks(self):
+        """Release order locks that were never confirmed.
+
+        A lock prevents a duplicate order while the game's answer is pending.
+        Without an answer for a few minutes (for example after a restart the
+        answer can never arrive) the fresh queue read is the better judge.
+        """
+        pending = self.settings.recruitment.pending_orders
+        now = monotonic()
+        stale = {
+            key for key in pending
+            if key not in self._pending_recruitment_responses
+            and now - self._pending_order_since.setdefault(key, now)
+            >= _RECRUITMENT_LOCK_EXPIRY_SECONDS
+        }
+        if not stale:
+            return
+        pending.difference_update(stale)
+        for key in stale:
+            self._pending_order_since.pop(key, None)
+        if not self._save_recruitment_settings():
+            pending.update(stale)
+            return
+        logger.info("Released stale recruitment locks: %s", sorted(stale))
+
     def _begin_automatic_recruitment(self, rows: list[dict]):
         if (
             not self.settings.recruitment.automatic_enabled
@@ -4596,6 +4630,7 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        self._expire_stale_recruitment_locks()
         candidates = []
         missing_queue_times = []
         for row in rows:
@@ -4673,6 +4708,7 @@ class MainWindow(QMainWindow):
         queue_threshold = max(queue_threshold, row["count"])
 
         self.settings.recruitment.pending_orders.add(key)
+        self._pending_order_since[key] = monotonic()
         if not self._save_recruitment_settings():
             self.settings.recruitment.pending_orders.discard(key)
             self._auto_recruitment_candidates.clear()
@@ -4684,10 +4720,22 @@ class MainWindow(QMainWindow):
         )
 
         try:
+            duration_mode = (
+                self.settings.recruitment.strategy_for(row["village_id"])
+                == "duration"
+            )
+            # Share the village's stock between the queues that still need
+            # replenishing in this scan, so one unit does not take it all.
+            same_village = 1 + sum(
+                1 for other in self._auto_recruitment_candidates
+                if other["village_id"] == row["village_id"]
+            )
             result = self.browser_session.queue_recruitment(
                 row,
                 batch_size,
                 queue_threshold,
+                min_quantity=1 if duration_mode else batch_size,
+                resource_share=1.0 / same_village,
             )
         except Exception as error:
             logger.exception("Automatic recruitment outcome is uncertain")
@@ -4706,7 +4754,7 @@ class MainWindow(QMainWindow):
             # (verification attempts, minimum queue count proving acceptance)
             self._pending_recruitment_responses[key] = (0, row["count"] + 1)
             self.recruitment_tab.recruitment_queue_status.setText(
-                f"Wysłano zlecenie: {batch_size} "
+                f"Wysłano zlecenie: {int(result.get('quantity') or batch_size)} "
                 f"× {row['unit']} w wiosce {row['village']}. Sprawdzam "
                 "odpowiedź serwera…"
             )
@@ -4743,7 +4791,12 @@ class MainWindow(QMainWindow):
         messages = {
             "queue_not_low": "kolejka wzrosła przed wysłaniem",
             "building_missing": "brak odpowiednich koszar lub stajni",
-            "insufficient_resources": "za mało surowców na całą partię",
+            "insufficient_resources": (
+                "za mało surowców nawet na jedną jednostkę"
+                if self.settings.recruitment.strategy_for(row["village_id"])
+                == "duration"
+                else "za mało surowców na całą partię"
+            ),
         }
         self.recruitment_tab.recruitment_queue_status.setText(
             f"Nie dodano {row['unit']} w wiosce {row['village']}: "
