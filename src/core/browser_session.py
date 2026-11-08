@@ -1267,6 +1267,49 @@ class TravianBrowserSession:
             )
         return state
 
+    def read_village_production(self, villages: list[dict]) -> dict[str, dict[str, int]]:
+        """Hourly production of every owned village from the game's models.
+
+        The game keeps ``data.production`` for all own villages, so this needs
+        no village switching (the live state only covers the selected one).
+        """
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        village_ids = [
+            str(village.get("id") or village.get("village_id") or "")
+            for village in villages
+        ]
+        if any(not village_id.isdigit() for village_id in village_ids):
+            raise ValueError("Invalid village identifier in production read.")
+        expression = """(villageIds) => {
+            const result = {};
+            for (const id of villageIds) {
+                const village = typeof Village !== "undefined" ? Village.get(id) : null;
+                const production = village && village.data && village.data.production;
+                if (!production) continue;
+                result[id] = {
+                    wood: Number(production[1]), clay: Number(production[2]),
+                    iron: Number(production[3]), grain: Number(production[4])
+                };
+            }
+            return result;
+        }"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=f"({expression})({json.dumps(village_ids)})",
+            returnByValue=True,
+            _timeout=5,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError("The Travian page returned invalid production data.")
+        production = {}
+        for village_id in village_ids:
+            rates = _model_production_rates(value.get(village_id))
+            if rates is not None:
+                production[village_id] = rates
+        return production
+
     def read_incoming_attacks(self, villages: list[dict]) -> list[dict]:
         """Read cached incoming attacks for every owned village."""
         if self._tab is None:

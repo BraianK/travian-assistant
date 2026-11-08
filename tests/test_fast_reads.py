@@ -21,6 +21,70 @@ class ModelProductionTests(unittest.TestCase):
         )
 
 
+class VillageProductionTests(unittest.TestCase):
+    def test_reads_production_of_every_village(self):
+        class FakeTab:
+            def call_method(self, method, **kwargs):
+                self.expression = kwargs["expression"]
+                return {"result": {"value": {
+                    "537968638": {"wood": 3131, "clay": 3000, "iron": 2246, "grain": 417},
+                    "538001407": {"wood": 10268, "clay": None, "iron": 1, "grain": 1},
+                }}}
+
+        session = TravianBrowserSession("127.0.0.1", 9222)
+        session._tab = FakeTab()
+        production = session.read_village_production([
+            {"id": "537968638", "name": "Dion"}, {"id": "538001407", "name": "Aden"},
+        ])
+        self.assertEqual(
+            {"537968638": {"wood": 3131, "clay": 3000, "iron": 2246, "grain": 417}},
+            production,
+        )
+        self.assertIn('["537968638", "538001407"]', session._tab.expression)
+
+    def test_balance_prefers_live_production_over_stale_record(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        import src.app as app_module
+        from src.config.settings import AppSettings
+        from src.core.account_manager import AccountManager
+        from src.core.village_tracker import VillageTracker
+        from src.database.connection import DatabaseManager
+        from src.database.repository import AccountRepository, VillageRepository
+
+        QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "balance.db"))
+            db.init()
+            window = app_module.MainWindow(
+                AppSettings(), AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+            )
+            try:
+                window.dashboard_tab._live_state = {
+                    "villages": [{"id": "537968638", "name": "Dion"}],
+                }
+                window._village_production = {
+                    "537968638": {"wood": 3131, "clay": 3000, "iron": 2246, "grain": 417},
+                }
+                captured = []
+                window.recruitment_tab.update_recruitment_economics = captured.extend
+                window._render_recruitment_economics([])
+                rates = {row["resource"]: row["production_rate"] for row in captured}
+                self.assertEqual(
+                    {"Drewno": 3131, "Glina": 3000, "Żelazo": 2246, "Zboże": 417}, rates,
+                )
+                self.assertEqual(3131, captured[0]["net_rate"])
+            finally:
+                window.close()
+                db.close()
+
+
 class TroopReadTests(unittest.TestCase):
     def test_reads_all_villages_in_one_call_without_switching(self):
         class FakeTab:

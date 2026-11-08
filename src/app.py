@@ -3837,6 +3837,8 @@ class MainWindow(QMainWindow):
             key: monotonic() for key in settings.recruitment.pending_orders
         }
         self._milling_candidates: list[dict] = []
+        # Hourly production of every village read from the game models.
+        self._village_production: dict[str, dict[str, int]] = {}
         self._milling_order_active = False
         self._milling_scan_active = False
         self._pending_milling_responses: dict[str, int] = {}
@@ -4439,18 +4441,21 @@ class MainWindow(QMainWindow):
                 village.get("id") or village.get("village_id") or ""
             )
             tracked_village = self.tracker.get_village(village_id)
+            live_production = self._village_production.get(village_id, {})
             for resource, label in resource_labels.items():
                 resource_point = (
                     getattr(tracked_village, resource)
                     if tracked_village is not None
                     else None
                 )
-                production_rate = (
-                    resource_point.production_rate
-                    if resource_point is not None
-                    and resource_point.last_updated is not None
-                    else None
-                )
+                production_rate = live_production.get(resource)
+                if production_rate is None:
+                    production_rate = (
+                        resource_point.production_rate
+                        if resource_point is not None
+                        and resource_point.last_updated is not None
+                        else None
+                    )
                 recruitment_cost = cost_rates.get(village_id, {}).get(
                     resource,
                     0.0,
@@ -4471,7 +4476,8 @@ class MainWindow(QMainWindow):
                     "recruitment_cost": recruitment_cost,
                     "net_rate": net_rate,
                     "last_updated": (
-                        resource_point.last_updated
+                        datetime.now() if resource in live_production
+                        else resource_point.last_updated
                         if resource_point is not None
                         else None
                     ),
@@ -6213,6 +6219,12 @@ class MainWindow(QMainWindow):
             rows = self.browser_session.read_recruitment_queues(
                 villages
             )
+            try:
+                self._village_production = (
+                    self.browser_session.read_village_production(villages)
+                )
+            except Exception as error:
+                logger.warning("Could not read village production: %s", error)
             recruitment_villages = []
             settings_changed = False
             added_village_settings = []
