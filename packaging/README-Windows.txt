@@ -1,4 +1,5 @@
 Travian Kingdoms Assistant — Windows
+Autor: Dzogurt
 
 1. Rozpakuj całe archiwum do wybranego folderu.
 2. Uruchom TravianAssistant.exe.

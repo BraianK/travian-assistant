@@ -27,6 +27,7 @@ try:
     from src.config.settings import (
         AppSettings,
         AttackSettings,
+        HideoutDefenseSettings,
         RecruitmentSettings,
         VACATION_MOVEMENT_TYPES,
         VacationSettings,
@@ -49,6 +50,8 @@ try:
     from src.core.village_tracker import VillageTracker
     from src.core.attack_automation import AttackAutomation
     from src.core.attack_bridge import GameAttackBridge
+    from src.core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
+    from src.core.attack_operations import UNIT_NAMES
     from src.core.attack_clicker import ClickAttackExecutor
     from src.core.tktools_client import TkToolsSession
     from src.core.vacation_planner import (
@@ -70,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from config.settings import (
         AppSettings,
         AttackSettings,
+        HideoutDefenseSettings,
         RecruitmentSettings,
         VACATION_MOVEMENT_TYPES,
         VacationSettings,
@@ -92,6 +96,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.village_tracker import VillageTracker
     from core.attack_automation import AttackAutomation
     from core.attack_bridge import GameAttackBridge
+    from core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
+    from core.attack_operations import UNIT_NAMES
     from core.attack_clicker import ClickAttackExecutor
     from core.tktools_client import TkToolsSession
     from core.vacation_planner import (
@@ -2968,6 +2974,337 @@ class AttackPlanWidget(QWidget):
             self.log_list.takeItem(self.log_list.count() - 1)
 
 
+class HideoutDefenseWidget(QWidget):
+    """Counter-strike robber hideouts: settings, live cases and log."""
+
+    enabled_toggled = Signal(bool)
+    setting_changed = Signal(str, object)
+
+    _UNIT_NUMBERS = tuple(range(1, 9))
+    _COLUMNS = (
+        "Kryjówka", "Atakuje", "Zbóje dotrą", "Kontratak dotrze",
+        "Grabież dotrze", "Status", "Uwagi",
+    )
+    _STATUS_KINDS = {
+        "detected": "pending",
+        "waiting_hero": "pending",
+        "counter_fired": "pending",
+        "raid_scheduled": "pending",
+        "raid_fired": "pending",
+        "raid_returning": "pending",
+        "done": "active",
+        "failed": "waiting",
+        "skipped": "muted",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tribe = 3
+        self._loading = False
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer_layout.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Obrona przed kryjówkami")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Gdy kryjówka zbójów wyśle atak na którąś z Twoich wiosek, jej wojsko "
+            "jest poza nią. Automat od razu wysyła ze stolicy kontratak (atak lub "
+            "oblężenie), a po nim grabież po surowce."
+        )
+        subtitle.setObjectName("secondaryText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        # Status card -----------------------------------------------------------
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 16, 18, 16)
+        status_layout.setSpacing(12)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        self.enabled_toggle = _AutomationToggle()
+        self.enabled_toggle.toggled.connect(self.enabled_toggled.emit)
+        top_row.addWidget(self.enabled_toggle)
+        self.state_chip = QLabel()
+        top_row.addWidget(self.state_chip)
+        top_row.addStretch()
+        status_layout.addLayout(top_row)
+        details = QGridLayout()
+        details.setHorizontalSpacing(18)
+        details.setVerticalSpacing(6)
+        self.detail_labels: dict[str, QLabel] = {}
+        for row, (key, caption) in enumerate((
+            ("capital", "Stolica"),
+            ("scan", "Ataki zbójów"),
+        )):
+            caption_label = QLabel(caption.upper())
+            caption_label.setObjectName("columnHeader")
+            details.addWidget(caption_label, row, 0, Qt.AlignTop)
+            value = QLabel("—")
+            value.setWordWrap(True)
+            details.addWidget(value, row, 1)
+            self.detail_labels[key] = value
+        details.setColumnStretch(1, 1)
+        status_layout.addLayout(details)
+        layout.addWidget(status_card)
+
+        table_title = QLabel("Ataki zbójów i odpowiedzi")
+        table_title.setObjectName("sectionTitle")
+        layout.addWidget(table_title)
+        self.table = QTableWidget(0, len(self._COLUMNS))
+        self.table.setHorizontalHeaderLabels(self._COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setWordWrap(True)
+        header = self.table.horizontalHeader()
+        for column in range(len(self._COLUMNS) - 1):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(self._COLUMNS) - 1, QHeaderView.Stretch)
+        self.table.setMinimumHeight(180)
+        layout.addWidget(self.table)
+
+        # Settings card ---------------------------------------------------------
+        settings_card = QFrame()
+        settings_card.setObjectName("card")
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setContentsMargins(18, 16, 18, 16)
+        settings_layout.setSpacing(10)
+        settings_title = QLabel("Ustawienia")
+        settings_title.setObjectName("sectionTitle")
+        settings_layout.addWidget(settings_title)
+
+        units_hint = QLabel(
+            "Ile procent jednostek obecnych w stolicy wysłać. 100% = wszystkie, "
+            "0% = żadne."
+        )
+        units_hint.setObjectName("footnote")
+        units_hint.setWordWrap(True)
+        settings_layout.addWidget(units_hint)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        for column, caption in enumerate(("Jednostka", "W stolicy", "Kontratak", "Grabież")):
+            label = QLabel(caption.upper())
+            label.setObjectName("columnHeader")
+            grid.addWidget(label, 0, column)
+        self.unit_labels: dict[int, QLabel] = {}
+        self.home_labels: dict[int, QLabel] = {}
+        self.counter_spins: dict[int, QSpinBox] = {}
+        self.raid_spins: dict[int, QSpinBox] = {}
+        for row, unit in enumerate(self._UNIT_NUMBERS, start=1):
+            self.unit_labels[unit] = QLabel()
+            grid.addWidget(self.unit_labels[unit], row, 0)
+            self.home_labels[unit] = QLabel("—")
+            grid.addWidget(self.home_labels[unit], row, 1)
+            for spins, column, field in (
+                (self.counter_spins, 2, "counter_units"),
+                (self.raid_spins, 3, "raid_units"),
+            ):
+                spin = AttackPlanWidget._spin(0, 100, " %", 80)
+                spin.valueChanged.connect(
+                    lambda _value, current_field=field: self._emit_units(current_field)
+                )
+                spins[unit] = spin
+                grid.addWidget(spin, row, column)
+        grid.setColumnStretch(4, 1)
+        settings_layout.addLayout(grid)
+        self._set_unit_names()
+
+        self.hero_checkbox = QCheckBox("Bohater idzie z kontratakiem")
+        settings_layout.addWidget(self.hero_checkbox)
+        self.wait_hero_checkbox = QCheckBox(
+            "Gdy bohatera nie ma w stolicy: wycofaj go i poczekaj, jeśli zdąży przed "
+            "atakiem zbójów (inaczej kontratak idzie od razu bez niego)"
+        )
+        settings_layout.addWidget(self.wait_hero_checkbox)
+        self.siege_checkbox = QCheckBox(
+            "Oblężenie zamiast ataku, jeśli dotrze przed atakiem zbójów (mniejsze "
+            "straty; wymaga taranów w kontrataku i co najmniej 1000 jednostek)"
+        )
+        settings_layout.addWidget(self.siege_checkbox)
+
+        self.raid_checkbox = QCheckBox("Po kontrataku wyślij grabież po surowce")
+        settings_layout.addWidget(self.raid_checkbox)
+        delay_row = QHBoxLayout()
+        delay_row.setSpacing(8)
+        self.raid_delay = AttackPlanWidget._spin(0, 86400, "", 80)
+        self.raid_delay_unit = QComboBox()
+        self.raid_delay_unit.addItem("s", 1)
+        self.raid_delay_unit.addItem("min", 60)
+        delay_row.addWidget(QLabel("Grabież wchodzi"))
+        delay_row.addWidget(self.raid_delay)
+        delay_row.addWidget(self.raid_delay_unit)
+        delay_row.addWidget(QLabel("po kontrataku (albo najszybciej, jak się da)."))
+        delay_row.addStretch()
+        settings_layout.addLayout(delay_row)
+        self.fit_checkbox = QCheckBox(
+            "Wysyłaj tylko tyle wojsk, ile trzeba do zabrania całego łupu kryjówki "
+            "(procent grabieży jest wtedy limitem)"
+        )
+        settings_layout.addWidget(self.fit_checkbox)
+        self.repeat_checkbox = QCheckBox(
+            "Powtarzaj grabież po powrocie wojsk, dopóki w kryjówce jest łup i nie "
+            "wróciła do niej obsada (najwyżej 30 razy)"
+        )
+        settings_layout.addWidget(self.repeat_checkbox)
+        raid_hint = QLabel(
+            "Grabież, która nie zdąży przed atakiem zbójów na Twoją wioskę, nie "
+            "wychodzi — wojsko zostaje do obrony, gdyby kontratak nie wyczyścił kryjówki."
+        )
+        raid_hint.setObjectName("footnote")
+        raid_hint.setWordWrap(True)
+        settings_layout.addWidget(raid_hint)
+
+        for field, checkbox in (
+            ("send_hero", self.hero_checkbox),
+            ("wait_for_hero", self.wait_hero_checkbox),
+            ("siege_enabled", self.siege_checkbox),
+            ("raid_enabled", self.raid_checkbox),
+            ("raid_fit_loot", self.fit_checkbox),
+            ("raid_repeat", self.repeat_checkbox),
+        ):
+            checkbox.toggled.connect(
+                lambda value, current_field=field: self.setting_changed.emit(current_field, value)
+            )
+        self.raid_delay.valueChanged.connect(lambda _value: self._emit_delay())
+        self.raid_delay_unit.currentIndexChanged.connect(lambda _index: self._emit_delay())
+        layout.addWidget(settings_card)
+
+        warning = QLabel(
+            "<b>Ważne:</b> działa tylko przy włączonej aplikacji i przeglądarce z grą. "
+            "Kontratak i grabież wychodzą zawsze ze stolicy. Godziny to czas serwera gry."
+        )
+        warning.setObjectName("footnote")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        log_title = QLabel("Dziennik")
+        log_title.setObjectName("sectionTitle")
+        layout.addWidget(log_title)
+        self.log_list = QListWidget()
+        self.log_list.setMinimumHeight(140)
+        layout.addWidget(self.log_list)
+        layout.addStretch()
+        self.set_state("Nie połączono z grą", "muted")
+
+    def _set_unit_names(self):
+        names = UNIT_NAMES.get(self._tribe, {})
+        for unit, label in self.unit_labels.items():
+            label.setText(names.get(unit, f"Jednostka {unit}"))
+
+    def set_capital(self, tribe: int | None, name: str | None, units: dict | None):
+        if tribe and tribe != self._tribe:
+            self._tribe = tribe
+            self._set_unit_names()
+        for unit, label in self.home_labels.items():
+            label.setText(
+                "—" if units is None
+                else str(int(units.get(str(unit), units.get(unit, 0)) or 0))
+            )
+        self.detail_labels["capital"].setText(name or "Nie znaleziono stolicy.")
+
+    @staticmethod
+    def _units_value(spins: dict[int, QSpinBox]) -> dict[str, int]:
+        return {str(unit): spin.value() for unit, spin in spins.items() if spin.value() > 0}
+
+    def _emit_units(self, field: str):
+        if self._loading:
+            return
+        spins = self.counter_spins if field == "counter_units" else self.raid_spins
+        self.setting_changed.emit(field, self._units_value(spins))
+
+    def _emit_delay(self):
+        if self._loading:
+            return
+        seconds = self.raid_delay.value() * int(self.raid_delay_unit.currentData())
+        self.setting_changed.emit("raid_delay_seconds", min(seconds, 86400))
+
+    def load_settings(self, settings):
+        self._loading = True
+        widgets = [
+            self.enabled_toggle, self.hero_checkbox, self.wait_hero_checkbox,
+            self.siege_checkbox, self.raid_checkbox, self.fit_checkbox,
+            self.repeat_checkbox,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.enabled_toggle.setChecked(settings.enabled)
+            self.hero_checkbox.setChecked(settings.send_hero)
+            self.wait_hero_checkbox.setChecked(settings.wait_for_hero)
+            self.siege_checkbox.setChecked(settings.siege_enabled)
+            self.raid_checkbox.setChecked(settings.raid_enabled)
+            self.fit_checkbox.setChecked(settings.raid_fit_loot)
+            self.repeat_checkbox.setChecked(settings.raid_repeat)
+            for spins, values in (
+                (self.counter_spins, settings.counter_units),
+                (self.raid_spins, settings.raid_units),
+            ):
+                for unit, spin in spins.items():
+                    spin.setValue(int(values.get(str(unit), 0)))
+            delay = settings.raid_delay_seconds
+            if delay and delay % 60 == 0:
+                self.raid_delay_unit.setCurrentIndex(1)
+                self.raid_delay.setValue(delay // 60)
+            else:
+                self.raid_delay_unit.setCurrentIndex(0)
+                self.raid_delay.setValue(delay)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            self._loading = False
+
+    def set_state(self, text: str, kind: str):
+        _set_status_chip(self.state_chip, text, kind)
+
+    def set_detail(self, key: str, text: str):
+        self.detail_labels[key].setText(text)
+
+    def update_rows(self, rows: list[dict]):
+        def clock(value):
+            return "—" if value is None else f"{datetime.fromtimestamp(value):%H:%M:%S}"
+
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            notes = [row["message"]]
+            if row.get("loot") is not None:
+                notes.append(f"Łup w kryjówce: {row['loot']:,}".replace(",", " "))
+            if row.get("garrison"):
+                notes.append(f"Obsada: {row['garrison']}")
+            values = (
+                row["hideout"], row["target"], clock(row["deadline"]),
+                clock(row["counter_arrival"]), clock(row["raid_arrival"]),
+                row["status"], "  ".join(part for part in notes if part),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 5:
+                    background, foreground = _RECRUITMENT_STATUS_COLORS[
+                        self._STATUS_KINDS.get(row["status_key"], "muted")
+                    ]
+                    item.setBackground(QColor(background))
+                    item.setForeground(QColor(foreground))
+                self.table.setItem(index, column, item)
+        self.table.resizeRowsToContents()
+
+    def add_log(self, text: str):
+        self.log_list.insertItem(0, f"{datetime.now():%d.%m %H:%M:%S}  {text}")
+        while self.log_list.count() > 300:
+            self.log_list.takeItem(self.log_list.count() - 1)
+
+
 class IncomingAttacksWidget(QWidget):
     """Display the persisted history of attacks detected in owned villages."""
 
@@ -3478,6 +3815,9 @@ class MainWindow(QMainWindow):
     incoming_attack_update = Signal(dict)
     village_names_update = Signal(dict)
     attack_log_message = Signal(str)
+    hideout_log_message = Signal(str)
+    hideout_handled = Signal(object)
+    hideout_active = Signal(str, object)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -3554,6 +3894,14 @@ class MainWindow(QMainWindow):
         self.attack_timer = QTimer(self)
         self.attack_timer.setInterval(1000)
         self.attack_timer.timeout.connect(self._attack_tick)
+        self.hideout_defense = None
+        self._hideout_worker = None
+        self.hideout_log_message.connect(self.hideout_tab.add_log)
+        self.hideout_handled.connect(self._mark_hideout_movements_handled)
+        self.hideout_active.connect(self._set_hideout_active)
+        self.hideout_timer = QTimer(self)
+        self.hideout_timer.setInterval(1000)
+        self.hideout_timer.timeout.connect(self._hideout_tick)
         self.incoming_attack_eta_timer = QTimer(self)
         self.incoming_attack_eta_timer.setInterval(1000)
         self.incoming_attack_eta_timer.timeout.connect(
@@ -3701,6 +4049,12 @@ class MainWindow(QMainWindow):
         self.attack_tab.setting_changed.connect(self._set_attack_setting)
         self.attack_tab.refresh_requested.connect(self._refresh_attack_plan)
         self.content_tabs.addTab(self.attack_tab, "Plan ataków")
+
+        self.hideout_tab = HideoutDefenseWidget()
+        self.hideout_tab.load_settings(self.settings.hideout_defense)
+        self.hideout_tab.enabled_toggled.connect(self._set_hideout_enabled)
+        self.hideout_tab.setting_changed.connect(self._set_hideout_setting)
+        self.content_tabs.addTab(self.hideout_tab, "Obrona przed kryjówkami")
         
         layout.addWidget(self.content_tabs, stretch=3)
         
@@ -3774,6 +4128,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(2500, self._check_resource_milling)
                 QTimer.singleShot(3500, self._check_vacation)
                 self._start_attack_automation()
+                self._start_hideout_defense()
             else:
                 self.recruitment_queue_timer.stop()
                 self.resource_milling_timer.stop()
@@ -4927,6 +5282,126 @@ class MainWindow(QMainWindow):
         self.attack_timer.start()
         self.attack_tab.set_state("Połączono z grą", "active")
 
+    # Robber hideout defense ----------------------------------------------------
+    def _start_hideout_defense(self):
+        if self.browser_session is None:
+            return
+        self.hideout_defense = HideoutDefense(
+            GameAttackBridge(self.browser_session),
+            lambda: self.settings.hideout_defense,
+            self.hideout_log_message.emit,
+            self.hideout_handled.emit,
+            set_active=self.hideout_active.emit,
+        )
+        self.hideout_timer.start()
+        self.hideout_tab.set_state("Połączono z grą", "active")
+
+    def _stop_hideout_defense(self):
+        self.hideout_timer.stop()
+        self.hideout_defense = None
+        self.hideout_tab.set_state("Nie połączono z grą", "muted")
+
+    def _hideout_tick(self):
+        defense = self.hideout_defense
+        if defense is None:
+            return
+        worker = self._hideout_worker
+        if worker is None or not worker.is_alive():
+            def run():
+                try:
+                    defense.tick()
+                except Exception as error:
+                    logger.exception("Hideout defense tick failed")
+                    self.hideout_log_message.emit(f"Błąd: {error}")
+
+            self._hideout_worker = threading.Thread(
+                target=run, daemon=True, name="hideout-defense",
+            )
+            self._hideout_worker.start()
+        self._render_hideout_state()
+
+    def _render_hideout_state(self):
+        defense = self.hideout_defense
+        if defense is None:
+            return
+        context = defense.context or {}
+        capital = (context.get("villages") or {}).get(defense.capital_id or "")
+        self.hideout_tab.set_capital(
+            context.get("tribe"), defense.capital_name,
+            None if capital is None else capital.get("units") or {},
+        )
+        rows = defense.rows()
+        self.hideout_tab.update_rows(rows)
+        if defense.last_error:
+            text = f"Błąd odczytu: {defense.last_error}"
+        elif defense.last_scan is None:
+            text = "Pierwszy odczyt za chwilę."
+        else:
+            active = sum(1 for case in defense.cases if not case.finished)
+            text = (
+                f"Sprawdzam co {int(SCAN_INTERVAL_SECONDS)} s. "
+                + (f"W toku: {active}." if active else "Brak aktywnych ataków zbójów.")
+            )
+            if not self.settings.hideout_defense.enabled:
+                text += " Automat wyłączony — tylko podgląd."
+        self.hideout_tab.set_detail("scan", text)
+
+    def _mark_hideout_movements_handled(self, movement_ids):
+        settings = self.settings.hideout_defense
+        handled = [item for item in settings.handled_movements if item not in movement_ids]
+        settings.handled_movements = (handled + sorted(movement_ids))[-500:]
+        self._save_recruitment_settings()
+
+    def _set_hideout_active(self, cell: str, info):
+        active = dict(self.settings.hideout_defense.active_hideouts)
+        if info is None:
+            active.pop(cell, None)
+        else:
+            active[cell] = {key: str(value) for key, value in info.items()}
+        self.settings.hideout_defense.active_hideouts = active
+        self._save_recruitment_settings()
+
+    def _set_hideout_enabled(self, enabled: bool):
+        if enabled:
+            answer = QMessageBox.question(
+                self,
+                "Włączyć obronę przed kryjówkami?",
+                "Gdy kryjówka zbójów zaatakuje którąś z Twoich wiosek, automat "
+                "sam wyśle ze stolicy kontratak (i grabież, jeśli ją włączysz) "
+                "z ustawionymi wojskami.\n\nWysłanych wojsk nie da się cofnąć. "
+                "Włączyć?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.hideout_tab.load_settings(self.settings.hideout_defense)
+                return
+        self.settings.hideout_defense.enabled = enabled
+        if not self._save_recruitment_settings():
+            self.settings.hideout_defense.enabled = not enabled
+            self.hideout_tab.load_settings(self.settings.hideout_defense)
+            return
+        self.hideout_tab.add_log(
+            "Obrona przed kryjówkami włączona." if enabled
+            else "Obrona przed kryjówkami wyłączona."
+        )
+
+    def _set_hideout_setting(self, field: str, value):
+        previous = getattr(self.settings.hideout_defense, field)
+        try:
+            updated = HideoutDefenseSettings.model_validate({
+                **self.settings.hideout_defense.model_dump(),
+                field: value,
+            })
+        except ValueError as error:
+            self.hideout_tab.add_log(f"Nieprawidłowe ustawienie: {error}")
+            self.hideout_tab.load_settings(self.settings.hideout_defense)
+            return
+        setattr(self.settings.hideout_defense, field, getattr(updated, field))
+        if not self._save_recruitment_settings():
+            setattr(self.settings.hideout_defense, field, previous)
+            self.hideout_tab.load_settings(self.settings.hideout_defense)
+
     def _on_attack_log(self, text: str):
         self.attack_tab.add_log(text)
 
@@ -5816,6 +6291,7 @@ class MainWindow(QMainWindow):
         self.vacation_timer.stop()
         self._vacation_pending_request = None
         self._stop_attack_automation()
+        self._stop_hideout_defense()
         self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
             self.browser_session.stop_incoming_attack_listener()
@@ -5939,7 +6415,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About Travian Kingdoms Assistant",
-            f"Version: {self.settings.version}\n\n"
+            f"Wersja: {self.settings.version}\n"
+            "Autor: Dzogurt\n\n"
             "A desktop application for managing and tracking progress in Travian Kingdoms.\n\n"
             "Features:\n"
             "- Village management & resource tracking\n"

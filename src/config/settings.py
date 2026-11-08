@@ -259,10 +259,48 @@ class AttackSettings(BaseModel):
         return value
 
 
+def _validate_unit_percents(values) -> dict[str, int]:
+    if not isinstance(values, dict):
+        raise ValueError("Unit shares must be a mapping.")
+    normalized = {}
+    for unit, percent in values.items():
+        unit_id = str(unit)
+        if not unit_id.isdigit() or not 1 <= int(unit_id) <= 10:
+            raise ValueError("Unit numbers must be between 1 and 10.")
+        if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+            raise ValueError("Unit shares must be between 0 and 100 percent.")
+        if percent:
+            normalized[unit_id] = percent
+    return normalized
+
+
+class HideoutDefenseSettings(BaseModel):
+    """Counter-strike robber hideouts that attack the player (from the capital)."""
+
+    enabled: bool = False
+    counter_units: dict[str, int] = Field(default_factory=dict)
+    send_hero: bool = True
+    wait_for_hero: bool = False
+    siege_enabled: bool = False
+    raid_enabled: bool = False
+    raid_units: dict[str, int] = Field(default_factory=dict)
+    raid_fit_loot: bool = True
+    raid_repeat: bool = True
+    raid_delay_seconds: int = Field(default=1, ge=0, le=86400)
+    handled_movements: list[str] = Field(default_factory=list)
+    # Hideouts being looted (map cell -> {"id", "name"}); survives restarts.
+    active_hideouts: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("counter_units", "raid_units", mode="before")
+    @classmethod
+    def validate_units(cls, values) -> dict[str, int]:
+        return _validate_unit_percents(values)
+
+
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="0.3.5")
+    version: str = Field(default="1.0.0")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
@@ -275,6 +313,7 @@ class AppSettings(BaseModel):
     )
     vacation: VacationSettings = Field(default_factory=VacationSettings)
     attacks: AttackSettings = Field(default_factory=AttackSettings)
+    hideout_defense: HideoutDefenseSettings = Field(default_factory=HideoutDefenseSettings)
 
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)
