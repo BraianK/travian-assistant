@@ -3982,7 +3982,14 @@ class MainWindow(QMainWindow):
         # Help menu
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction("&About", self._show_about)
-    
+
+        self.author_label = QLabel("Author: Dzogurt")
+        self.author_label.setObjectName("secondaryText")
+        self.author_label.setContentsMargins(0, 0, 12, 0)
+        self.author_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.author_label.setFixedHeight(menubar.sizeHint().height())
+        menubar.setCornerWidget(self.author_label, Qt.TopRightCorner)
+
     def _createCentralWidget(self):
         """Create the central widget with sidebar and content."""
         central = QWidget()

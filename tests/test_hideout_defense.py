@@ -326,6 +326,37 @@ class SettingsTests(unittest.TestCase):
             HideoutDefenseSettings(raid_units={"11": 50})
 
 
+class AuthorLabelTests(unittest.TestCase):
+    def test_menu_bar_shows_author_on_the_right(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+        import src.app as app_module
+        from src.config.settings import AppSettings
+        from src.core.account_manager import AccountManager
+        from src.core.village_tracker import VillageTracker
+        from src.database.connection import DatabaseManager
+        from src.database.repository import AccountRepository, VillageRepository
+
+        QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "author.db"))
+            db.init()
+            window = app_module.MainWindow(
+                AppSettings(), AccountManager(AccountRepository(db)),
+                VillageTracker(VillageRepository(db)),
+            )
+            try:
+                corner = window.menuBar().cornerWidget(Qt.TopRightCorner)
+                self.assertEqual("Author: Dzogurt", corner.text())
+            finally:
+                window.close()
+                db.close()
+
+
 class WidgetTests(unittest.TestCase):
     def test_widget_round_trips_settings(self):
         import os
