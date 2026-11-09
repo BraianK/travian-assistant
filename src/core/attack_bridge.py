@@ -249,14 +249,17 @@ class GameAttackBridge:
         movement_type: int,
         units: dict[int, int],
         catapult_targets: tuple[int, ...] = (),
+        spy_mission: str = "resources",
     ) -> dict:
+        if spy_mission not in ("resources", "defence"):
+            raise ValueError("Invalid spy mission.")
         params = {
             "villageId": int(village_id),
             "destVillageId": int(dest_village_id),
             "movementType": int(movement_type),
             "redeployHero": False,
             "units": {str(unit): int(count) for unit, count in units.items() if count > 0},
-            "spyMission": "resources",
+            "spyMission": spy_mission,
         }
         if catapult_targets:
             params["catapultTargets"] = [int(target) for target in catapult_targets]

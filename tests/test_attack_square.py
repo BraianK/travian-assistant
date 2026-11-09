@@ -155,6 +155,43 @@ class AttacksTabTests(unittest.TestCase):
                 db.close()
 
 
+class BatchDetectionTests(unittest.TestCase):
+    def test_attacks_of_different_players_seen_together_are_a_snapshot(self):
+        from src.core.tournament_square import batch_detections
+
+        records = [
+            {"id": 1, "attacker_name": "TheKunS", "first_detected_at": "2026-11-08T21:01:17.1"},
+            {"id": 2, "attacker_name": "SERO", "first_detected_at": "2026-11-08T21:01:17.4"},
+            {"id": 3, "attacker_name": "Cozo", "first_detected_at": "2026-11-08T19:46:11.0"},
+            {"id": 4, "attacker_name": "Cozo", "first_detected_at": "2026-11-08T19:46:11.2"},
+            {"id": 5, "attacker_name": "Robber", "first_detected_at": "2026-11-08T19:46:11.3"},
+        ]
+        self.assertEqual({1, 2}, batch_detections(records))
+
+    def test_reconnect_keeps_first_detection_facts(self):
+        import tempfile as _tempfile
+        from datetime import datetime
+        from src.database.connection import DatabaseManager
+        from src.database.repository import IncomingAttackRepository
+
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager(str(Path(tmpdir) / "keep.db"))
+            db.init()
+            try:
+                repo = IncomingAttackRepository(db)
+                attack = {**AttacksTabTests.attack("1", 5000), "tournament_square": "3 (Katapulta)",
+                          "detected_live": True}
+                repo.record_attack(attack, datetime(2026, 11, 9, 20, 0))
+                # After a reconnect the attack is a snapshot: no estimate, not live.
+                repo.record_attack({**AttacksTabTests.attack("1", 5000), "detected_live": False},
+                                   datetime(2026, 11, 9, 21, 0))
+                details = repo.get_recent_attacks()[0]["details"]
+                self.assertTrue(details["detected_live"])
+                self.assertEqual("3 (Katapulta)", details["tournament_square"])
+            finally:
+                db.close()
+
+
 class BackfillTests(unittest.TestCase):
     def test_old_records_get_estimate_unless_detected_at_app_start(self):
         from datetime import datetime

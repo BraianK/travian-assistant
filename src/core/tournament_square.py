@@ -42,6 +42,36 @@ def detected_at_start(detected, starts, window_seconds: float = 120.0) -> bool:
     return any(0 <= (detected - start).total_seconds() <= window_seconds for start in starts)
 
 
+def batch_detections(records: list[dict], window_seconds: float = 2.0) -> set:
+    """Ids of records first seen together with another attacker's attack.
+
+    Attacks of different players detected in the same moment were already on
+    their way when the app connected (a snapshot), not sent at that time.
+    """
+    timed = []
+    for record in records:
+        detected = record.get("first_detected_at")
+        if isinstance(detected, str):
+            try:
+                from datetime import datetime
+
+                detected = datetime.fromisoformat(detected)
+            except ValueError:
+                continue
+        if detected is not None and record.get("attacker_name") != "Robber":
+            timed.append((detected, str(record.get("attacker_name") or ""), record.get("id")))
+    timed.sort(key=lambda item: item[0])
+    batched = set()
+    for index, (moment, attacker, record_id) in enumerate(timed):
+        for other_moment, other_attacker, other_id in timed[max(0, index - 30):index + 30]:
+            if other_id != record_id and other_attacker != attacker and abs(
+                (other_moment - moment).total_seconds()
+            ) <= window_seconds:
+                batched.add(record_id)
+                break
+    return batched
+
+
 def travel_seconds(distance: float, speed: float, level: int) -> float:
     """Travel time in seconds of a unit with *speed* fields/hour."""
     if distance <= MIN_DISTANCE:

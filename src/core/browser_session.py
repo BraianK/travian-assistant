@@ -850,6 +850,10 @@ class TravianBrowserSession:
                     "time_start": _finite_number(attack.get("time_start")),
                     "tribe_id": int(_finite_number(attack.get("tribe_id")) or 0),
                     "robber": bool(attack.get("robber")),
+                    "attacker_player_id": (
+                        str(attack.get("attacker_player_id") or "")
+                        if str(attack.get("attacker_player_id") or "").isdigit() else ""
+                    ),
                     "distance": _finite_number(attack.get("distance")),
                     **_coordinates(attack.get("source_coordinates")),
                 })
@@ -1006,6 +1010,7 @@ class TravianBrowserSession:
                         time_start: Number(movement.timeStart) || 0,
                         tribe_id: Number(data.tribeId) || 0,
                         robber: Number(data.playerId) === -1,
+                        attacker_player_id: String(data.playerId || ""),
                         source_coordinates: coordinatesOf(sourceVillageId, sourceVillage),
                         distance: distanceBetween(
                             sourceVillageId, sourceVillage,

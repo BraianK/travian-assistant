@@ -297,6 +297,21 @@ class HideoutDefenseSettings(BaseModel):
         return _validate_unit_percents(values)
 
 
+class ScoutTargetSetting(BaseModel):
+    name: str = Field(max_length=60)
+    x: int = Field(ge=-400, le=400)
+    y: int = Field(ge=-400, le=400)
+
+
+class ScoutSettings(BaseModel):
+    """Scouting an attacker's possible departures to find his real target."""
+
+    enabled: bool = False
+    scouts_per_send: int = Field(default=2, ge=1, le=50)
+    pt_spread: int = Field(default=1, ge=0, le=20)
+    targets: list[ScoutTargetSetting] = Field(default_factory=list)
+
+
 class KingdomSettings(BaseModel):
     """Kingdom tab: the TK-Tools team whose troop updates are shown."""
 
@@ -327,7 +342,7 @@ class KingdomSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.1.1")
+    version: str = Field(default="1.2.0")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
@@ -342,6 +357,7 @@ class AppSettings(BaseModel):
     attacks: AttackSettings = Field(default_factory=AttackSettings)
     hideout_defense: HideoutDefenseSettings = Field(default_factory=HideoutDefenseSettings)
     kingdom: KingdomSettings = Field(default_factory=KingdomSettings)
+    scout: ScoutSettings = Field(default_factory=ScoutSettings)
 
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)
