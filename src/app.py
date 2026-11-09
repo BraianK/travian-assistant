@@ -1595,6 +1595,13 @@ class RecruitmentWidget(QWidget):
         enabled.toggled.connect(
             lambda checked, current_id=village_id: (
                 self._refresh_village_summary(current_id),
+                [
+                    self._refresh_unit_row(current_id, unit_id)
+                    for unit_id in list(
+                        self.village_recruitment_controls.get(current_id, {})
+                    )
+                    if unit_id != "enabled"
+                ],
                 self.village_enabled_toggled.emit(current_id, checked),
             )
         )
@@ -1875,6 +1882,12 @@ class RecruitmentWidget(QWidget):
                 self._refresh_unit_row(village_id, unit_id)
             self._refresh_village_summary(village_id)
 
+    def _village_automation_enabled(self, village_id: str) -> bool:
+        controls = self.village_recruitment_controls.get(village_id)
+        if controls is not None and "enabled" in controls:
+            return controls["enabled"].isChecked()
+        return self._village_settings(village_id).enabled
+
     def _refresh_village_summary(self, village_id: str):
         label = self.village_summary_labels.get(village_id)
         controls = self.village_recruitment_controls.get(village_id)
@@ -1993,11 +2006,17 @@ class RecruitmentWidget(QWidget):
             status = ("Rekrutacja trwa", "active")
         elif not selected:
             status = None
-        elif queue.get("other_count", 0):
-            status = ("Budynek zajęty innymi", "waiting")
+        elif not self._village_automation_enabled(village_id):
+            status = ("Automat wioski wyłączony", "muted")
             status_label.setToolTip(
-                f"W budynku szkoli się {queue['other_count']} szt. "
-                "innych jednostek."
+                "Włącz „Automat w tej wiosce”, aby uzupełniać tę kolejkę."
+            )
+        elif queue.get("other_count", 0):
+            status = ("Dołączy do kolejki", "waiting")
+            status_label.setToolTip(
+                f"W budynku szkoli się {queue['other_count']} szt. innych "
+                "jednostek. Automat i tak zamawia tę jednostkę — gra ustawi "
+                "ją w kolejce budynku za nimi."
             )
         else:
             status = ("Brak rekrutacji", "waiting")

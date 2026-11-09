@@ -85,6 +85,39 @@ class VillageProductionTests(unittest.TestCase):
                 db.close()
 
 
+class SharedBuildingStatusTests(unittest.TestCase):
+    def test_status_explains_village_switch_and_shared_building(self):
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        from src.app import RecruitmentWidget
+        from src.config.settings import RecruitmentSettings, VillageRecruitmentSettings
+
+        QApplication.instance() or QApplication([])
+        settings = RecruitmentSettings(
+            automatic_enabled=True,
+            queue_strategy="duration",
+            villages={"101": VillageRecruitmentSettings(
+                enabled=False, units={"26"}, queue_minutes_by_unit={"26": 720},
+            )},
+        )
+        widget = RecruitmentWidget()
+        widget.bind_settings(settings)
+        row = {
+            "village_id": "101", "village": "Aden", "unit": "Haeduan",
+            "unit_id": "26", "unit_type": 26, "building": "Stajnia",
+            "building_type": 20, "building_available": True,
+            "count": 0, "other_count": 164, "training_times_seconds": [900.0],
+        }
+        widget.update_recruitment_queues([row], set())
+        status = widget.unit_rows[("101", "26")]["status"]
+        self.assertEqual("Automat wioski wyłączony", status.text())
+        widget.village_recruitment_controls["101"]["enabled"].setChecked(True)
+        self.assertEqual("Dołączy do kolejki", status.text())
+
+
 class TroopReadTests(unittest.TestCase):
     def test_reads_all_villages_in_one_call_without_switching(self):
         class FakeTab:
