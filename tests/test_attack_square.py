@@ -155,5 +155,55 @@ class AttacksTabTests(unittest.TestCase):
                 db.close()
 
 
+class BackfillTests(unittest.TestCase):
+    def test_old_records_get_estimate_unless_detected_at_app_start(self):
+        from datetime import datetime
+        from src.core.tournament_square import distance_between, travel_seconds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            window, repo, db = AttacksTabTests().make_window(tmpdir)
+            try:
+                source = str(538001407 + 30)          # 30 fields east of target
+                target = "538001407"
+                self.assertEqual(30.0, distance_between(source, target))
+                live_detected = datetime(2026, 11, 9, 20, 0, 0)
+                duration = travel_seconds(30, 8.0, 10)  # ram, square 10
+                offset = 41.0
+                arrival = live_detected.timestamp() + offset + duration
+                base = {
+                    "village_id": target, "village_name": "Aden",
+                    "attacker_name": "BIKO", "source_village_id": source,
+                    "source_village": "AKACJA", "arrival_time": arrival,
+                    "seconds_remaining": 0, "movement_type": "Atak", "masked": True,
+                }
+                repo.record_attack({**base, "movement_id": "1"}, live_detected)
+                started = datetime(2026, 11, 9, 21, 0, 0)
+                repo.record_attack({**base, "movement_id": "2", "arrival_time": arrival + 9999},
+                                   datetime(2026, 11, 9, 21, 0, 40))
+                repo.record_attack({**base, "movement_id": "3", "attacker_name": "Robber",
+                                    "source_village_id": None}, live_detected)
+
+                class Session:
+                    def read_server_clock_offset(self):
+                        return offset
+
+                    def read_village_tribes(self, ids):
+                        return {source: 2}
+
+                window.browser_session = Session()
+                window._unit_speeds = {2: {1: 14.0, 7: 8.0}}
+                with patch("src.app._app_start_times", return_value=[started]):
+                    window._backfill_attacker_squares()
+                squares = {r["movement_id"]: r["details"].get("tournament_square")
+                           for r in repo.get_recent_attacks()}
+                self.assertEqual("≈ 10 (Taran)", squares["1"])
+                self.assertIsNone(squares["2"])          # detected 40 s after an app start
+                self.assertEqual(ROBBER_TEXT, squares["3"])
+            finally:
+                window.browser_session = None
+                window.close()
+                db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

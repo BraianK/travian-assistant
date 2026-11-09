@@ -1322,6 +1322,208 @@ class TravianBrowserSession:
             )
         return state
 
+    def read_own_army(self) -> dict:
+        """Every own unit per home village (home, reinforcing elsewhere, moving).
+
+        Also returns the tournament square level of each village, for the
+        TK-Tools troop declaration.
+        """
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        expression = """(() => {
+            const injector = angular.element(document.body).injector();
+            const villages = injector.get("VillageService").U().data.map(v => v.data);
+            if (!villages.length) throw new Error("No villages.");
+            const me = String(villages[0].playerId);
+            const player = Player.get(me).data;
+            const seen = new Set();
+            const units = {};
+            for (const village of villages) {
+                for (const kind of ["stationary", "elsewhere", "moving"]) {
+                    const collection = Troops.getCollection(kind, String(village.villageId));
+                    if (!collection || !collection.filled) {
+                        throw new Error("Troop data is not loaded for " + village.name);
+                    }
+                    for (const row of collection.data || []) {
+                        const data = row.data || {};
+                        if (String(data.playerId) !== me || seen.has(data.troopId)) continue;
+                        seen.add(data.troopId);
+                        const home = String(data.villageId);
+                        units[home] = units[home] || {};
+                        for (const [unit, count] of Object.entries(data.units || {})) {
+                            units[home][unit] = (units[home][unit] || 0)
+                                + Math.max(0, Number(count) || 0);
+                        }
+                    }
+                }
+            }
+            return {
+                player_name: String(player.name || ""),
+                tribe: Number(player.tribeId) || 0,
+                villages: villages.map(village => {
+                    let square = 0;
+                    const buildings = Building.getCollection(village.villageId);
+                    for (const row of (buildings && buildings.data) || []) {
+                        if (Number(row.data.buildingType) === 14) square = Number(row.data.lvl) || 0;
+                    }
+                    return {
+                        id: String(village.villageId), name: String(village.name),
+                        x: Number(village.coordinates.x), y: Number(village.coordinates.y),
+                        units: units[String(village.villageId)] || {},
+                        tournament_square_level: square
+                    };
+                })
+            };
+        })()"""
+        result = self._tab.call_method(
+            "Runtime.evaluate", expression=expression, returnByValue=True, _timeout=10,
+        )
+        details = result.get("exceptionDetails")
+        if details:
+            text = (details.get("exception") or {}).get("description") or details.get("text")
+            raise RuntimeError(f"Nie udało się odczytać wojsk z gry: {str(text)[:160]}")
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict) or not isinstance(value.get("villages"), list):
+            raise RuntimeError("The Travian page returned invalid troop data.")
+        villages = []
+        for village in value["villages"]:
+            units = {}
+            for unit, count in (village.get("units") or {}).items():
+                if str(unit).isdigit() and 1 <= int(unit) <= 11:
+                    units[int(unit)] = int(_finite_number(count) or 0)
+            villages.append({
+                "id": str(village.get("id")),
+                "name": str(village.get("name") or ""),
+                "x": int(village.get("x")),
+                "y": int(village.get("y")),
+                "units": units,
+                "tournament_square_level": int(
+                    _finite_number(village.get("tournament_square_level")) or 0
+                ),
+            })
+        return {
+            "player_name": str(value.get("player_name") or ""),
+            "tribe": int(_finite_number(value.get("tribe")) or 0),
+            "villages": villages,
+        }
+
+    def read_kingdom_members(self) -> dict:
+        """Members of the player's kingdom from the game's ``Kingdom`` model."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        expression = """(async () => {
+            const injector = angular.element(document.body).injector();
+            const rootScope = injector.get("$rootScope");
+            const villages = injector.get("VillageService").U().data;
+            if (!villages.length) throw new Error("No villages.");
+            const me = Player.get(String(villages[0].data.playerId));
+            const kingdomId = Number(me && me.data && me.data.kingdomId) || 0;
+            if (!kingdomId) return {kingdom_id: 0, tag: "", members: []};
+            const kingdom = Kingdom.get(kingdomId);
+            if (!rootScope.$$phase) rootScope.$apply();
+            for (let i = 0; i < 40; i++) {
+                const members = kingdom.data && kingdom.data.members;
+                if (Array.isArray(members) && members.length) break;
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+            const members = ((kingdom.data && kingdom.data.members) || []).map(m => ({
+                player_id: Number(m.playerId) || 0,
+                name: String(m.name || ""),
+                is_king: Boolean(m.isKing),
+                is_duke: Boolean(m.isDuke),
+                population: Number(m.population) || 0,
+                villages: Number(m.villages) || 0,
+                victory_points: Number(m.victoryPoints) || 0,
+                fealty_level: Number(m.fealtyLevel) || 0
+            }));
+            return {
+                kingdom_id: kingdomId,
+                tag: String((kingdom.data && kingdom.data.tag) || ""),
+                members
+            };
+        })()"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=True,
+            _timeout=15,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict) or not isinstance(value.get("members"), list):
+            raise RuntimeError("The Travian page returned invalid kingdom data.")
+        members = []
+        for member in value["members"]:
+            if not isinstance(member, dict) or not str(member.get("name") or "").strip():
+                continue
+            members.append({
+                "player_id": int(_finite_number(member.get("player_id")) or 0),
+                "name": str(member["name"]).strip(),
+                "is_king": bool(member.get("is_king")),
+                "is_duke": bool(member.get("is_duke")),
+                "population": int(_finite_number(member.get("population")) or 0),
+                "villages": int(_finite_number(member.get("villages")) or 0),
+                "victory_points": int(_finite_number(member.get("victory_points")) or 0),
+                "fealty_level": int(_finite_number(member.get("fealty_level")) or 0),
+            })
+        return {
+            "kingdom_id": int(_finite_number(value.get("kingdom_id")) or 0),
+            "tag": str(value.get("tag") or ""),
+            "members": members,
+        }
+
+    def read_village_tribes(self, village_ids: list[str]) -> dict[str, int]:
+        """Tribe of (foreign) villages from the game's village models."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        ids = [str(v) for v in village_ids if str(v).isdigit()]
+        expression = """(async (ids) => {
+            const rootScope = angular.element(document.body).injector().get("$rootScope");
+            const models = ids.map(id => Village.get(Number(id)));
+            if (!rootScope.$$phase) rootScope.$apply();
+            for (let i = 0; i < 30 && models.some(m => !(m.data && m.data.tribeId)); i++) {
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+            const tribes = {};
+            ids.forEach((id, index) => {
+                const data = models[index].data;
+                if (data && Number(data.tribeId) > 0) tribes[id] = Number(data.tribeId);
+            });
+            return tribes;
+        })"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=f"({expression})({json.dumps(ids)})",
+            returnByValue=True,
+            awaitPromise=True,
+            _timeout=15,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): int(tribe) for key, tribe in value.items()
+            if str(key).isdigit() and isinstance(tribe, (int, float))
+        }
+
+    def read_server_clock_offset(self) -> float:
+        """Seconds the game server clock is ahead of this computer."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=(
+                "Number(angular.element(document.body).injector()"
+                ".get('$rootScope').currentServerTime) - Date.now() / 1000"
+            ),
+            returnByValue=True,
+            _timeout=5,
+        )
+        value = result.get("result", {}).get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise RuntimeError("The game server time is unavailable.")
+        return float(value)
+
     def read_unit_speeds(self) -> dict[int, dict[int, float]]:
         """Unit speeds (fields/hour, world speed included) for tribes 1-3."""
         if self._tab is None:

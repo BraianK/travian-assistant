@@ -51,10 +51,15 @@ try:
     from src.core.attack_automation import AttackAutomation
     from src.core.attack_bridge import GameAttackBridge
     from src.core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
+    from src.config.paths import get_data_dir
     from src.core.attack_operations import UNIT_NAMES
     from src.core.tournament_square import describe as describe_square_level
+    from src.core.tournament_square import (
+        ROBBER_TEXT as ROBBER_SQUARE_TEXT, detected_at_start, distance_between,
+    )
     from src.core.attack_clicker import ClickAttackExecutor
     from src.core.tktools_client import TkToolsSession
+    from src.core.gettertools_client import GetterToolsSession
     from src.core.vacation_planner import (
         ACTION_CANCEL,
         ACTION_KEEP,
@@ -98,10 +103,15 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.attack_automation import AttackAutomation
     from core.attack_bridge import GameAttackBridge
     from core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
+    from config.paths import get_data_dir
     from core.attack_operations import UNIT_NAMES
     from core.tournament_square import describe as describe_square_level
+    from core.tournament_square import (
+        ROBBER_TEXT as ROBBER_SQUARE_TEXT, detected_at_start, distance_between,
+    )
     from core.attack_clicker import ClickAttackExecutor
     from core.tktools_client import TkToolsSession
+    from core.gettertools_client import GetterToolsSession
     from core.vacation_planner import (
         ACTION_CANCEL,
         ACTION_KEEP,
@@ -470,6 +480,7 @@ _AUTO_RECRUITMENT_ORDER_INTERVAL_MS = 6 * 1000
 _RECRUITMENT_LOCK_EXPIRY_SECONDS = 5 * 60
 _DURATION_MODE_MAX_BATCH = 10_000
 _VACATION_CHECK_INTERVAL_MS = 30 * 1000
+_KINGDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
 DEFAULT_RECRUITMENT_QUEUE_MINUTES = 60
 _NPC_TRADER_ORDER_INTERVAL_MS = 6 * 1000
@@ -3326,6 +3337,278 @@ class HideoutDefenseWidget(QWidget):
             self.log_list.takeItem(self.log_list.count() - 1)
 
 
+def _app_start_times() -> list[datetime]:
+    """When this app was started, from its log ("Database initialized")."""
+    starts = []
+    try:
+        log_path = get_data_dir() / "travian.log"
+        with open(log_path, encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if "Database initialized" in line:
+                    try:
+                        starts.append(datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return starts
+
+
+def _parse_iso_time(value) -> datetime | None:
+    """Timezone-aware datetime from an ISO 8601 string (TK-Tools uses "Z")."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        from datetime import timezone
+
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+class _NumberItem(QTableWidgetItem):
+    """Table item that sorts by its numeric value instead of its text."""
+
+    def __init__(self, value: int, text: str | None = None):
+        super().__init__(text if text is not None else f"{value:,}".replace(",", " "))
+        self._value = value
+        self.setTextAlignment(Qt.AlignCenter)
+
+    def __lt__(self, other):
+        if isinstance(other, _NumberItem):
+            return self._value < other._value
+        return super().__lt__(other)
+
+
+# TK-Tools freshness buckets and colours (light theme of tk-tools.fr):
+# under 3 days green, under 7 days amber, older red, never grey.
+_TK_FRESHNESS_COLORS = {
+    "lt3": ("#D7F3EF", "#08655F"),
+    "lt7": ("#FFF3D6", "#8A5A00"),
+    "older": ("#FCE7EC", "#A31739"),
+    "never": ("#F1F1F4", "#75747F"),
+}
+
+
+# GetterTools marks "L.troop update" green / orange / red; shown with the
+# same palette as the TK-Tools column so both columns read alike.
+_GT_FRESHNESS_COLORS = {
+    "green": _TK_FRESHNESS_COLORS["lt3"],
+    "orange": _TK_FRESHNESS_COLORS["lt7"],
+    "red": _TK_FRESHNESS_COLORS["older"],
+}
+
+
+def _tk_freshness_bucket(age_seconds: float | None) -> str:
+    if age_seconds is None:
+        return "never"
+    if age_seconds < 3 * 86400:
+        return "lt3"
+    if age_seconds < 7 * 86400:
+        return "lt7"
+    return "older"
+
+
+class KingdomWidget(QWidget):
+    """Members of the player's kingdom."""
+
+    refresh_requested = Signal()
+    update_tk_requested = Signal()
+    update_gt_requested = Signal()
+
+    COLUMNS = (
+        "#", "Gracz", "Rola", "Populacja", "Wioski", "Punkty zwycięstwa",
+        "TK - Aktualność", "GT - Aktualność",
+    )
+    NO_DATA = "brak danych"
+    UPDATE_COLUMN = 6
+    GT_COLUMN = 7
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(12)
+
+        top = QHBoxLayout()
+        self.title = QLabel("Królestwo")
+        self.title.setObjectName("pageTitle")
+        top.addWidget(self.title)
+        top.addStretch()
+        self.update_tk_button = QPushButton("Aktualizuj TK")
+        self.update_tk_button.setToolTip(
+            "Zapisuje Twoje obecne wojska z gry (wszystkie wioski: w domu, "
+            "posiłki i w drodze) oraz poziomy placu turniejowego na stronie "
+            "Troops w TK-Tools. Kuźnia i orientacje zostają bez zmian."
+        )
+        self.update_tk_button.clicked.connect(self.update_tk_requested.emit)
+        top.addWidget(self.update_tk_button)
+        self.update_gt_button = QPushButton("Aktualizuj GT")
+        self.update_gt_button.setToolTip(
+            "Zapisuje Twoje obecne wojska z gry (jednostki 1–9, bez osadników "
+            "i bohatera) oraz poziomy placu turniejowego w GetterTools "
+            "(My troops). Typ wioski zostaje bez zmian."
+        )
+        self.update_gt_button.clicked.connect(self.update_gt_requested.emit)
+        top.addWidget(self.update_gt_button)
+        self.refresh_button = QPushButton("⟳  Odśwież")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        top.addWidget(self.refresh_button)
+        layout.addLayout(top)
+
+        self.status = QLabel("Połącz z grą, aby wczytać członków królestwa.")
+        self.status.setObjectName("secondaryText")
+        layout.addWidget(self.status)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Szukaj gracza…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.filter_edit)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
+        DashboardWidget._configure_table(self.table)
+        header = self.table.horizontalHeader()
+        for column in range(len(self.COLUMNS)):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        for column, width in enumerate((50, 200, 110, 110, 80, 150, 190, 190)):
+            self.table.setColumnWidth(column, width)
+        header.setStretchLastSection(True)
+        header.setSortIndicator(0, Qt.AscendingOrder)
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeaderItem(self.UPDATE_COLUMN).setToolTip(
+            "Ostatnia aktualizacja wojsk gracza w TK-Tools (team z ustawień). "
+            "„brak danych”: gracza nie ma w teamie albo konto nie ma dostępu."
+        )
+        self.table.horizontalHeaderItem(self.GT_COLUMN).setToolTip(
+            "Ostatnia aktualizacja wojsk gracza w GetterTools (L.troop update "
+            "z listy członków grupy). „brak danych”: gracza nie ma w grupie "
+            "albo konto nie ma dostępu."
+        )
+        layout.addWidget(self.table, stretch=1)
+
+        hint = QLabel(
+            "Kliknij nagłówek kolumny, aby posortować. Lista odświeża się co 10 minut. "
+            "„TK - Aktualność” pochodzi z TK-Tools (zaloguj się tam w tej samej "
+            "przeglądarce co gra)."
+        )
+        hint.setObjectName("footnote")
+        layout.addWidget(hint)
+
+    @staticmethod
+    def _role(member: dict) -> str:
+        if member.get("is_king"):
+            return "Król"
+        if member.get("is_duke"):
+            return "Książę"
+        return "Gubernator"
+
+    def set_loading(self):
+        self.status.setText("Wczytuję członków królestwa…")
+
+    def set_error(self, message: str):
+        self.status.setText(f"Nie udało się wczytać królestwa: {message}")
+
+    def update_members(self, kingdom: dict, loaded_at: datetime):
+        members = sorted(
+            kingdom.get("members") or [],
+            key=lambda member: -member.get("population", 0),
+        )
+        tag = kingdom.get("tag") or ""
+        self.title.setText(f"Królestwo {tag}" if tag else "Królestwo")
+        if not kingdom.get("kingdom_id"):
+            self.status.setText("Nie należysz do żadnego królestwa.")
+        else:
+            self.status.setText(
+                f"Członków: {len(members)} · populacja łącznie "
+                f"{sum(m.get('population', 0) for m in members):,}".replace(",", " ")
+                + f" · odczyt {loaded_at:%H:%M:%S}"
+            )
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(members))
+        for row, member in enumerate(members):
+            items = (
+                _NumberItem(row + 1, str(row + 1)),
+                QTableWidgetItem(member["name"]),
+                QTableWidgetItem(self._role(member)),
+                _NumberItem(member.get("population", 0)),
+                _NumberItem(member.get("villages", 0)),
+                _NumberItem(member.get("victory_points", 0)),
+                self._update_item(member, kingdom.get("tk_updates"), loaded_at),
+                self._gt_item(member, kingdom.get("gt_updates"), loaded_at),
+            )
+            for column, item in enumerate(items):
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, column, item)
+        self.table.setSortingEnabled(True)
+        self._apply_filter(self.filter_edit.text())
+
+    def _update_item(self, member: dict, updates: dict | None, now: datetime) -> QTableWidgetItem:
+        """TK-Tools last troop update, "brak danych" when unknown."""
+        entry = (updates or {}).get(str(member.get("player_id") or ""))
+        stamp = _parse_iso_time(entry.get("last_update")) if entry else None
+        if stamp is None:
+            item = _NumberItem(-1, self.NO_DATA)
+            if entry is not None:
+                # In the team but never updated: grey like "Jamais" on TK-Tools.
+                self._color_item(item, "never")
+            return item
+        local = stamp.astimezone().replace(tzinfo=None)
+        age = max(0, int((now - local).total_seconds()))
+        if age < 3600:
+            ago = f"{age // 60} min temu"
+        elif age < 48 * 3600:
+            ago = f"{age // 3600} h temu"
+        else:
+            ago = f"{age // 86400} dni temu"
+        item = _NumberItem(int(local.timestamp()), f"{local:%d.%m %H:%M} ({ago})")
+        self._color_item(item, _tk_freshness_bucket(age))
+        return item
+
+    def _gt_item(self, member: dict, updates: dict | None, now: datetime) -> QTableWidgetItem:
+        """GetterTools last troop update, coloured like on gettertools.com."""
+        entry = (updates or {}).get(str(member.get("player_id") or ""))
+        if not entry:
+            return _NumberItem(-1, self.NO_DATA)
+        timestamp = entry.get("timestamp")
+        if timestamp:
+            local = datetime.fromtimestamp(timestamp)
+            age = max(0, int((now - local).total_seconds()))
+            if age < 3600:
+                ago = f"{age // 60} min temu"
+            elif age < 48 * 3600:
+                ago = f"{age // 3600} h temu"
+            else:
+                ago = f"{age // 86400} dni temu"
+            item = _NumberItem(int(timestamp), f"{local:%d.%m %H:%M} ({ago})")
+        else:
+            item = _NumberItem(0, "nigdy")
+        background, foreground = (
+            _GT_FRESHNESS_COLORS.get(entry.get("color") or "", _TK_FRESHNESS_COLORS["never"])
+            if timestamp else _TK_FRESHNESS_COLORS["never"]
+        )
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+        return item
+
+    @staticmethod
+    def _color_item(item: QTableWidgetItem, bucket: str):
+        background, foreground = _TK_FRESHNESS_COLORS[bucket]
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+
+    def _apply_filter(self, text: str):
+        query = text.casefold().strip()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            name = item.text().casefold() if item is not None else ""
+            self.table.setRowHidden(row, bool(query) and query not in name)
+
+
 class IncomingAttacksWidget(QWidget):
     """Display the persisted history of attacks detected in owned villages."""
 
@@ -3887,6 +4170,9 @@ class MainWindow(QMainWindow):
     hideout_log_message = Signal(str)
     hideout_handled = Signal(object)
     hideout_active = Signal(str, object)
+    kingdom_loaded = Signal(object)
+    tk_troops_updated = Signal(object)
+    gt_troops_updated = Signal(object)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -3978,6 +4264,15 @@ class MainWindow(QMainWindow):
         self.hideout_timer = QTimer(self)
         self.hideout_timer.setInterval(1000)
         self.hideout_timer.timeout.connect(self._hideout_tick)
+        self._kingdom_worker = None
+        self.kingdom_loaded.connect(self._on_kingdom_loaded)
+        self.tk_troops_updated.connect(self._on_tktools_troops_updated)
+        self.gt_troops_updated.connect(self._on_gettertools_troops_updated)
+        self._gt_update_worker = None
+        self._tk_update_worker = None
+        self.kingdom_timer = QTimer(self)
+        self.kingdom_timer.setInterval(_KINGDOM_REFRESH_INTERVAL_MS)
+        self.kingdom_timer.timeout.connect(self._refresh_kingdom)
         self.incoming_attack_eta_timer = QTimer(self)
         self.incoming_attack_eta_timer.setInterval(1000)
         self.incoming_attack_eta_timer.timeout.connect(
@@ -4138,6 +4433,12 @@ class MainWindow(QMainWindow):
         self.hideout_tab.enabled_toggled.connect(self._set_hideout_enabled)
         self.hideout_tab.setting_changed.connect(self._set_hideout_setting)
         self.content_tabs.addTab(self.hideout_tab, "Obrona przed kryjówkami")
+
+        self.kingdom_tab = KingdomWidget()
+        self.kingdom_tab.refresh_requested.connect(self._refresh_kingdom)
+        self.kingdom_tab.update_tk_requested.connect(self._update_tktools_troops)
+        self.kingdom_tab.update_gt_requested.connect(self._update_gettertools_troops)
+        self.content_tabs.addTab(self.kingdom_tab, "Królestwo")
         
         layout.addWidget(self.content_tabs, stretch=3)
         
@@ -4213,6 +4514,9 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(3500, self._check_vacation)
                 self._start_attack_automation()
                 self._start_hideout_defense()
+                self.kingdom_timer.start()
+                QTimer.singleShot(4500, self._refresh_kingdom)
+                QTimer.singleShot(7000, self._backfill_attacker_squares)
             else:
                 self.recruitment_queue_timer.stop()
                 self.resource_milling_timer.stop()
@@ -4429,6 +4733,7 @@ class MainWindow(QMainWindow):
                     # Already on its way when listening started: keep any
                     # estimate saved earlier, never guess from this snapshot.
                     self._untimed_attacks.add(key)
+                    attack["detected_live"] = False
                 else:
                     tribe = int(attack.get("tribe_id") or 0)
                     self._square_estimates[key] = describe_square_level(
@@ -4440,6 +4745,65 @@ class MainWindow(QMainWindow):
                     )
             if key in self._square_estimates:
                 attack["tournament_square"] = self._square_estimates[key]
+                attack["detected_live"] = True
+
+    def _backfill_attacker_squares(self):
+        """Estimate the tournament square for history records saved without it.
+
+        The travel time is ``arrival - first detection``; that is only right
+        when the app was already running when the attack was sent, so records
+        detected right after an app start (or marked as not live) are skipped.
+        """
+        session = self.browser_session
+        repo = self.incoming_attack_repo
+        if session is None or repo is None:
+            return
+        records = [
+            record for record in repo.get_recent_attacks()
+            if not (record.get("details") or {}).get("tournament_square")
+        ]
+        if not records:
+            return
+        try:
+            offset = session.read_server_clock_offset()
+            tribes = session.read_village_tribes([
+                str(record.get("source_village_id") or "") for record in records
+            ])
+        except Exception as error:
+            logger.warning("Could not backfill tournament squares: %s", error)
+            return
+        starts = _app_start_times()
+        changed = 0
+        for record in records:
+            details = record.get("details") or {}
+            robber = record.get("attacker_name") == "Robber" or details.get("robber")
+            text = None
+            if robber:
+                text = ROBBER_SQUARE_TEXT
+            elif details.get("detected_live") is not False:
+                detected = record.get("first_detected_at")
+                if isinstance(detected, str):
+                    try:
+                        detected = datetime.fromisoformat(detected)
+                    except ValueError:
+                        detected = None
+                source = str(record.get("source_village_id") or "")
+                tribe = tribes.get(source)
+                distance = distance_between(source, record.get("target_village_id"))
+                if (
+                    isinstance(detected, datetime) and tribe and distance is not None
+                    and not detected_at_start(detected, starts)
+                ):
+                    duration = float(record["arrival_time"]) - (detected.timestamp() + offset)
+                    text = "≈ " + describe_square_level(
+                        distance, duration, self._attacker_unit_speeds(tribe),
+                        UNIT_NAMES.get(tribe, {}),
+                    )
+            if text:
+                repo.set_attack_detail(record["id"], "tournament_square", text)
+                changed += 1
+        if changed:
+            self.incoming_attacks_tab.update_history(repo.get_recent_attacks())
 
     def _attacker_unit_speeds(self, tribe: int) -> dict[int, float]:
         """Speeds (fields/hour) of units 1-9 of *tribe* from the game config."""
@@ -5431,6 +5795,195 @@ class MainWindow(QMainWindow):
         self.attack_tab.set_villages(villages, self.settings.attacks.hero_parking_village_id)
         self.attack_timer.start()
         self.attack_tab.set_state("Połączono z grą", "active")
+
+    # Kingdom -------------------------------------------------------------------
+    def _refresh_kingdom(self):
+        session = self.browser_session
+        if session is None:
+            self.kingdom_tab.status.setText("Połącz z grą, aby wczytać członków królestwa.")
+            return
+        worker = self._kingdom_worker
+        if worker is not None and worker.is_alive():
+            return
+        self.kingdom_tab.set_loading()
+
+        team_id = self.settings.kingdom.tktools_team_id
+        gt_group = self.settings.kingdom.gettertools_group
+        server_name = self._game_server_name()
+        cdp_url = session._cdp_url
+
+        def run():
+            try:
+                kingdom = session.read_kingdom_members()
+                kingdom["tk_updates"] = None
+                kingdom["tk_error"] = None
+                if team_id:
+                    tktools = TkToolsSession(cdp_url)
+                    try:
+                        kingdom["tk_updates"] = tktools.read_team_updates(team_id)["members"]
+                    except Exception as error:
+                        # No TK-Tools tab, not logged in or no access to the
+                        # team: every row shows "brak danych".
+                        kingdom["tk_error"] = str(error)
+                    finally:
+                        tktools.disconnect()
+                kingdom["gt_updates"] = None
+                kingdom["gt_error"] = None
+                if gt_group and server_name:
+                    gettertools = GetterToolsSession(cdp_url)
+                    try:
+                        kingdom["gt_updates"] = gettertools.read_group_updates(
+                            server_name, gt_group,
+                        )
+                    except Exception as error:
+                        kingdom["gt_error"] = str(error)
+                    finally:
+                        gettertools.disconnect()
+                self.kingdom_loaded.emit(kingdom)
+            except Exception as error:
+                logger.warning("Could not read kingdom members: %s", error)
+                self.kingdom_loaded.emit({"error": str(error)})
+
+        self._kingdom_worker = threading.Thread(target=run, daemon=True, name="kingdom")
+        self._kingdom_worker.start()
+
+    def _update_tktools_troops(self):
+        session = self.browser_session
+        if session is None:
+            QMessageBox.information(self, "Aktualizuj TK", "Najpierw połącz się z grą.")
+            return
+        worker = self._tk_update_worker
+        if worker is not None and worker.is_alive():
+            return
+        server_name = self._game_server_name()
+        if not server_name:
+            QMessageBox.warning(self, "Aktualizuj TK", "Nie rozpoznano serwera gry.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Aktualizować wojska w TK-Tools?",
+            "Aplikacja zapisze w TK-Tools (strona Troops) Twoje obecne wojska "
+            "z gry dla każdej wioski — w domu, w posiłkach i w drodze — oraz "
+            "poziomy placu turniejowego. Poziomy kuźni i orientacje wiosek "
+            "zostaną bez zmian.\n\nZaktualizować?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.kingdom_tab.update_tk_button.setEnabled(False)
+        self.kingdom_tab.status.setText("Aktualizuję wojska w TK-Tools…")
+        cdp_url = session._cdp_url
+
+        def run():
+            tktools = TkToolsSession(cdp_url)
+            try:
+                army = session.read_own_army()
+                self.tk_troops_updated.emit(tktools.update_troops(server_name, army))
+            except Exception as error:
+                logger.warning("TK-Tools troop update failed: %s", error)
+                self.tk_troops_updated.emit({"error": str(error)})
+            finally:
+                tktools.disconnect()
+
+        self._tk_update_worker = threading.Thread(target=run, daemon=True, name="tk-troops")
+        self._tk_update_worker.start()
+
+    def _on_tktools_troops_updated(self, result):
+        self.kingdom_tab.update_tk_button.setEnabled(True)
+        if not isinstance(result, dict) or result.get("error"):
+            message = str((result or {}).get("error") or "brak odpowiedzi")
+            self.kingdom_tab.status.setText(f"Nie zaktualizowano TK-Tools: {message}")
+            QMessageBox.warning(self, "Aktualizuj TK", f"Nie udało się: {message}")
+            return
+        parts = [f"Zaktualizowano w TK-Tools: {', '.join(result.get('updated') or []) or '—'}."]
+        if result.get("missing"):
+            parts.append(
+                "Wiosek nie ma jeszcze w TK-Tools (pominięto): "
+                + ", ".join(result["missing"]) + "."
+            )
+        if result.get("kept"):
+            parts.append(
+                "Bez zmian (nie ma ich w grze): " + ", ".join(result["kept"]) + "."
+            )
+        QMessageBox.information(self, "Aktualizuj TK", "\n\n".join(parts))
+        self._refresh_kingdom()
+
+    def _update_gettertools_troops(self):
+        session = self.browser_session
+        if session is None:
+            QMessageBox.information(self, "Aktualizuj GT", "Najpierw połącz się z grą.")
+            return
+        worker = self._gt_update_worker
+        if worker is not None and worker.is_alive():
+            return
+        server_name = self._game_server_name()
+        if not server_name:
+            QMessageBox.warning(self, "Aktualizuj GT", "Nie rozpoznano serwera gry.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Aktualizować wojska w GetterTools?",
+            "Aplikacja zapisze w GetterTools (My troops) Twoje obecne wojska "
+            "z gry dla każdej wioski — w domu, w posiłkach i w drodze, "
+            "jednostki 1–9 — oraz poziomy placu turniejowego. Typ wioski "
+            "zostanie bez zmian.\n\nZaktualizować?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.kingdom_tab.update_gt_button.setEnabled(False)
+        self.kingdom_tab.status.setText("Aktualizuję wojska w GetterTools…")
+        cdp_url = session._cdp_url
+
+        def run():
+            gettertools = GetterToolsSession(cdp_url)
+            try:
+                army = session.read_own_army()
+                self.gt_troops_updated.emit(gettertools.update_troops(server_name, army))
+            except Exception as error:
+                logger.warning("GetterTools troop update failed: %s", error)
+                self.gt_troops_updated.emit({"error": str(error)})
+            finally:
+                gettertools.disconnect()
+
+        self._gt_update_worker = threading.Thread(target=run, daemon=True, name="gt-troops")
+        self._gt_update_worker.start()
+
+    def _on_gettertools_troops_updated(self, result):
+        self.kingdom_tab.update_gt_button.setEnabled(True)
+        if not isinstance(result, dict) or result.get("error"):
+            message = str((result or {}).get("error") or "brak odpowiedzi")
+            self.kingdom_tab.status.setText(f"Nie zaktualizowano GetterTools: {message}")
+            QMessageBox.warning(self, "Aktualizuj GT", f"Nie udało się: {message}")
+            return
+        parts = [f"Zaktualizowano w GetterTools: {', '.join(result.get('updated') or []) or '—'}."]
+        if result.get("failed"):
+            parts.append("Nie zapisano: " + ", ".join(result["failed"]) + ".")
+        if result.get("missing"):
+            parts.append(
+                "Wiosek nie ma jeszcze w GetterTools (pominięto): "
+                + ", ".join(result["missing"]) + "."
+            )
+        QMessageBox.information(self, "Aktualizuj GT", "\n\n".join(parts))
+        self._refresh_kingdom()
+
+    def _on_kingdom_loaded(self, kingdom):
+        if not isinstance(kingdom, dict) or kingdom.get("error"):
+            self.kingdom_tab.set_error(str((kingdom or {}).get("error") or "brak danych"))
+            return
+        self.kingdom_tab.update_members(kingdom, datetime.now())
+        if kingdom.get("tk_error"):
+            self.kingdom_tab.status.setText(
+                self.kingdom_tab.status.text()
+                + f" · TK-Tools: brak danych ({kingdom['tk_error']})"
+            )
+        if kingdom.get("gt_error"):
+            self.kingdom_tab.status.setText(
+                self.kingdom_tab.status.text()
+                + f" · GetterTools: brak danych ({kingdom['gt_error']})"
+            )
 
     # Robber hideout defense ----------------------------------------------------
     def _start_hideout_defense(self):
@@ -6448,6 +7001,7 @@ class MainWindow(QMainWindow):
         self._vacation_pending_request = None
         self._stop_attack_automation()
         self._stop_hideout_defense()
+        self.kingdom_timer.stop()
         self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
             self.browser_session.stop_incoming_attack_listener()

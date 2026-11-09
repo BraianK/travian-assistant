@@ -21,6 +21,27 @@ DURATION_TOLERANCE_SECONDS = 5.0
 ROBBER_TEXT = "0 (kryjówka)"
 
 
+def village_position(village_id) -> tuple[int, int] | None:
+    """Map position encoded in a Travian Kingdoms village id."""
+    raw = str(village_id or "")
+    if not raw.isdigit():
+        return None
+    number = int(raw)
+    return number % 32768 - 16384, number // 32768 - 16384
+
+
+def distance_between(source_id, target_id) -> float | None:
+    source, target = village_position(source_id), village_position(target_id)
+    if source is None or target is None:
+        return None
+    return math.hypot(source[0] - target[0], source[1] - target[1])
+
+
+def detected_at_start(detected, starts, window_seconds: float = 120.0) -> bool:
+    """True when *detected* falls right after an app start (attack already on its way)."""
+    return any(0 <= (detected - start).total_seconds() <= window_seconds for start in starts)
+
+
 def travel_seconds(distance: float, speed: float, level: int) -> float:
     """Travel time in seconds of a unit with *speed* fields/hour."""
     if distance <= MIN_DISTANCE:

@@ -297,10 +297,37 @@ class HideoutDefenseSettings(BaseModel):
         return _validate_unit_percents(values)
 
 
+class KingdomSettings(BaseModel):
+    """Kingdom tab: the TK-Tools team whose troop updates are shown."""
+
+    tktools_team_id: str = "93a85d51-bad4-40f6-a780-7a70b04eae9a"
+    gettertools_group: str = "ILOVEPL,groups117"
+
+    @field_validator("gettertools_group")
+    @classmethod
+    def validate_gt_group(cls, value: str) -> str:
+        import re
+
+        value = value.strip()
+        if value and not re.fullmatch(r"[A-Za-z0-9_\-]+,groups\d+", value):
+            raise ValueError("Invalid GetterTools group.")
+        return value
+
+    @field_validator("tktools_team_id")
+    @classmethod
+    def validate_team_id(cls, value: str) -> str:
+        import re
+
+        value = value.strip().lower()
+        if value and not re.fullmatch(r"[0-9a-f-]{36}", value):
+            raise ValueError("Invalid TK-Tools team id.")
+        return value
+
+
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.0.3")
+    version: str = Field(default="1.1.0")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
@@ -314,6 +341,7 @@ class AppSettings(BaseModel):
     vacation: VacationSettings = Field(default_factory=VacationSettings)
     attacks: AttackSettings = Field(default_factory=AttackSettings)
     hideout_defense: HideoutDefenseSettings = Field(default_factory=HideoutDefenseSettings)
+    kingdom: KingdomSettings = Field(default_factory=KingdomSettings)
 
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)

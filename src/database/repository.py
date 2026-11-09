@@ -521,6 +521,21 @@ class IncomingAttackRepository(Repository):
         )
         return self._decode_row(rows[0]) if rows else None
 
+    def set_attack_detail(self, record_id: int, key: str, value) -> None:
+        """Store one extra field in a record's details (e.g. a late estimate)."""
+        rows = self.db.execute_raw(
+            "SELECT details FROM incoming_attack_logs WHERE id = :id",
+            {"id": record_id},
+        )
+        if not rows:
+            return
+        details = json.loads(rows[0]["details"] or "{}")
+        details[key] = value
+        self.db.execute_raw(
+            "UPDATE incoming_attack_logs SET details = :details WHERE id = :id",
+            {"id": record_id, "details": json.dumps(details, ensure_ascii=False)},
+        )
+
     def delete_attack(self, record_id: int) -> bool:
         """Delete exactly one history record."""
         self.db.execute_raw(
