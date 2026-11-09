@@ -138,6 +138,43 @@ class GetterToolsTests(unittest.TestCase):
 
 
 class KingdomWidgetTests(unittest.TestCase):
+    def test_viceking_role_and_sorting_every_column(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+
+        from src.app import KingdomWidget
+
+        QApplication.instance() or QApplication([])
+        widget = KingdomWidget()
+        widget.resize(1300, 500)
+        widget.show()
+        widget.update_members({"kingdom_id": 48, "tag": "X", "members": [
+            {"player_id": 156, "name": "RejeZ", "population": 4851, "kingdom_role": 3},
+            {"player_id": 146, "name": "rafal92f", "population": 4176, "is_king": True,
+             "kingdom_role": 1},
+            {"player_id": 290, "name": "Tosiek", "population": 4060, "is_duke": True,
+             "kingdom_role": 2},
+            {"player_id": 199, "name": "Dzogurt", "population": 2538},
+        ]}, datetime(2026, 11, 9, 22, 0))
+        table, header = widget.table, widget.table.horizontalHeader()
+        roles = {table.item(r, 1).text(): table.item(r, 2).text() for r in range(4)}
+        self.assertEqual("Wicekról", roles["RejeZ"])
+
+        def click(column):
+            QTest.mouseClick(header.viewport(), Qt.LeftButton, Qt.NoModifier,
+                             QPoint(header.sectionViewportPosition(column) + 5, 5))
+            return [table.item(r, 1).text() for r in range(4)]
+
+        self.assertEqual(["rafal92f", "RejeZ", "Tosiek", "Dzogurt"], click(2))
+        self.assertEqual(["Dzogurt", "Tosiek", "RejeZ", "rafal92f"], click(2))
+        self.assertEqual(["RejeZ", "rafal92f", "Tosiek", "Dzogurt"], click(3))
+        self.assertEqual(["Dzogurt", "rafal92f", "RejeZ", "Tosiek"], click(1))
+        for column in range(table.columnCount()):
+            click(column)
+            self.assertEqual(column, header.sortIndicatorSection())
+
     def test_gt_column_colours(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication

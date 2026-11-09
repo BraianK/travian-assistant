@@ -3479,6 +3479,8 @@ class KingdomWidget(QWidget):
             self.table.setColumnWidth(column, width)
         header.setStretchLastSection(True)
         header.setSortIndicator(0, Qt.AscendingOrder)
+        self._last_sort_column = 0
+        header.sectionClicked.connect(self._on_header_clicked)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeaderItem(self.UPDATE_COLUMN).setToolTip(
             "Ostatnia aktualizacja wojsk gracza w TK-Tools (team z ustawień). "
@@ -3499,13 +3501,33 @@ class KingdomWidget(QWidget):
         hint.setObjectName("footnote")
         layout.addWidget(hint)
 
+    # Player.KINGDOM_ROLE_*: 0 governor, 1 king, 2 duke, 3 viceking.
+    _ROLES = {1: "Król", 3: "Wicekról", 2: "Książę", 0: "Gubernator"}
+    # Higher value = higher rank, used to sort the role column.
+    _ROLE_RANK = {1: 3, 3: 2, 2: 1, 0: 0}
+    # Columns whose first click sorts from the highest value / newest date.
+    _DESCENDING_FIRST = {2, 3, 4, 5, 6, 7}
+
     @staticmethod
-    def _role(member: dict) -> str:
+    def _role_id(member: dict) -> int:
         if member.get("is_king"):
-            return "Król"
-        if member.get("is_duke"):
-            return "Książę"
-        return "Gubernator"
+            return 1
+        role = int(member.get("kingdom_role") or 0)
+        if role in (2, 3):
+            return role
+        return 2 if member.get("is_duke") else 0
+
+    @classmethod
+    def _role(cls, member: dict) -> str:
+        return cls._ROLES[cls._role_id(member)]
+
+    def _on_header_clicked(self, column: int):
+        """First click on a numeric column sorts descending (biggest first)."""
+        if column == self._last_sort_column:
+            return
+        self._last_sort_column = column
+        if column in self._DESCENDING_FIRST:
+            self.table.horizontalHeader().setSortIndicator(column, Qt.DescendingOrder)
 
     def set_loading(self):
         self.status.setText("Wczytuję członków królestwa…")
@@ -3534,7 +3556,7 @@ class KingdomWidget(QWidget):
             items = (
                 _NumberItem(row + 1, str(row + 1)),
                 QTableWidgetItem(member["name"]),
-                QTableWidgetItem(self._role(member)),
+                _NumberItem(self._ROLE_RANK[self._role_id(member)], self._role(member)),
                 _NumberItem(member.get("population", 0)),
                 _NumberItem(member.get("villages", 0)),
                 _NumberItem(member.get("victory_points", 0)),
