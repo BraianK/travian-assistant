@@ -52,6 +52,7 @@ try:
     from src.core.attack_bridge import GameAttackBridge
     from src.core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
     from src.core.attack_operations import UNIT_NAMES
+    from src.core.tournament_square import describe as describe_square_level
     from src.core.attack_clicker import ClickAttackExecutor
     from src.core.tktools_client import TkToolsSession
     from src.core.vacation_planner import (
@@ -98,6 +99,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.attack_bridge import GameAttackBridge
     from core.hideout_defense import HideoutDefense, SCAN_INTERVAL_SECONDS
     from core.attack_operations import UNIT_NAMES
+    from core.tournament_square import describe as describe_square_level
     from core.attack_clicker import ClickAttackExecutor
     from core.tktools_client import TkToolsSession
     from core.vacation_planner import (
@@ -3308,7 +3310,15 @@ class HideoutDefenseWidget(QWidget):
 class IncomingAttacksWidget(QWidget):
     """Display the persisted history of attacks detected in owned villages."""
 
-    delete_requested = Signal(int)
+    delete_requested = Signal(list)
+
+    _COLUMNS = (
+        "Cel", "Atakujący", "Wioska źródłowa", "Koordynaty", "Rodzaj",
+        "Dotarcie", "Plac turniejowy", "Pozostało", "Status", "Wykryto",
+    )
+    _COLUMN_WIDTHS = (110, 110, 150, 90, 80, 120, 300, 130, 90, 120)
+    SQUARE_COLUMN = 6
+    ETA_COLUMN = 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3323,24 +3333,32 @@ class IncomingAttacksWidget(QWidget):
         self.status.setObjectName("secondaryText")
         layout.addWidget(self.status)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels([
-            "Cel", "Atakujący", "Wioska źródłowa",
-            "Rodzaj", "Dotarcie", "Pozostało", "Status", "Wykryto",
-        ])
-        DashboardWidget._configure_table(
-            self.table,
-            stretch_columns=(0, 1, 2, 6, 7),
+        self.table = QTableWidget(0, len(self._COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(self._COLUMNS))
+        DashboardWidget._configure_table(self.table)
+        header = self.table.horizontalHeader()
+        # Every column can be widened by dragging its edge in the header.
+        for column, width in enumerate(self._COLUMN_WIDTHS):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+            self.table.setColumnWidth(column, width)
+        header.setStretchLastSection(True)
+        self.table.setWordWrap(True)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.horizontalHeaderItem(self.SQUARE_COLUMN).setToolTip(
+            "Poziom placu turniejowego atakującego wyliczony z czasu przemarszu "
+            "(+10% prędkości za poziom powyżej 20 pól). Skład wojsk jest ukryty, "
+            "więc podano poziomy pasujące do jednostek, które mogą iść najwolniej."
         )
         self.table.cellDoubleClicked.connect(self._show_attack_details)
         layout.addWidget(self.table)
 
-        self.delete_button = QPushButton("Usuń wybrany wpis")
+        self.delete_button = QPushButton("Usuń zaznaczone wpisy")
         self.delete_button.clicked.connect(self._request_delete_selected)
         layout.addWidget(self.delete_button, alignment=Qt.AlignRight)
 
         hint = QLabel(
-            "Historia ataków jest zapisywana lokalnie. Podwójne kliknięcie "
+            "Historia ataków jest zapisywana lokalnie. Zaznacz kilka wierszy "
+            "z Ctrl lub Shift, aby usunąć je naraz. Podwójne kliknięcie "
             "pokazuje szczegóły i zdarzenia; aplikacja nie wysyła obrony "
             "ani innych działań."
         )
@@ -3452,8 +3470,10 @@ class IncomingAttacksWidget(QWidget):
                     "source_village_name",
                     record.get("source_village", ""),
                 ),
+                self._coordinates_text(record, attack),
                 record.get("movement_type", ""),
                 datetime.fromtimestamp(arrival_time).strftime("%d.%m %H:%M:%S"),
+                self._square_text(record, attack),
                 (
                     self._format_eta(attack["seconds_remaining"])
                     if attack is not None
@@ -3466,6 +3486,8 @@ class IncomingAttacksWidget(QWidget):
                 item = QTableWidgetItem(str(value))
                 if column == 0:
                     item.setData(Qt.UserRole, record.get("id"))
+                if column == self.SQUARE_COLUMN and str(value) != "—":
+                    item.setToolTip(str(value).replace("; ", "\n"))
                 self.table.setItem(row, column, item)
             first_item = self.table.item(row, 0)
             first_item.setData(
@@ -3481,6 +3503,30 @@ class IncomingAttacksWidget(QWidget):
                 )
         self.refresh_eta()
 
+    @staticmethod
+    def _coordinates_text(record: dict, attack: dict | None) -> str:
+        """"(x|y)" of the source village, from the game or its village id."""
+        for source in (attack or {}, record, record.get("details") or {}):
+            if not isinstance(source, dict):
+                continue
+            x, y = source.get("source_x"), source.get("source_y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                return f"({int(x)}|{int(y)})"
+        raw_id = str(record.get("source_village_id") or "")
+        if raw_id.isdigit():
+            # Travian Kingdoms village ids encode the map position.
+            village_id = int(raw_id)
+            return f"({village_id % 32768 - 16384}|{village_id // 32768 - 16384})"
+        return "—"
+
+    @staticmethod
+    def _square_text(record: dict, attack: dict | None) -> str:
+        for source in (attack or {}, record, record.get("details") or {}):
+            value = source.get("tournament_square") if isinstance(source, dict) else None
+            if value:
+                return str(value)
+        return "—"
+
     def _show_attack_details(self, row: int, _column: int):
         item = self.table.item(row, 0)
         if item is None:
@@ -3495,17 +3541,21 @@ class IncomingAttacksWidget(QWidget):
         )
 
     def _request_delete_selected(self):
-        selected = self.table.selectedItems()
-        if not selected:
+        rows = sorted({item.row() for item in self.table.selectedItems()})
+        record_ids = []
+        for row in rows:
+            item = self.table.item(row, 0)
+            record_id = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(record_id, int) and record_id not in record_ids:
+                record_ids.append(record_id)
+        if not record_ids:
             QMessageBox.information(
                 self,
                 "Historia ataków",
-                "Najpierw wybierz rekord do usunięcia.",
+                "Najpierw zaznacz rekordy do usunięcia.",
             )
             return
-        record_id = self.table.item(selected[0].row(), 0).data(Qt.UserRole)
-        if isinstance(record_id, int):
-            self.delete_requested.emit(record_id)
+        self.delete_requested.emit(record_ids)
 
     def refresh_eta(self):
         now = monotonic()
@@ -3514,7 +3564,7 @@ class IncomingAttacksWidget(QWidget):
             row = self._row_by_attack_key.get(attack_key)
             if row is None:
                 continue
-            item = self.table.item(row, 5)
+            item = self.table.item(row, self.ETA_COLUMN)
             if item is not None:
                 baseline, updated_at = self._eta_references[attack_key]
                 item.setText(self._format_eta(
@@ -3844,6 +3894,11 @@ class MainWindow(QMainWindow):
         self._pending_milling_responses: dict[str, int] = {}
         self._connected_milling_controls: set[int] = set()
         self._seen_incoming_attack_ids: set[str] = set()
+        # Villages whose first (baseline) movement snapshot was processed.
+        self._attack_listener_villages: set[str] = set()
+        self._square_estimates: dict[str, str] = {}
+        self._untimed_attacks: set[str] = set()
+        self._unit_speeds: dict[int, dict[int, float]] | None = None
         self._incoming_attacks_by_key: dict[str, dict] = {}
         self._dismissed_incoming_attack_ids: set[str] = set()
         self._vacation_pending_request: tuple[str, bool, int] | None = None
@@ -4080,6 +4135,7 @@ class MainWindow(QMainWindow):
         try:
             self._seen_incoming_attack_ids.clear()
             self._incoming_attacks_by_key.clear()
+            self._attack_listener_villages.clear()
             self.browser_session = TravianBrowserSession(
                 self.settings.browser.cdp_address,
                 self.settings.browser.cdp_port,
@@ -4251,6 +4307,7 @@ class MainWindow(QMainWindow):
             f"{village_id}:{attack['movement_id']}"
             for attack in snapshot["attacks"]
         }
+        self._estimate_attacker_squares(village_id, snapshot["attacks"], server_time)
         try:
             if self.incoming_attack_repo is not None:
                 for attack in snapshot["attacks"]:
@@ -4328,7 +4385,56 @@ class MainWindow(QMainWindow):
                 "obrony ani żadnych działań do gry.",
             )
 
-    def _delete_incoming_attack_record(self, record_id: int):
+    def _estimate_attacker_squares(
+        self, village_id: str, attacks: list[dict], server_time: float,
+    ):
+        """Attach the attacker's tournament square estimate to new attacks.
+
+        The travel time is ``arrival - timeStart`` when the game gives the
+        start, otherwise ``arrival - first live detection``; attacks already
+        on their way when the listener started cannot be timed that way.
+        """
+        baseline = village_id not in self._attack_listener_villages
+        self._attack_listener_villages.add(village_id)
+        for attack in attacks:
+            key = f"{village_id}:{attack['movement_id']}"
+            if key not in self._square_estimates and key not in self._untimed_attacks:
+                robber = bool(attack.get("robber")) or attack.get("attacker_name") == "Robber"
+                time_start = attack.get("time_start") or 0
+                duration = None
+                if time_start > 0:
+                    duration = float(attack["arrival_time"]) - float(time_start)
+                elif not baseline:
+                    duration = float(attack["arrival_time"]) - server_time
+                if not robber and duration is None:
+                    # Already on its way when listening started: keep any
+                    # estimate saved earlier, never guess from this snapshot.
+                    self._untimed_attacks.add(key)
+                else:
+                    tribe = int(attack.get("tribe_id") or 0)
+                    self._square_estimates[key] = describe_square_level(
+                        attack.get("distance"),
+                        duration,
+                        self._attacker_unit_speeds(tribe),
+                        UNIT_NAMES.get(tribe, {}),
+                        robber=robber,
+                    )
+            if key in self._square_estimates:
+                attack["tournament_square"] = self._square_estimates[key]
+
+    def _attacker_unit_speeds(self, tribe: int) -> dict[int, float]:
+        """Speeds (fields/hour) of units 1-9 of *tribe* from the game config."""
+        if self._unit_speeds is None and self.browser_session is not None:
+            try:
+                self._unit_speeds = self.browser_session.read_unit_speeds()
+            except Exception as error:
+                logger.warning("Could not read unit speeds: %s", error)
+        return dict((self._unit_speeds or {}).get(tribe, {}))
+
+    def _delete_incoming_attack_record(self, record_ids):
+        """Delete one or several history records after one confirmation."""
+        if isinstance(record_ids, int):
+            record_ids = [record_ids]
         if self.incoming_attack_repo is None:
             QMessageBox.warning(
                 self,
@@ -4336,27 +4442,39 @@ class MainWindow(QMainWindow):
                 "Historia ataków nie jest dostępna.",
             )
             return
-        record = self.incoming_attack_repo.get_attack(record_id)
-        if record is None:
+        records = [
+            record for record in (
+                self.incoming_attack_repo.get_attack(record_id)
+                for record_id in record_ids
+            )
+            if record is not None
+        ]
+        if not records:
             self.incoming_attacks_tab.update_history(
                 self.incoming_attack_repo.get_recent_attacks()
             )
             return
+        question = (
+            "Czy na pewno usunąć wybrany rekord z historii?"
+            if len(records) == 1
+            else f"Czy na pewno usunąć {len(records)} zaznaczone rekordy z historii?"
+        )
         confirmation = QMessageBox.question(
             self,
-            "Usuń rekord ataku",
-            "Czy na pewno usunąć wybrany rekord z historii?",
+            "Usuń rekordy ataków" if len(records) > 1 else "Usuń rekord ataku",
+            question,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if confirmation != QMessageBox.Yes:
             return
         try:
-            self.incoming_attack_repo.delete_attack(record_id)
-            if record["movement_key"] in self._incoming_attacks_by_key:
-                self._dismissed_incoming_attack_ids.add(
-                    record["movement_key"]
-                )
+            for record in records:
+                self.incoming_attack_repo.delete_attack(record["id"])
+                if record["movement_key"] in self._incoming_attacks_by_key:
+                    self._dismissed_incoming_attack_ids.add(
+                        record["movement_key"]
+                    )
             self.incoming_attacks_tab.update_history(
                 self.incoming_attack_repo.get_recent_attacks()
             )
@@ -4370,11 +4488,11 @@ class MainWindow(QMainWindow):
                 datetime.now(),
             )
         except Exception as error:
-            logger.exception("Could not delete incoming attack history record")
+            logger.exception("Could not delete incoming attack history records")
             QMessageBox.warning(
                 self,
                 "Błąd historii ataków",
-                f"Nie udało się usunąć wybranego rekordu: {error}",
+                f"Nie udało się usunąć wybranych rekordów: {error}",
             )
 
     def _on_village_names_update(self, village_names: dict):

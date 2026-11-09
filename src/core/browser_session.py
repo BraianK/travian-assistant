@@ -499,6 +499,29 @@ def _tab_url(tab: pychrome.Tab) -> str:
     return str(metadata.get("url", "")) if isinstance(metadata, dict) else ""
 
 
+def _coordinates(value) -> dict:
+    """``{"source_x", "source_y"}`` from page data (map coordinates may be negative)."""
+    if not isinstance(value, dict):
+        return {}
+    x, y = value.get("x"), value.get("y")
+    if any(
+        isinstance(number, bool) or not isinstance(number, (int, float))
+        or not math.isfinite(number)
+        for number in (x, y)
+    ):
+        return {}
+    return {"source_x": int(x), "source_y": int(y)}
+
+
+def _finite_number(value) -> float | None:
+    """A finite, non-negative number from page data, otherwise ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
 def _model_production_rates(value) -> dict[str, int] | None:
     """Hourly production from the game's village model, if complete."""
     if not isinstance(value, dict):
@@ -824,6 +847,11 @@ class TravianBrowserSession:
                         or "Atak"
                     ),
                     "masked": bool(attack.get("masked")),
+                    "time_start": _finite_number(attack.get("time_start")),
+                    "tribe_id": int(_finite_number(attack.get("tribe_id")) or 0),
+                    "robber": bool(attack.get("robber")),
+                    "distance": _finite_number(attack.get("distance")),
+                    **_coordinates(attack.get("source_coordinates")),
                 })
             self._incoming_attack_handler({
                 "village_id": village_id,
@@ -894,6 +922,25 @@ class TravianBrowserSession:
             if (villageIds.some(id => !ownedIds.has(String(id)))) {
                 throw new Error("A selected village is not owned by this account.");
             }
+            const coordinatesOf = (id, model) => {
+                const data = model && model.data;
+                if (data && data.coordinates) {
+                    return {x: Number(data.coordinates.x), y: Number(data.coordinates.y)};
+                }
+                const numeric = Number(id);
+                if (typeof window.id2xy === "function" && numeric > 0) {
+                    const point = window.id2xy(numeric);
+                    return {x: Number(point.x), y: Number(point.y)};
+                }
+                return null;
+            };
+            const distanceBetween = (sourceId, sourceModel, targetId) => {
+                const source = coordinatesOf(sourceId, sourceModel);
+                const target = coordinatesOf(targetId, null);
+                if (!source || !target || !Number.isFinite(source.x)
+                    || !Number.isFinite(target.x)) return null;
+                return Math.hypot(source.x - target.x, source.y - target.y);
+            };
             const publish = villageId => {
                 const collection = Troops.getCollection(
                     Troops.COLLECTION_MOVING,
@@ -956,6 +1003,14 @@ class TravianBrowserSession:
                         ),
                         source_village_id: sourceVillageId,
                         arrival_time: Number(movement.timeFinish),
+                        time_start: Number(movement.timeStart) || 0,
+                        tribe_id: Number(data.tribeId) || 0,
+                        robber: Number(data.playerId) === -1,
+                        source_coordinates: coordinatesOf(sourceVillageId, sourceVillage),
+                        distance: distanceBetween(
+                            sourceVillageId, sourceVillage,
+                            String(movement.villageIdTarget || villageId)
+                        ),
                         movement_type: movementType(
                             Number(movement.movementType)
                         ),
@@ -1266,6 +1321,40 @@ class TravianBrowserSession:
                 state["capacities"],
             )
         return state
+
+    def read_unit_speeds(self) -> dict[int, dict[int, float]]:
+        """Unit speeds (fields/hour, world speed included) for tribes 1-3."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression="""(() => {
+                const troops = (config.balancing && config.balancing.troopConfig) || {};
+                const speeds = {};
+                for (let tribe = 1; tribe <= 3; tribe++) {
+                    speeds[tribe] = {};
+                    for (let nr = 1; nr <= 9; nr++) {
+                        const unit = troops[String((tribe - 1) * 10 + nr)];
+                        if (unit && Number(unit.speed) > 0) speeds[tribe][nr] = Number(unit.speed);
+                    }
+                }
+                return speeds;
+            })()""",
+            returnByValue=True,
+            _timeout=5,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError("The Travian page returned invalid unit speeds.")
+        speeds: dict[int, dict[int, float]] = {}
+        for tribe, units in value.items():
+            if not str(tribe).isdigit() or not isinstance(units, dict):
+                continue
+            speeds[int(tribe)] = {
+                int(unit): float(speed) for unit, speed in units.items()
+                if str(unit).isdigit() and _finite_number(speed)
+            }
+        return speeds
 
     def read_village_production(self, villages: list[dict]) -> dict[str, dict[str, int]]:
         """Hourly production of every owned village from the game's models.

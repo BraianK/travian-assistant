@@ -19,6 +19,7 @@ game through ``GameAttackBridge`` and keeps per-hideout ``HideoutCase`` state.
 from __future__ import annotations
 
 
+import json
 import math
 import re
 import threading
@@ -163,6 +164,14 @@ _READ_HIDEOUT_JS = r"""((cellId, fresh) => new Promise(resolve => {
 # ---------------------------------------------------------------------------
 # Pure planning helpers
 # ---------------------------------------------------------------------------
+
+def _float(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
 
 def hideout_display_name(name) -> str:
     """Map "Haydut sığınağı II" (any language) to "Kryjówka II"."""
@@ -458,7 +467,7 @@ class HideoutDefense:
                 target_village_name="",
                 deadline=min(arrivals) if arrivals else 0.0,
                 status=STATUS_RAID_RETURNING,
-                counter_arrival=0.0,
+                counter_arrival=_float(info.get("counter_arrival")),
                 message="Wznowiono grabienie po restarcie aplikacji.",
             )
             self.cases.append(case)
@@ -632,7 +641,13 @@ class HideoutDefense:
             case.status = STATUS_DONE
             return
         if self.settings.raid_repeat and case.hideout_cell:
-            self._set_active(case.hideout_cell, {"id": case.hideout_id, "name": case.hideout_name})
+            self._set_active(case.hideout_cell, {
+                "id": case.hideout_id,
+                "name": case.hideout_name,
+                # Raids must never land before the counter-attack, also
+                # after a restart.
+                "counter_arrival": f"{float(case.counter_arrival or 0):.3f}",
+            })
         self._schedule_raid(case)
 
     # ------------------------------------------------------------------- raid
@@ -767,7 +782,20 @@ class HideoutDefense:
         now = self.server_now()
         if case.raid_return_at is not None and now < case.raid_return_at:
             return
-        movements = self.bridge.read_movements(self.capital_id)
+        counter_landed = (case.counter_arrival or 0) + RETURN_MARGIN_SECONDS
+        if now < counter_landed:
+            case.raid_return_at = counter_landed
+            case.raid_message = (
+                f"Czekam na wejście kontrataku ({_clock_text(case.counter_arrival)})."
+            )
+            return
+        movements = self._capital_movements()
+        if movements is None:
+            # Right after connecting the game may not have loaded the troop
+            # movements yet; an empty list must not be read as "nothing out".
+            case.raid_return_at = now + LOOT_CHECK_INTERVAL_SECONDS
+            case.raid_message = "Czekam, aż gra wczyta ruchy wojsk."
+            return
         targets = {case.hideout_id, str(case.hideout_cell or "")}
         outgoing = [m for m in movements if str(m.get("target")) in targets]
         returning = [m for m in movements if str(m.get("source")) in targets]
@@ -823,6 +851,19 @@ class HideoutDefense:
             return
         case.raid_return_at = None
         self._schedule_raid(case)
+
+    def _capital_movements(self) -> list[dict] | None:
+        """Movements of the capital, or ``None`` while the game has not loaded them."""
+        value = self.bridge._evaluate(
+            "((villageId) => { const c = Troops.getCollection('moving', villageId);"
+            " if (!c || !c.filled) return null;"
+            " return (c.data || []).map(row => { const d = row.data || {};"
+            " const m = d.movement || {}; return {"
+            " source: String(m.villageIdStart || ''), target: String(m.villageIdTarget || ''),"
+            " movement_type: Number(m.movementType), arrival: Number(m.timeFinish) || 0}; }); })"
+            f"({json.dumps(str(self.capital_id))})"
+        )
+        return value if isinstance(value, list) else None
 
     def _finish_looting(self, case: HideoutCase, message: str) -> None:
         case.status = STATUS_DONE

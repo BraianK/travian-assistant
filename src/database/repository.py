@@ -277,6 +277,14 @@ class IncomingAttackRepository(Repository):
             existing = existing_rows[0]
             events = json.loads(existing["event_log"])
             previous_details = json.loads(existing["details"])
+            if (
+                "tournament_square" not in details
+                and previous_details.get("tournament_square")
+            ):
+                # The estimate is made once at detection; later snapshots
+                # (e.g. after a reconnect) must not drop it.
+                details["tournament_square"] = previous_details["tournament_square"]
+                details_json = json.dumps(details, ensure_ascii=False)
             status = "incoming"
             if existing["status"] != status:
                 events.append({

@@ -72,6 +72,7 @@ class FakeBridge:
         self.loot = {"1": 1000, "2": 0, "3": 0, "4": 500}
         self.garrison = {}
         self.gone = False
+        self.movements_unloaded = False
         self.attacks = [{
             "movement_id": "504867", "target_village_id": "538001407",
             "target_village_name": "00.Aden", "hideout_id": "-2294",
@@ -91,6 +92,8 @@ class FakeBridge:
         }
 
     def _evaluate(self, expression, **kwargs):
+        if "getCollection('moving'" in expression:
+            return None if self.movements_unloaded else self.read_movements("538001407")
         if "npcInfo" in expression:
             if self.gone:
                 return {"found": False, "refreshed": True, "carry": {}}
@@ -270,6 +273,41 @@ class EngineTests(unittest.TestCase):
         case = defense.cases[0]
         self.assertEqual(STATUS_DONE, case.status)
         self.assertIn("zniknęła", case.raid_message)
+
+    def test_after_restart_never_raids_before_the_counter_lands(self):
+        bridge, settings, defense, _handled = self.make(
+            raid_enabled=True, raid_units={"1": 100},
+        )
+        settings.active_hideouts = {"537870332": {
+            "id": "-2294", "name": "Haydut I",
+            "counter_arrival": str(bridge.now + 3000),
+        }}
+        bridge.attacks = []
+        bridge.units = {"1": 2580}
+        bridge.movements_unloaded = True   # the game has not loaded movements yet
+        self.tick(defense)
+        case = defense.cases[0]
+        self.assertEqual([], bridge.fired)
+        self.assertEqual(bridge.now + 3000 + 5, case.raid_return_at)
+        bridge.now += 3005                 # counter landed
+        self.tick(defense)
+        self.assertEqual([], bridge.fired)  # movements still not loaded
+        self.assertIn("wczyta", case.raid_message)
+        bridge.movements_unloaded = False
+        bridge.now += 20
+        self.tick(defense)
+        self.tick(defense)
+        self.assertEqual(4, bridge.fired[0][0]["params"]["movementType"])
+
+    def test_counter_arrival_is_remembered_for_restarts(self):
+        bridge, _settings, defense, _handled = self.make(raid_enabled=True, raid_units={"1": 10})
+        remembered = []
+        defense._set_active = lambda cell, info: remembered.append((cell, info))
+        self.tick(defense)
+        self.tick(defense)
+        cell, info = remembered[0]
+        self.assertEqual("538066946", cell)
+        self.assertEqual(bridge.now + 340, float(info["counter_arrival"]))
 
     def test_stops_raiding_when_hideout_garrison_is_back(self):
         bridge, _settings, defense, _handled = self.make(

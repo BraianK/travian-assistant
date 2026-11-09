@@ -2305,7 +2305,7 @@ class BaselineSmokeTests(unittest.TestCase):
                 self.assertEqual(1, window.incoming_attacks_tab.table.rowCount())
                 self.assertEqual(
                     "Wycofany",
-                    window.incoming_attacks_tab.table.item(0, 6).text(),
+                    window.incoming_attacks_tab.table.item(0, 8).text(),
                 )
 
                 with patch(
