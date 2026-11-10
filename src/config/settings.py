@@ -297,10 +297,52 @@ class HideoutDefenseSettings(BaseModel):
         return _validate_unit_percents(values)
 
 
+def _validate_scout_time(value: str) -> str:
+    from datetime import datetime
+
+    value = (value or "").strip()
+    if value:
+        try:
+            datetime.strptime(value, "%d.%m.%Y %H:%M:%S")
+        except ValueError as error:
+            raise ValueError("Use the dd.mm.yyyy HH:MM:SS format.") from error
+    return value
+
+
 class ScoutTargetSetting(BaseModel):
     name: str = Field(max_length=60)
     x: int = Field(ge=-400, le=400)
     y: int = Field(ge=-400, le=400)
+    # Empty: the attack's (or manual attacker's) own arrival time.
+    arrival: str = ""
+
+    @field_validator("arrival")
+    @classmethod
+    def validate_arrival(cls, value: str) -> str:
+        return _validate_scout_time(value)
+
+
+class ScoutAttackerSetting(BaseModel):
+    """An attacker added by hand (e.g. from an operation spreadsheet)."""
+
+    id: str = Field(min_length=1, max_length=40)
+    name: str = Field(default="", max_length=60)
+    village_name: str = Field(default="", max_length=80)
+    x: int = Field(ge=-400, le=400)
+    y: int = Field(ge=-400, le=400)
+    player_id: str = ""
+    village_id: str = ""
+    tribe_id: int = Field(default=0, ge=0, le=9)
+    unit: int = Field(default=7, ge=1, le=10)
+    siege: bool = True
+    pt_from: int = Field(default=0, ge=0, le=20)
+    pt_to: int = Field(default=20, ge=0, le=20)
+    arrival: str = ""
+
+    @field_validator("arrival")
+    @classmethod
+    def validate_arrival(cls, value: str) -> str:
+        return _validate_scout_time(value)
 
 
 class ScoutSettings(BaseModel):
@@ -310,6 +352,7 @@ class ScoutSettings(BaseModel):
     scouts_per_send: int = Field(default=2, ge=1, le=50)
     pt_spread: int = Field(default=1, ge=0, le=20)
     targets: list[ScoutTargetSetting] = Field(default_factory=list)
+    attackers: list[ScoutAttackerSetting] = Field(default_factory=list)
 
 
 class KingdomSettings(BaseModel):
@@ -342,7 +385,7 @@ class KingdomSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.2.0")
+    version: str = Field(default="1.2.1")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)

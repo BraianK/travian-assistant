@@ -99,6 +99,7 @@ class ScoutOperation:
     scout_unit: int
     scouts_per_send: int
     scout_travel: float
+    pair_xp: int = 0
     candidates: list[Candidate] = field(default_factory=list)
     id: int = field(default_factory=lambda: next(_ids))
     status: str = "aktywna"
@@ -114,8 +115,10 @@ class ScoutAutomation:
         log: Callable[[str], None],
         clock: Callable[[], float] = time.time,
         timer: PreciseTimer | None = None,
+        on_found: Callable[[dict], None] | None = None,
     ):
         self.bridge = bridge
+        self._on_found = on_found or (lambda _result: None)
         self._settings = settings_getter
         self._log = log
         self._clock = clock
@@ -161,6 +164,20 @@ class ScoutAutomation:
         scout_unit: int,
         scouts_per_send: int,
     ) -> ScoutOperation:
+        with self._lock:
+            previous = [
+                op for op in self.operations
+                if op.attack_key == attack_key and op.status == "aktywna"
+            ]
+            if any(
+                status != "zaplanowany"
+                for op in previous for candidate in op.candidates
+                for status in candidate.send_status
+            ):
+                raise RuntimeError(
+                    "dla tego atakującego część skanów już wyszła — anuluj najpierw "
+                    "obecną operację, jeśli chcesz zaplanować od nowa."
+                )
         context = self.refresh_context(force=True)
         village = context["villages"].get(str(scout_village_id))
         if village is None:
@@ -169,6 +186,12 @@ class ScoutAutomation:
         scout_travel = float(result["durations"].get(str(scout_unit)) or 0)
         if scout_travel <= 0:
             raise RuntimeError("Gra nie podała czasu przemarszu zwiadowców.")
+        supply = self.bridge._evaluate(
+            "(() => { const t = (config.balancing.troopConfig || {})["
+            f"{json.dumps(str((int(context.get('tribe') or 0) - 1) * 10 + int(scout_unit)))}"
+            "]; return t ? Number(t.supply) || 0 : 0; })()"
+        )
+        pair_xp = int(supply or 0) * int(scouts_per_send)
         candidates = plan_candidates(
             source, targets, unit_speed, levels, siege, scout_travel, self.server_now(),
         )
@@ -182,13 +205,22 @@ class ScoutAutomation:
             siege=siege, scout_village_id=str(scout_village_id),
             scout_village_name=str(village.get("name") or scout_village_id),
             scout_unit=scout_unit, scouts_per_send=scouts_per_send,
-            scout_travel=scout_travel, candidates=candidates,
+            scout_travel=scout_travel, pair_xp=pair_xp, candidates=candidates,
         )
         with self._lock:
+            # Planning the same attacker again replaces its not-yet-started plan.
+            replaced = [
+                op for op in self.operations
+                if op.attack_key == attack_key and op.status == "aktywna"
+            ]
+            self.operations = [op for op in self.operations if op not in replaced]
             self.operations.append(operation)
+        if replaced:
+            self._log(f"Plan zwiadu na {attacker_name} zastąpiony nowym.")
         self._log(
             f"Zwiad na {attacker_name}: {len(candidates)} możliwych wyjść, potrzeba "
-            f"{needed} zwiadowców z {operation.scout_village_name} (jest {available})."
+            f"{needed} zwiadowców z {operation.scout_village_name} (jest {available}). "
+            f"Zabicie jednej pary zwiadu daje bohaterowi ok. {pair_xp} EXP."
         )
         if available < needed:
             self._log("Uwaga: za mało zwiadowców — część wysyłek się nie uda.")
@@ -268,6 +300,15 @@ class ScoutAutomation:
         candidate.verdict = verdict
         if verdict == VERDICT_LEFT and not operation.found:
             operation.found = f"{candidate.target}, PT {candidate.level}"
+            self._on_found({
+                "attacker": operation.attacker_name,
+                "unit": operation.unit_label,
+                "siege": operation.siege,
+                "target": candidate.target,
+                "level": candidate.level,
+                "departure": candidate.departure,
+                "xp": dict(candidate.xp),
+            })
         self._log(
             f"{operation.attacker_name} → {candidate.target}, PT {candidate.level} "
             f"(wyjście {time.strftime('%H:%M:%S', time.localtime(candidate.departure))}): "
@@ -300,5 +341,6 @@ class ScoutAutomation:
                         "xp": dict(candidate.xp),
                         "verdict": candidate.verdict,
                         "status": operation.status,
+                        "pair_xp": operation.pair_xp,
                     })
             return rows

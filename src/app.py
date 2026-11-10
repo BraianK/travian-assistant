@@ -3652,6 +3652,7 @@ class ScoutWidget(QWidget):
     setting_changed = Signal(str, object)
     plan_requested = Signal(dict)
     cancel_requested = Signal(int)
+    manual_attacker_requested = Signal(int, int)
 
     ATTACK_COLUMNS = ("Atakujący", "Wioska (koord.)", "Atakuje", "Dotarcie", "Rodzaj",
                       "Plac turniejowy", "EXP bohatera")
@@ -3662,6 +3663,8 @@ class ScoutWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._attacks: list[dict] = []
+        self._incoming: list[dict] = []
+        self._manual: list[dict] = []
         self._villages: list[dict] = []
         self._speeds: dict[int, dict[int, float]] = {}
         self._loading_targets = False
@@ -3699,6 +3702,16 @@ class ScoutWidget(QWidget):
         top.addWidget(self.state_chip)
         top.addStretch()
         layout.addLayout(top)
+        self.found_banner = QLabel()
+        self.found_banner.setWordWrap(True)
+        self.found_banner.setTextFormat(Qt.RichText)
+        self.found_banner.setStyleSheet(
+            "background:#D7F3EF; color:#08655F; border:1px solid #0C9C93;"
+            "border-radius:8px; padding:10px 12px; font-size:14px;"
+        )
+        self.found_banner.hide()
+        layout.addWidget(self.found_banner)
+        self._found: list[str] = []
 
         section = QLabel("1. Nadchodzący atak")
         section.setObjectName("sectionTitle")
@@ -3706,7 +3719,7 @@ class ScoutWidget(QWidget):
         self.attacks_table = QTableWidget(0, len(self.ATTACK_COLUMNS))
         self.attacks_table.setHorizontalHeaderLabels(list(self.ATTACK_COLUMNS))
         DashboardWidget._configure_table(self.attacks_table)
-        self.attacks_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.attacks_table.setSelectionMode(QTableWidget.ExtendedSelection)
         header = self.attacks_table.horizontalHeader()
         for column in range(len(self.ATTACK_COLUMNS)):
             header.setSectionResizeMode(column, QHeaderView.Interactive)
@@ -3716,6 +3729,28 @@ class ScoutWidget(QWidget):
         self.attacks_table.setMinimumHeight(170)
         self.attacks_table.itemSelectionChanged.connect(self._on_attack_selected)
         layout.addWidget(self.attacks_table)
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(QLabel("Atakujący ręcznie — wioska (x|y):"))
+        self.manual_coordinates = QLineEdit()
+        self.manual_coordinates.setPlaceholderText("np. -34|29")
+        self.manual_coordinates.setFixedWidth(120)
+        self.manual_coordinates.returnPressed.connect(self._request_manual_attacker)
+        manual_row.addWidget(self.manual_coordinates)
+        manual_button = QPushButton("Dodaj atakującego")
+        manual_button.clicked.connect(self._request_manual_attacker)
+        manual_row.addWidget(manual_button)
+        remove_manual = QPushButton("Usuń ręcznego atakującego")
+        remove_manual.clicked.connect(self._remove_manual_attacker)
+        manual_row.addWidget(remove_manual)
+        manual_row.addStretch()
+        layout.addLayout(manual_row)
+        manual_hint = QLabel(
+            "Gracza i plemię aplikacja odczyta z gry. Ręcznie dodani atakujący, ich "
+            "jednostka, oblężenie, zakres PT i czas wejścia zapisują się na stałe."
+        )
+        manual_hint.setObjectName("footnote")
+        manual_hint.setWordWrap(True)
+        layout.addWidget(manual_hint)
 
         section = QLabel("2. Ustawienia zwiadu dla wybranego ataku")
         section.setObjectName("sectionTitle")
@@ -3745,6 +3780,15 @@ class ScoutWidget(QWidget):
         form.addLayout(pt_row, 1, 1)
         form.addWidget(QLabel("Domyślnie ± od wyliczonego PT:"), 1, 2)
         form.addWidget(self.spread_spin, 1, 3)
+        self.attacker_arrival = QLineEdit()
+        self.attacker_arrival.setPlaceholderText("dd.mm.rrrr gg:mm:ss")
+        self.attacker_arrival.setFixedWidth(170)
+        self.attacker_arrival.setToolTip(
+            "Czas wejścia ataku ręcznego atakującego — używany dla celów "
+            "bez własnego czasu dotarcia."
+        )
+        form.addWidget(QLabel("Czas wejścia atakującego:"), 3, 0)
+        form.addWidget(self.attacker_arrival, 3, 1)
         form.addWidget(QLabel("Zwiad wysyła wioska:"), 2, 0)
         form.addWidget(self.scout_village, 2, 1)
         form.addWidget(QLabel("Zwiadowców na wysyłkę:"), 2, 2)
@@ -3754,6 +3798,13 @@ class ScoutWidget(QWidget):
         self.spread_spin.valueChanged.connect(
             lambda value: self.setting_changed.emit("pt_spread", value)
         )
+        # Remember the choices of a selected manual attacker.
+        self._selecting = False
+        self.unit_combo.currentIndexChanged.connect(lambda _i: self._store_manual_choices())
+        self.siege_checkbox.toggled.connect(lambda _v: self._store_manual_choices())
+        self.pt_from.valueChanged.connect(lambda _v: self._store_manual_choices())
+        self.pt_to.valueChanged.connect(lambda _v: self._store_manual_choices())
+        self.attacker_arrival.editingFinished.connect(self._store_manual_choices)
         self.scouts_spin.valueChanged.connect(
             lambda value: self.setting_changed.emit("scouts_per_send", value)
         )
@@ -3784,6 +3835,16 @@ class ScoutWidget(QWidget):
         remove_button.clicked.connect(self._remove_target)
         buttons.addWidget(remove_button)
         buttons.addStretch()
+        selected_button = QPushButton("Zaplanuj dla zaznaczonych")
+        selected_button.setToolTip(
+            "Planuje zwiad dla wszystkich zaznaczonych atakujących (Ctrl/Shift), "
+            "każdego według jego zapisanych ustawień."
+        )
+        selected_button.clicked.connect(lambda: self._request_plan_many(selected_only=True))
+        buttons.addWidget(selected_button)
+        all_button = QPushButton("Zaplanuj dla wszystkich")
+        all_button.clicked.connect(lambda: self._request_plan_many(selected_only=False))
+        buttons.addWidget(all_button)
         self.plan_button = QPushButton("Zaplanuj zwiad")
         self.plan_button.setObjectName("primaryButton")
         self.plan_button.clicked.connect(self._request_plan)
@@ -3791,7 +3852,8 @@ class ScoutWidget(QWidget):
         layout.addLayout(buttons)
         hint = QLabel(
             "Pusty czas dotarcia = czas wybranego ataku (ataki jednej operacji "
-            "zwykle wchodzą razem). Cele zapisują się na stałe, czasy nie."
+            "zwykle wchodzą razem); dla ręcznego atakującego czas jest wymagany. "
+            "Cele zapisują się na stałe, czasy nie."
         )
         hint.setObjectName("footnote")
         hint.setWordWrap(True)
@@ -3845,8 +3907,52 @@ class ScoutWidget(QWidget):
         self._loading_targets = True
         self.targets_table.setRowCount(0)
         for target in settings.targets:
-            self._add_target_row(target.name, target.x, target.y, None, emit=False)
+            self._add_target_row(target.name, target.x, target.y, target.arrival or None, emit=False)
         self._loading_targets = False
+        self._manual = [self._manual_entry(attacker.model_dump()) for attacker in settings.attackers]
+        self.update_attacks(self._incoming)
+
+    @staticmethod
+    def _manual_entry(saved: dict) -> dict:
+        arrival = None
+        if saved.get("arrival"):
+            arrival = datetime.strptime(saved["arrival"], "%d.%m.%Y %H:%M:%S").timestamp()
+        return {
+            "key": f"manual:{saved['id']}", "manual": True, "saved": dict(saved),
+            "attacker_name": saved.get("name") or "?",
+            "attacker_player_id": saved.get("player_id") or "",
+            "source_village": saved.get("village_name") or "",
+            "source_village_id": saved.get("village_id") or "",
+            "source_xy": (saved["x"], saved["y"]), "target_xy": None,
+            "village_name": "(ręcznie)", "arrival_time": arrival,
+            "movement_type": "Oblężenie" if saved.get("siege", True) else "Atak",
+            "tribe_id": saved.get("tribe_id") or 0, "tournament_square": "—",
+            "hero_xp": saved.get("hero_xp"),
+        }
+
+    def _emit_attackers(self):
+        self.setting_changed.emit("attackers", [entry["saved"] for entry in self._manual])
+
+    def _store_manual_choices(self):
+        attack = self.selected_attack()
+        if self._selecting or attack is None or not attack.get("manual"):
+            return
+        saved = attack["saved"]
+        if self.unit_combo.currentData() is not None:
+            saved["unit"] = int(self.unit_combo.currentData()[0])
+        saved["siege"] = self.siege_checkbox.isChecked()
+        saved["pt_from"], saved["pt_to"] = sorted((self.pt_from.value(), self.pt_to.value()))
+        text = self.attacker_arrival.text().strip()
+        try:
+            arrival = datetime.strptime(text, "%d.%m.%Y %H:%M:%S").timestamp() if text else None
+        except ValueError:
+            QMessageBox.warning(self, "Zwiad", "Czas wejścia w formacie dd.mm.rrrr gg:mm:ss.")
+            return
+        saved["arrival"] = text
+        attack["arrival_time"] = arrival
+        attack["movement_type"] = "Oblężenie" if saved["siege"] else "Atak"
+        self._emit_attackers()
+        self.update_attacks(self._incoming)
 
     def set_state(self, text: str, kind: str):
         _set_status_chip(self.state_chip, text, kind)
@@ -3855,6 +3961,22 @@ class ScoutWidget(QWidget):
         self.log_list.insertItem(0, f"{datetime.now():%d.%m %H:%M:%S}  {text}")
         while self.log_list.count() > 300:
             self.log_list.takeItem(self.log_list.count() - 1)
+
+    @staticmethod
+    def found_text(result: dict) -> str:
+        kind = "OBLĘŻENIE" if result.get("siege") else "ATAK"
+        return (
+            f"{kind} Z BOHATEREM: {result['attacker']} → {result['target']} "
+            f"(PT {result['level']}, {result.get('unit', '')}, wyjście wojsk "
+            f"{datetime.fromtimestamp(result['departure']):%d.%m %H:%M:%S})"
+        )
+
+    def add_found(self, result: dict):
+        self._found.insert(0, self.found_text(result))
+        self.found_banner.setText(
+            "<b>Prawdziwy cel znaleziony</b><br>" + "<br>".join(self._found[:6])
+        )
+        self.found_banner.show()
 
     # ------------------------------------------------------------ attacks
     def set_context(self, villages: list[dict], speeds: dict[int, dict[int, float]]):
@@ -3872,11 +3994,57 @@ class ScoutWidget(QWidget):
         if index >= 0:
             self.scout_village.setCurrentIndex(index)
         self.scout_village.blockSignals(False)
+        self._on_attack_selected()
+
+    def _request_manual_attacker(self):
+        text = self.manual_coordinates.text().strip().strip("()").replace(" ", "")
+        parts = text.replace(",", "|").replace(";", "|").split("|")
+        try:
+            x, y = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            QMessageBox.warning(self, "Zwiad", "Wpisz współrzędne wioski jako x|y, np. -34|29.")
+            return
+        self.manual_attacker_requested.emit(x, y)
+
+    def add_manual_attacker(self, village: dict, x: int, y: int):
+        import uuid
+
+        saved = {
+            "id": uuid.uuid4().hex[:12], "name": village.get("player_name") or "",
+            "village_name": village.get("village_name") or "", "x": x, "y": y,
+            "player_id": village["player_id"], "village_id": village["village_id"],
+            "tribe_id": int(village.get("tribe_id") or 0), "unit": 7, "siege": True,
+            "pt_from": 0, "pt_to": 20, "arrival": "",
+        }
+        entry = self._manual_entry(saved)
+        key = entry["key"]
+        self._manual.append(entry)
+        self._emit_attackers()
+        self.update_attacks(self._incoming)
+        for row, attack in enumerate(self._attacks):
+            if attack["key"] == key:
+                self.attacks_table.selectRow(row)
+
+    def set_manual_hero_xp(self, key: str, xp: int):
+        for entry in self._manual:
+            if entry["key"] == key or entry.get("source_village_id") == key.split(":")[-1]:
+                entry["hero_xp"] = xp
+        self.update_attacks(self._incoming)
+
+    def _remove_manual_attacker(self):
+        attack = self.selected_attack()
+        if attack is None or not attack.get("manual"):
+            QMessageBox.information(self, "Zwiad", "Zaznacz ręcznie dodanego atakującego.")
+            return
+        self._manual = [entry for entry in self._manual if entry["key"] != attack["key"]]
+        self._emit_attackers()
+        self.update_attacks(self._incoming)
 
     def update_attacks(self, attacks: list[dict]):
         selected = self.selected_attack()
         selected_key = selected["key"] if selected else None
-        self._attacks = [a for a in attacks if not a.get("robber")]
+        self._incoming = list(attacks)
+        self._attacks = self._manual + [a for a in attacks if not a.get("robber")]
         self.attacks_table.blockSignals(True)
         self.attacks_table.setRowCount(len(self._attacks))
         for row, attack in enumerate(self._attacks):
@@ -3887,8 +4055,12 @@ class ScoutWidget(QWidget):
                 f"{attack.get('source_village', '')} "
                 + (f"({source[0]}|{source[1]})" if source else ""),
                 attack.get("village_name", ""),
-                f"{datetime.fromtimestamp(attack['arrival_time']):%d.%m %H:%M:%S}",
-                attack.get("movement_type", ""),
+                (
+                    f"{datetime.fromtimestamp(attack['arrival_time']):%d.%m %H:%M:%S}"
+                    if attack.get("arrival_time") else "—"
+                ),
+                (f"ręcznie · {attack.get('movement_type', '')}" if attack.get("manual")
+                 else attack.get("movement_type", "")),
                 attack.get("tournament_square") or "—",
                 "—" if xp is None else f"{xp:,}".replace(",", " "),
             )
@@ -3912,6 +4084,13 @@ class ScoutWidget(QWidget):
         attack = self.selected_attack()
         if attack is None:
             return
+        self._selecting = True
+        try:
+            self._apply_attack_selection(attack)
+        finally:
+            self._selecting = False
+
+    def _apply_attack_selection(self, attack: dict):
         tribe = int(attack.get("tribe_id") or 0)
         speeds = self._speeds.get(tribe, {})
         names = UNIT_NAMES.get(tribe, {})
@@ -3936,6 +4115,17 @@ class ScoutWidget(QWidget):
             self.pt_from.setValue(0)
             self.pt_to.setValue(20)
         self.siege_checkbox.setChecked(attack.get("movement_type") == "Oblężenie")
+        self.attacker_arrival.setText("")
+        self.attacker_arrival.setEnabled(bool(attack.get("manual")))
+        if attack.get("manual"):
+            saved = attack["saved"]
+            for index in range(self.unit_combo.count()):
+                if self.unit_combo.itemData(index)[0] == int(saved.get("unit") or 7):
+                    self.unit_combo.setCurrentIndex(index)
+            self.siege_checkbox.setChecked(bool(saved.get("siege", True)))
+            self.pt_from.setValue(int(saved.get("pt_from") or 0))
+            self.pt_to.setValue(int(saved.get("pt_to", 20)))
+            self.attacker_arrival.setText(saved.get("arrival") or "")
         source = attack.get("source_xy")
         if source and self._villages:
             nearest = min(
@@ -3951,10 +4141,13 @@ class ScoutWidget(QWidget):
         self._loading_targets = True
         row = self.targets_table.rowCount()
         self.targets_table.insertRow(row)
-        for column, value in enumerate((
-            name, str(x), str(y),
-            "" if arrival is None else f"{datetime.fromtimestamp(arrival):%d.%m.%Y %H:%M:%S}",
-        )):
+        if arrival is None:
+            arrival_text = ""
+        elif isinstance(arrival, str):
+            arrival_text = arrival
+        else:
+            arrival_text = f"{datetime.fromtimestamp(arrival):%d.%m.%Y %H:%M:%S}"
+        for column, value in enumerate((name, str(x), str(y), arrival_text)):
             self.targets_table.setItem(row, column, QTableWidgetItem(value))
         self._loading_targets = False
         if emit:
@@ -3965,7 +4158,12 @@ class ScoutWidget(QWidget):
         if attack is None:
             QMessageBox.information(self, "Zwiad", "Najpierw wybierz atak z listy.")
             return
-        target = attack.get("target_xy") or (0, 0)
+        if attack.get("manual") or not attack.get("target_xy"):
+            QMessageBox.information(
+                self, "Zwiad", "Dla ręcznego atakującego dodaj cele przyciskiem „Dodaj cel”.",
+            )
+            return
+        target = attack["target_xy"]
         self._add_target_row(attack.get("village_name", "Cel"), target[0], target[1],
                              attack["arrival_time"])
 
@@ -3983,16 +4181,24 @@ class ScoutWidget(QWidget):
         targets = []
         for row in range(self.targets_table.rowCount()):
             try:
+                arrival_item = self.targets_table.item(row, 3)
+                arrival_text = arrival_item.text().strip() if arrival_item else ""
+                try:
+                    if arrival_text:
+                        datetime.strptime(arrival_text, "%d.%m.%Y %H:%M:%S")
+                except ValueError:
+                    arrival_text = ""      # keep the target, not a half-typed time
                 targets.append({
                     "name": self.targets_table.item(row, 0).text().strip() or f"Cel {row + 1}",
                     "x": int(self.targets_table.item(row, 1).text()),
                     "y": int(self.targets_table.item(row, 2).text()),
+                    "arrival": arrival_text,
                 })
             except (AttributeError, ValueError):
                 continue
         self.setting_changed.emit("targets", targets)
 
-    def targets(self, default_arrival: float) -> list[tuple[str, int, int, float]]:
+    def targets(self, default_arrival: float | None) -> list[tuple[str, int, int, float]]:
         result = []
         for row in range(self.targets_table.rowCount()):
             try:
@@ -4010,6 +4216,8 @@ class ScoutWidget(QWidget):
                     raise ValueError(
                         f"Cel „{name}”: czas dotarcia w formacie dd.mm.rrrr gg:mm:ss."
                     )
+            if arrival is None:
+                raise ValueError(f"Cel „{name}”: podaj czas dotarcia (dd.mm.rrrr gg:mm:ss).")
             result.append((name, x, y, arrival))
         return result
 
@@ -4023,7 +4231,9 @@ class ScoutWidget(QWidget):
             QMessageBox.information(self, "Zwiad", "Brak danych o jednostkach atakującego.")
             return
         try:
-            targets = self.targets(float(attack["arrival_time"]))
+            targets = self.targets(
+                float(attack["arrival_time"]) if attack.get("arrival_time") else None
+            )
         except ValueError as error:
             QMessageBox.warning(self, "Zwiad", str(error))
             return
@@ -4044,6 +4254,76 @@ class ScoutWidget(QWidget):
             "scouts_per_send": self.scouts_spin.value(),
         })
 
+    def selected_attacks(self) -> list[dict]:
+        rows = sorted({item.row() for item in self.attacks_table.selectedItems()})
+        return [self._attacks[row] for row in rows if row < len(self._attacks)]
+
+    def _nearest_scout_village(self, source) -> str | None:
+        villages = [v for v in self._villages if v.get("scouts", 0) > 0]
+        if not villages or not source:
+            return self.scout_village.currentData()
+        return min(
+            villages, key=lambda v: (v["x"] - source[0]) ** 2 + (v["y"] - source[1]) ** 2,
+        )["id"]
+
+    def _plan_request_for(self, attack: dict) -> dict:
+        """A plan request from an attacker's own saved settings (or estimate)."""
+        tribe = int(attack.get("tribe_id") or 0)
+        speeds = self._speeds.get(tribe, {})
+        names = UNIT_NAMES.get(tribe, {})
+        if attack.get("manual"):
+            saved = attack["saved"]
+            unit = int(saved.get("unit") or 7)
+            siege = bool(saved.get("siege", True))
+            low, high = sorted((int(saved.get("pt_from") or 0), int(saved.get("pt_to", 20))))
+        else:
+            best = None
+            for level, units in (attack.get("square_levels") or {}).items():
+                for candidate in units:
+                    speed = speeds.get(int(candidate))
+                    if speed and (best is None or speed < best[2]):
+                        best = (int(level), int(candidate), speed)
+            if best is None:
+                raise ValueError("brak wyceny jednostki i PT — zaplanuj go pojedynczo")
+            spread = self.spread_spin.value()
+            unit, low, high = best[1], max(0, best[0] - spread), min(20, best[0] + spread)
+            siege = attack.get("movement_type") == "Oblężenie"
+        speed = speeds.get(unit)
+        if not speed:
+            raise ValueError("brak prędkości jednostki (poczekaj na odczyt danych gry)")
+        targets = self.targets(float(attack["arrival_time"]) if attack.get("arrival_time") else None)
+        if not targets:
+            raise ValueError("dodaj przynajmniej jeden możliwy cel")
+        return {
+            "attack": attack, "unit": unit,
+            "unit_label": f"{names.get(unit, unit)} ({speed:g} pól/h)", "speed": speed,
+            "siege": siege, "levels": list(range(low, high + 1)), "targets": targets,
+            "scout_village_id": self._nearest_scout_village(attack.get("source_xy")),
+            "scouts_per_send": self.scouts_spin.value(),
+        }
+
+    def _request_plan_many(self, selected_only: bool):
+        attacks = self.selected_attacks() if selected_only else list(self._attacks)
+        if not attacks:
+            QMessageBox.information(
+                self, "Zwiad",
+                "Zaznacz atakujących (Ctrl/Shift)." if selected_only else "Brak atakujących.",
+            )
+            return
+        problems = []
+        planned = 0
+        for attack in attacks:
+            try:
+                request = self._plan_request_for(attack)
+            except ValueError as error:
+                problems.append(f"{attack.get('attacker_name', '?')}: {error}")
+                continue
+            self.plan_requested.emit(request)
+            planned += 1
+        self.add_log(f"Planuję zwiad dla {planned} atakujących.")
+        if problems:
+            QMessageBox.warning(self, "Zwiad", "Pominięto:\n" + "\n".join(problems))
+
     def _request_cancel(self):
         rows = {item.row() for item in self.plan_table.selectedItems()}
         if not rows:
@@ -4058,7 +4338,8 @@ class ScoutWidget(QWidget):
 
         verdict_labels = {
             "left": "BOHATER WYSZEDŁ — prawdziwy cel",
-            "home": "bohater w domu",
+            "home": "bohater był i został",
+            "absent": "bohatera nie było w wiosce",
             "unknown": "bez wniosku",
         }
         self.plan_table.setRowCount(len(rows))
@@ -4067,6 +4348,8 @@ class ScoutWidget(QWidget):
             xp_text = " / ".join(
                 "—" if xp.get(offset) is None else str(xp.get(offset)) for offset in (-3, 0, 2)
             )
+            if all(xp.get(offset) is not None for offset in (-3, 0, 2)):
+                xp_text += f"  (+{xp[0] - xp[-3]}, +{xp[2] - xp[0]}; para ≈ {row.get('pair_xp', 0)})"
             result = verdict_labels.get(row["verdict"], "")
             if not result:
                 result = {"aktywna": "czeka", "anulowana": "anulowana",
@@ -4653,6 +4936,9 @@ class MainWindow(QMainWindow):
     scout_log_message = Signal(str)
     hero_xp_read = Signal(str, object)
     scout_context_ready = Signal(object, object)
+    manual_attacker_resolved = Signal(object, int, int)
+    manual_attacker_xp = Signal(str, int)
+    scout_found = Signal(object)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -4757,6 +5043,9 @@ class MainWindow(QMainWindow):
         self.scout_log_message.connect(self.scout_tab.add_log)
         self.hero_xp_read.connect(self._on_hero_xp_read)
         self.scout_context_ready.connect(self.scout_tab.set_context)
+        self.manual_attacker_resolved.connect(self._on_manual_attacker_resolved)
+        self.manual_attacker_xp.connect(self.scout_tab.set_manual_hero_xp)
+        self.scout_found.connect(self._on_scout_found)
         self.scout_timer = QTimer(self)
         self.scout_timer.setInterval(1000)
         self.scout_timer.timeout.connect(self._scout_tick)
@@ -4932,6 +5221,7 @@ class MainWindow(QMainWindow):
         self.scout_tab.setting_changed.connect(self._set_scout_setting)
         self.scout_tab.plan_requested.connect(self._plan_scouting)
         self.scout_tab.cancel_requested.connect(self._cancel_scouting)
+        self.scout_tab.manual_attacker_requested.connect(self._resolve_manual_attacker)
         self.content_tabs.addTab(self.scout_tab, "Zwiad")
 
         self.kingdom_tab = KingdomWidget()
@@ -6336,6 +6626,7 @@ class MainWindow(QMainWindow):
             GameAttackBridge(self.browser_session),
             lambda: self.settings.scout,
             self.scout_log_message.emit,
+            on_found=self.scout_found.emit,
         )
         self.scout_timer.start()
         self.scout_tab.set_state("Połączono z grą", "active")
@@ -6365,8 +6656,65 @@ class MainWindow(QMainWindow):
             self.scout_context_ready.emit(
                 villages, {t: self._attacker_unit_speeds(t) for t in (1, 2, 3)},
             )
+            bridge = GameAttackBridge(self.browser_session) if self.browser_session else None
+            seen = {}
+            for attacker in list(self.settings.scout.attackers):
+                if bridge is None or not attacker.player_id:
+                    continue
+                try:
+                    if attacker.player_id not in seen:
+                        seen[attacker.player_id] = read_hero_xp(bridge, attacker.player_id)["xp"]
+                    self.manual_attacker_xp.emit(f"manual:{attacker.id}", seen[attacker.player_id])
+                except Exception as error:
+                    logger.warning("Could not read hero XP of %s: %s", attacker.name, error)
 
         threading.Thread(target=run, daemon=True, name="scout-context").start()
+
+    def _on_scout_found(self, result: dict):
+        """Make a found real target impossible to miss."""
+        self.scout_tab.add_found(result)
+        QApplication.beep()
+        QApplication.alert(self, 0)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Zwiad — prawdziwy cel")
+        box.setText(ScoutWidget.found_text(result))
+        xp = result.get("xp") or {}
+        box.setInformativeText(
+            f"EXP bohatera: {xp.get(-3)} → {xp.get(0)} → {xp.get(2)} — po pierwszej "
+            "parze zwiadu wzrósł, po drugiej już nie: bohater wyszedł z wojskiem."
+        )
+        box.setModal(False)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.show()
+
+    def _resolve_manual_attacker(self, x: int, y: int):
+        session = self.browser_session
+        if session is None:
+            QMessageBox.information(self, "Zwiad", "Najpierw połącz się z grą.")
+            return
+
+        def run():
+            try:
+                village = session.resolve_village(x, y)
+            except Exception as error:
+                self.scout_log_message.emit(f"Nie znaleziono atakującego: {error}")
+                return
+            self.manual_attacker_resolved.emit(village, x, y)
+            try:
+                xp = read_hero_xp(GameAttackBridge(session), village["player_id"])["xp"]
+                self.manual_attacker_xp.emit(f"manual:{village['village_id']}", xp)
+            except Exception as error:
+                self.scout_log_message.emit(f"Nie odczytano EXP bohatera: {error}")
+
+        threading.Thread(target=run, daemon=True, name="scout-manual").start()
+
+    def _on_manual_attacker_resolved(self, village, x: int, y: int):
+        self.scout_tab.add_manual_attacker(village, x, y)
+        self.scout_tab.add_log(
+            f"Dodano atakującego {village.get('player_name')} — "
+            f"{village.get('village_name')} ({x}|{y})."
+        )
 
     def _refresh_scout_attacks(self):
         attacks = []

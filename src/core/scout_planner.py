@@ -34,10 +34,12 @@ XP_READ_OFFSETS = (-3, 0, 2)
 VERDICT_LEFT = "left"
 VERDICT_HOME = "home"
 VERDICT_UNKNOWN = "unknown"
+VERDICT_ABSENT = "absent"
 VERDICT_LABELS = {
     VERDICT_LEFT: "BOHATER WYSZEDŁ — prawdziwy cel",
-    VERDICT_HOME: "bohater w domu — nie ten cel/PT",
-    VERDICT_UNKNOWN: "bez wniosku (EXP nie wzrósł po pierwszej parze)",
+    VERDICT_HOME: "bohater był i został — nie ten cel/PT",
+    VERDICT_ABSENT: "bohatera nie było w wiosce",
+    VERDICT_UNKNOWN: "bez wniosku (EXP wzrósł dopiero po drugiej parze)",
 }
 
 
@@ -110,9 +112,14 @@ def judge(xp: dict[int, int | None]) -> str | None:
     before, middle, after = (xp.get(offset) for offset in XP_READ_OFFSETS)
     if before is None or middle is None or after is None:
         return None
-    if middle <= before:
-        return VERDICT_UNKNOWN
-    return VERDICT_HOME if after > middle else VERDICT_LEFT
+    first, second = middle - before, after - middle
+    if first <= 0 and second <= 0:
+        return VERDICT_ABSENT          # nobody killed the scouts
+    if first > 0 and second <= 0:
+        return VERDICT_LEFT            # killed the first pair, gone for the second
+    if first > 0 and second > 0:
+        return VERDICT_HOME            # killed both pairs: stayed home
+    return VERDICT_UNKNOWN
 
 
 def level_range(estimate: int | None, spread: int, maximum: int = 20) -> list[int]:

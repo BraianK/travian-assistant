@@ -1531,6 +1531,49 @@ class TravianBrowserSession:
             raise RuntimeError("The game server time is unavailable.")
         return float(value)
 
+    def resolve_village(self, x: int, y: int) -> dict:
+        """Village at (x|y) with its owner and tribe, from the game's models."""
+        if self._tab is None:
+            raise RuntimeError("Not connected to Chrome.")
+        village_id = int(x) + 16384 + 32768 * (int(y) + 16384)
+        expression = """(async (villageId) => {
+            const rootScope = angular.element(document.body).injector().get("$rootScope");
+            const village = Village.get(villageId);
+            if (!rootScope.$$phase) rootScope.$apply();
+            for (let i = 0; i < 30 && !(village.data && village.data.playerId); i++) {
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+            const data = village.data || {};
+            if (!data.playerId) return null;
+            const player = Player.get(String(data.playerId));
+            for (let i = 0; i < 20 && !(player.data && player.data.name); i++) {
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+            return {
+                village_id: String(villageId), village_name: String(data.name || ""),
+                player_id: String(data.playerId),
+                player_name: String((player.data && player.data.name) || ""),
+                tribe_id: Number(data.tribeId || (player.data && player.data.tribeId)) || 0
+            };
+        })"""
+        result = self._tab.call_method(
+            "Runtime.evaluate",
+            expression=f"({expression})({village_id})",
+            returnByValue=True,
+            awaitPromise=True,
+            _timeout=15,
+        )
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict) or not str(value.get("player_id") or "").isdigit():
+            raise RuntimeError(f"Na ({x}|{y}) nie ma wioski gracza.")
+        return {
+            "village_id": str(value["village_id"]),
+            "village_name": str(value.get("village_name") or ""),
+            "player_id": str(value["player_id"]),
+            "player_name": str(value.get("player_name") or ""),
+            "tribe_id": int(_finite_number(value.get("tribe_id")) or 0),
+        }
+
     def read_unit_speeds(self) -> dict[int, dict[int, float]]:
         """Unit speeds (fields/hour, world speed included) for tribes 1-3."""
         if self._tab is None:
@@ -1963,8 +2006,15 @@ class TravianBrowserSession:
                 if (configured === 20) return [20, 30];
                 if (configured === 25 || configured === 26) return [25, 26];
                 if (buildingTypes.includes(configured)) return [configured];
+                // The training building is listed in the unit's requirements
+                // (e.g. the Gaul pathfinder needs a stable, not barracks).
+                const required = (troop.requirements || []).map(item =>
+                    Number(item && item.buildingType));
+                if (required.includes(21)) return [21];
+                if (required.includes(20)) return [20, 30];
+                if (required.includes(19)) return [19, 29];
                 const position = (unitType - 1) % 10 + 1;
-                if (position <= 3) return [19, 29];
+                if (position <= 4) return [19, 29];
                 if (position <= 6) return [20, 30];
                 if (position <= 8) return [21];
                 return [25, 26];

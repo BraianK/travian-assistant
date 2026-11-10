@@ -6,6 +6,7 @@ import unittest
 from src.config.settings import ScoutSettings
 from src.core.scout_automation import ScoutAutomation
 from src.core.scout_planner import (
+    VERDICT_ABSENT,
     VERDICT_HOME,
     VERDICT_LEFT,
     VERDICT_UNKNOWN,
@@ -49,7 +50,8 @@ class PlannerTests(unittest.TestCase):
         self.assertIsNone(judge({-3: 100, 0: 110}))
         self.assertEqual(VERDICT_LEFT, judge({-3: 100, 0: 110, 2: 110}))
         self.assertEqual(VERDICT_HOME, judge({-3: 100, 0: 110, 2: 125}))
-        self.assertEqual(VERDICT_UNKNOWN, judge({-3: 100, 0: 100, 2: 100}))
+        self.assertEqual(VERDICT_ABSENT, judge({-3: 100, 0: 100, 2: 100}))
+        self.assertEqual(VERDICT_UNKNOWN, judge({-3: 100, 0: 100, 2: 104}))
 
     def test_level_range(self):
         self.assertEqual([9, 10, 11], level_range(10, 1))
@@ -92,6 +94,8 @@ class FakeBridge:
         return "b" * 32, {"status": "fired"}
 
     def _evaluate(self, expression, **kwargs):
+        if "supply" in expression:
+            return 2
         return {"xp": self.xp_values.pop(0), "level": 30}
 
 
@@ -103,8 +107,9 @@ class AutomationTests(unittest.TestCase):
         bridge = FakeBridge([100, 110, 125, 125, 135, 135])
         timer = FakeTimer()
         logs = []
+        found = []
         automation = ScoutAutomation(bridge, lambda: settings, logs.append,
-                                     clock=lambda: now[0], timer=timer)
+                                     clock=lambda: now[0], timer=timer, on_found=found.append)
         operation = automation.create_operation(
             attack_key="1:9", attacker_id="777", attacker_name="KunS",
             source_village_id="537001000", source=(-34, 29), unit_label="Taran",
@@ -122,7 +127,45 @@ class AutomationTests(unittest.TestCase):
         verdicts = [c.verdict for c in operation.candidates]
         self.assertEqual([VERDICT_HOME, VERDICT_LEFT], verdicts)
         self.assertEqual("Jessica, PT 11", operation.found)
+        self.assertEqual(4, operation.pair_xp)  # 2 pathfinders x 2 crop
+        self.assertEqual(1, len(found))
+        self.assertEqual(("Jessica", 11, True), (found[0]["target"], found[0]["level"], found[0]["siege"]))
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.app import ScoutWidget
+        QApplication.instance() or QApplication([])
+        widget = ScoutWidget()
+        widget.add_found(found[0])
+        self.assertIn("OBLĘŻENIE Z BOHATEREM: KunS → Jessica (PT 11", widget.found_banner.text())
         self.assertTrue(any("BOHATER WYSZEDŁ" in line for line in logs))
+
+    def test_planning_again_replaces_instead_of_duplicating(self):
+        settings = ScoutSettings(enabled=False)
+        bridge = FakeBridge([])
+        logs = []
+        automation = ScoutAutomation(bridge, lambda: settings, logs.append,
+                                     clock=lambda: 900_000.0, timer=FakeTimer())
+
+        def plan(levels):
+            return automation.create_operation(
+                attack_key="manual:ivi01", attacker_id="777", attacker_name="KunS",
+                source_village_id="537001000", source=(-34, 29), unit_label="Taran",
+                unit_speed=8.0, siege=True, levels=levels,
+                targets=[ScoutTarget("Jessica", 30, 35, 1_000_000)],
+                scout_village_id="101", scout_unit=3, scouts_per_send=2,
+            )
+
+        plan([10, 11])
+        second = plan([9, 10, 11])
+        self.assertEqual([second], automation.operations)
+        self.assertEqual(3, len(automation.rows()))
+        self.assertTrue(any("zastąpiony" in line for line in logs))
+
+        # Once scouts left, the plan is not silently replaced.
+        second.candidates[0].send_status[0] = "wysłany"
+        with self.assertRaises(RuntimeError):
+            plan([10])
+        self.assertEqual([second], automation.operations)
 
     def test_disabled_does_not_send(self):
         settings = ScoutSettings(enabled=False)
@@ -177,6 +220,88 @@ class WidgetTests(unittest.TestCase):
             [("RejeZ stolica", 5, 6, 1_000_000.0), ("Jessica", 30, 35, 1_000_000.0)],
             request["targets"],
         )
+
+
+class ManualAttackerTests(unittest.TestCase):
+    def test_manual_attacker_with_several_targets(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from datetime import datetime
+        from unittest.mock import patch
+        from PySide6.QtWidgets import QApplication
+
+        from src.app import ScoutWidget
+
+        QApplication.instance() or QApplication([])
+        widget = ScoutWidget()
+        widget.load_settings(ScoutSettings(targets=[
+            {"name": "Jessica", "x": 30, "y": 35}, {"name": "RejeZ stolica", "x": 5, "y": 6},
+        ]))
+        widget.set_context([{"id": "101", "name": "Aden", "x": -1, "y": 34, "scouts": 20}],
+                           {2: {1: 14.0, 7: 8.0, 8: 6.0}})
+        widget.update_attacks([])
+        widget.add_manual_attacker({"village_id": "537837534", "village_name": "00 TheKunS",
+                                    "player_id": "131", "player_name": "TheKunS",
+                                    "tribe_id": 2}, -34, 29)
+        attack = widget.selected_attack()
+        self.assertEqual("TheKunS", attack["attacker_name"])
+        self.assertEqual(7, widget.unit_combo.currentData()[0])      # ram
+        self.assertTrue(widget.siege_checkbox.isChecked())
+        requests = []
+        widget.plan_requested.connect(requests.append)
+        with patch("src.app.QMessageBox.warning") as warning:
+            widget._request_plan()                                   # no arrival times yet
+        self.assertEqual([], requests)
+        self.assertIn("podaj czas dotarcia", warning.call_args[0][2])
+        from PySide6.QtWidgets import QTableWidgetItem
+        widget.targets_table.setItem(0, 3, QTableWidgetItem("10.11.2026 06:59:59"))
+        widget.targets_table.setItem(1, 3, QTableWidgetItem("10.11.2026 07:00:00"))
+        widget._request_plan()
+        request = requests[0]
+        self.assertEqual("131", request["attack"]["attacker_player_id"])
+        self.assertEqual("537837534", request["attack"]["source_village_id"])
+        self.assertEqual(
+            [datetime(2026, 11, 10, 6, 59, 59).timestamp(), datetime(2026, 11, 10, 7).timestamp()],
+            [target[3] for target in request["targets"]],
+        )
+
+
+class PlanManyTests(unittest.TestCase):
+    def test_plan_for_all_uses_each_attackers_saved_settings(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        from src.app import ScoutWidget
+
+        QApplication.instance() or QApplication([])
+        widget = ScoutWidget()
+        base = {"village_name": "v", "player_id": "131", "village_id": "537837534", "tribe_id": 2}
+        widget.load_settings(ScoutSettings(
+            targets=[{"name": "001: Jessica", "x": 30, "y": 35}],
+            attackers=[
+                {**base, "id": "a1", "name": "TheKunS", "x": -34, "y": 29, "unit": 7,
+                 "siege": True, "pt_from": 9, "pt_to": 11, "arrival": "11.11.2026 06:59:59"},
+                {**base, "id": "a2", "name": "Cozo", "x": -47, "y": 8, "unit": 8,
+                 "siege": False, "pt_from": 2, "pt_to": 4, "arrival": "11.11.2026 07:00:00"},
+                {**base, "id": "a3", "name": "Bez czasu", "x": 1, "y": 1},
+            ],
+        ))
+        widget.set_context([{"id": "101", "name": "Dion", "x": -2, "y": 33, "scouts": 276}],
+                           {2: {1: 14.0, 7: 8.0, 8: 6.0}})
+        requests = []
+        widget.plan_requested.connect(requests.append)
+        from unittest.mock import patch
+        with patch("src.app.QMessageBox.warning") as warning:
+            widget._request_plan_many(selected_only=False)
+        self.assertEqual(["TheKunS", "Cozo"], [r["attack"]["attacker_name"] for r in requests])
+        self.assertEqual((7, True, [9, 10, 11]), (requests[0]["unit"], requests[0]["siege"], requests[0]["levels"]))
+        self.assertEqual((8, False, [2, 3, 4]), (requests[1]["unit"], requests[1]["siege"], requests[1]["levels"]))
+        self.assertEqual("101", requests[0]["scout_village_id"])
+        self.assertIn("Bez czasu", warning.call_args[0][2])     # no arrival time -> skipped
+
+        requests.clear()
+        widget.attacks_table.selectRow(1)
+        widget._request_plan_many(selected_only=True)
+        self.assertEqual(["Cozo"], [r["attack"]["attacker_name"] for r in requests])
 
 
 if __name__ == "__main__":
