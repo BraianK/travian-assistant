@@ -27,6 +27,7 @@ try:
         ScoutTarget,
         judge,
         plan_candidates,
+        truce_windows,
     )
 except ModuleNotFoundError:  # pragma: no cover - script fallback
     from core.attack_automation import PreciseTimer
@@ -40,6 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - script fallback
         ScoutTarget,
         judge,
         plan_candidates,
+        truce_windows,
     )
 
 # Aim requests at the middle of the target second (as the attack automation).
@@ -192,11 +194,26 @@ class ScoutAutomation:
             "]; return t ? Number(t.supply) || 0 : 0; })()"
         )
         pair_xp = int(supply or 0) * int(scouts_per_send)
+        now = self.server_now()
+        reachable = plan_candidates(source, targets, unit_speed, levels, siege, scout_travel, now)
+        windows = truce_windows(context.get("truce"), now)
         candidates = plan_candidates(
-            source, targets, unit_speed, levels, siege, scout_travel, self.server_now(),
+            source, targets, unit_speed, levels, siege, scout_travel, now, truce=windows,
         )
+        in_peace = len(reachable) - len(candidates)
         if not candidates:
+            if in_peace:
+                raise RuntimeError(
+                    "wszystkie możliwe wyjścia z tego zakresu PT wypadają w rozejmie "
+                    "nocnym — wtedy nie da się wysłać wojsk ani zwiadu. Sprawdź niższy PT "
+                    "(wcześniejsze wyjście) albo inną jednostkę."
+                )
             raise RuntimeError("Żadne z możliwych wyjść nie jest już do zdążenia ze zwiadem.")
+        if in_peace:
+            self._log(
+                f"Zwiad na {attacker_name}: pominięto {in_peace} wyjść w rozejmie nocnym "
+                "(wtedy nie da się wysłać wojsk ani zwiadu)."
+            )
         needed = len(candidates) * len(SCOUT_OFFSETS) * scouts_per_send
         available = int((village.get("units") or {}).get(str(scout_unit), 0))
         operation = ScoutOperation(

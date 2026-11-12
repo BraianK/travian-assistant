@@ -27,6 +27,7 @@ try:
     from src.config.settings import (
         AppSettings,
         AttackSettings,
+        BuildSettings,
         HideoutDefenseSettings,
         ScoutSettings,
         RecruitmentSettings,
@@ -64,6 +65,7 @@ try:
     from src.core.tktools_client import TkToolsSession
     from src.core.gettertools_client import GetterToolsSession
     from src.core.scout_automation import ScoutAutomation, read_hero_xp
+    from src.core.build_automation import BuildAutomation
     from src.core.scout_planner import ScoutTarget
     from src.core.tournament_square import estimate_levels as estimate_square_levels
     from src.core.attack_operations import SCOUT_UNITS
@@ -86,6 +88,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from config.settings import (
         AppSettings,
         AttackSettings,
+        BuildSettings,
         HideoutDefenseSettings,
         ScoutSettings,
         RecruitmentSettings,
@@ -123,6 +126,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.tktools_client import TkToolsSession
     from core.gettertools_client import GetterToolsSession
     from core.scout_automation import ScoutAutomation, read_hero_xp
+    from core.build_automation import BuildAutomation
     from core.scout_planner import ScoutTarget
     from core.tournament_square import estimate_levels as estimate_square_levels
     from core.attack_operations import SCOUT_UNITS
@@ -495,6 +499,9 @@ _RECRUITMENT_LOCK_EXPIRY_SECONDS = 5 * 60
 _DURATION_MODE_MAX_BATCH = 10_000
 _VACATION_CHECK_INTERVAL_MS = 30 * 1000
 _KINGDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000
+_BUILD_CHECK_INTERVAL_MS = 3 * 60 * 1000
+# A build check running longer than this is considered stuck.
+_BUILD_WORKER_STALL_SECONDS = 4 * 60
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
 DEFAULT_RECRUITMENT_QUEUE_MINUTES = 60
 _NPC_TRADER_ORDER_INTERVAL_MS = 6 * 1000
@@ -3351,6 +3358,958 @@ class HideoutDefenseWidget(QWidget):
             self.log_list.takeItem(self.log_list.count() - 1)
 
 
+def _format_hours(hours: float | None) -> str:
+    if hours is None:
+        return "nigdy (brak produkcji)"
+    if hours <= 0:
+        return "teraz"
+    minutes = round(hours * 60)
+    if minutes < 60:
+        return f"{max(minutes, 1)} min"
+    if hours < 48:
+        return f"{int(hours)} h {round((hours - int(hours)) * 60):02d} min"
+    return f"{hours / 24:.1f} dni"
+
+
+def _format_costs(costs: dict) -> str:
+    return " / ".join(f"{int(costs.get(r, 0)):,}".replace(",", " ") for r in (1, 2, 3, 4))
+
+
+class VillageBuildWidget(QWidget):
+    """Resource-field building plan, automation switch and transfer hints."""
+
+    overflow_unit_changed = Signal(str, int)
+    military_changed = Signal(object)
+    enabled_toggled = Signal(bool)
+    setting_changed = Signal(str, object)
+    village_toggled = Signal(str, bool)
+    refresh_requested = Signal()
+
+    _PLAN_COLUMNS = (
+        "Buduj", "Wioska", "Pola", "Następny krok", "Koszt (D / G / Ż / Z)",
+        "Zwrot", "Gotowe za", "Złoto", "Kolejne kroki",
+    )
+    _MODES = (("off", "Wyłączone"), ("recommend", "Tylko zalecenia"), ("auto", "Automat"))
+    _TRANSFER_COLUMNS = (
+        "Z wioski", "Do wioski", "Surowce (D / G / Ż / Z)", "Kupcy",
+        "Droga", "Bez transportu", "Z transportem", "Po co",
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loading = False
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer_layout.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Budowa wiosek")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Pola surowców rozbudowywane w kolejności najszybszego zwrotu: koszt "
+            "dzielony przez przyrost produkcji na godzinę (po bonusach, minus zboże "
+            "zjadane przez nową populację). Gdy koszt nie mieści się w magazynie lub "
+            "spichlerzu, najpierw rozbudowywany jest magazyn; gdy bilans zboża spadłby "
+            "poniżej zera, najpierw pole zboża. Automat klika jak gracz — w osobnej "
+            "karcie w tle wybiera wioskę i klika poziom pola."
+        )
+        subtitle.setObjectName("secondaryText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 16, 18, 16)
+        status_layout.setSpacing(12)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        self.enabled_toggle = _AutomationToggle()
+        self.enabled_toggle.toggled.connect(self.enabled_toggled.emit)
+        top_row.addWidget(self.enabled_toggle)
+        self.state_chip = QLabel()
+        top_row.addWidget(self.state_chip)
+        top_row.addStretch()
+        self.refresh_button = QPushButton("Odśwież plan")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        top_row.addWidget(self.refresh_button)
+        status_layout.addLayout(top_row)
+
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(10)
+        settings_row.addWidget(QLabel("Stolica do poziomu:"))
+        self.capital_target = QSpinBox()
+        self.capital_target.setRange(1, 20)
+        self.capital_target.valueChanged.connect(
+            lambda value: self._emit("capital_target", value)
+        )
+        settings_row.addWidget(self.capital_target)
+        settings_row.addSpacing(16)
+        settings_row.addWidget(QLabel("Pozostałe wioski do poziomu:"))
+        self.village_target = QSpinBox()
+        self.village_target.setRange(1, 20)
+        self.village_target.setToolTip(
+            "Wioski, które nie są miastami, gra ogranicza do poziomu 10."
+        )
+        self.village_target.valueChanged.connect(
+            lambda value: self._emit("village_target", value)
+        )
+        settings_row.addWidget(self.village_target)
+        settings_row.addSpacing(16)
+        settings_row.addWidget(QLabel("Transport, gdy oszczędza co najmniej:"))
+        self.transfer_minutes = QSpinBox()
+        self.transfer_minutes.setRange(5, 1440)
+        self.transfer_minutes.setSuffix(" min")
+        self.transfer_minutes.valueChanged.connect(
+            lambda value: self._emit("transfer_min_saved_minutes", value)
+        )
+        settings_row.addWidget(self.transfer_minutes)
+        settings_row.addStretch()
+        status_layout.addLayout(settings_row)
+        self.main_building_checkbox = QCheckBox(
+            "Budynek główny najpierw, gdy wioskę ogranicza kolejka budowy"
+        )
+        self.main_building_checkbox.setToolTip(
+            "Gdy budowa pozostałych pól trwa dłużej niż wyprodukowanie surowców na "
+            "nie, budynek główny (krótsze czasy budowy) jest rozbudowywany, dopóki "
+            "skraca budowę pól co najmniej dwa razy bardziej, niż sam trwa."
+        )
+        self.main_building_checkbox.toggled.connect(
+            lambda checked: self._emit("main_building", checked)
+        )
+        status_layout.addWidget(self.main_building_checkbox)
+        self.balance_checkbox = QCheckBox(
+            "Wyceniaj surowce według niedoboru (nadmiar zboża liczy się mniej)"
+        )
+        self.balance_checkbox.setToolTip(
+            "Porównuje udział każdego surowca w kosztach pozostałej rozbudowy z jego "
+            "udziałem w produkcji. Surowiec produkowany w nadmiarze (np. zboże, które "
+            "tylko zapełnia spichlerz) jest wart mniej, a ten, którego brakuje — więcej. "
+            "Gdy handlarz NPC jest ustawiony na Automat, wszystkie surowce liczą się 1:1, "
+            "bo nadwyżkę i tak da się wymienić."
+        )
+        self.balance_checkbox.toggled.connect(
+            lambda checked: self._emit("balance_resources", checked)
+        )
+        status_layout.addWidget(self.balance_checkbox)
+        self.bonus_checkbox = QCheckBox(
+            "Rozbudowuj budynki bonusowe (tartak, cegielnia, huta, młyn, piekarnia)"
+        )
+        self.bonus_checkbox.setToolTip(
+            "Istniejące budynki zwiększające produkcję konkurują z polami według "
+            "czasu zwrotu. Nowych budynków automat nie stawia."
+        )
+        self.bonus_checkbox.toggled.connect(
+            lambda checked: self._emit("bonus_buildings", checked)
+        )
+        status_layout.addWidget(self.bonus_checkbox)
+        self.hero_checkbox = QCheckBox(
+            "Przestawiaj produkcję bohatera na surowiec, którego najbardziej brakuje"
+        )
+        self.hero_checkbox.setToolTip(
+            "Automat porównuje, ile zostało do zbudowania z produkcją wszystkich wiosek, "
+            "i wybiera w oknie bohatera (Atrybuty → Hero production) wszystkie surowce "
+            "albo jeden — ten, który najbardziej skraca czas do celów. Zmienia najwyżej "
+            "co 2 h i tylko przy zysku co najmniej 3%."
+        )
+        self.hero_checkbox.toggled.connect(
+            lambda checked: self._emit("hero_production_auto", checked)
+        )
+        status_layout.addWidget(self.hero_checkbox)
+        raid_row = QHBoxLayout()
+        self.raid_checkbox = QCheckBox("Przed nadchodzącym atakiem zabezpieczaj surowce na")
+        self.raid_checkbox.setToolTip(
+            "Gdy atak lub napad (nie zwiad) dotrze do wioski w tym czasie, automat najpierw "
+            "buduje i rezerwuje u budowniczego, co się da, potem wysyła resztę surowców "
+            "do najbliższych wiosek, które nie są atakowane i mają miejsce w magazynie, "
+            "a czego nie da się wysłać, przeznacza na jednostkę z sekcji nadmiaru. "
+            "Nie wysyła też transportów do wioski, którą zaraz po ich dotarciu ktoś zaatakuje. "
+            "Kryjówka (to, co chroni) zostaje w wiosce."
+        )
+        self.raid_checkbox.toggled.connect(lambda checked: self._emit("raid_protection", checked))
+        raid_row.addWidget(self.raid_checkbox)
+        self.raid_minutes = QSpinBox()
+        self.raid_minutes.setRange(2, 60)
+        self.raid_minutes.setSuffix(" min przed")
+        self.raid_minutes.valueChanged.connect(lambda v: self._emit("raid_lead_minutes", v))
+        raid_row.addWidget(self.raid_minutes)
+        raid_row.addStretch()
+        status_layout.addLayout(raid_row)
+        bank_row = QHBoxLayout()
+        self.bank_checkbox = QCheckBox(
+            "Bank zboża w stolicy: spichlerze do maks., nadwyżki zboża do stolicy, mielenie u handlarza przy"
+        )
+        self.bank_checkbox.setToolTip(
+            "Spichlerze stolicy idą do maksymalnego poziomu przed innymi budynkami (razem z magazynem "
+            "na zmielone zboże). Pozostałe wioski "
+            "wysyłają tam zboże, którego same nie potrzebują. Gdy spichlerze są zapełnione do "
+            "ustawionego progu, handlarz NPC w targowisku (za złoto, z potwierdzeniem) zamienia "
+            "zboże na drewno, glinę i żelazo — w proporcji tego, czego sieci najbardziej brakuje "
+            "do celów, w granicach wolnego miejsca w magazynie. Zostaje zboże na następne kroki "
+            "budowy i rezerwa rekrutacji. Rezerwa złota jest zawsze zachowana."
+        )
+        self.bank_checkbox.toggled.connect(lambda checked: self._emit("crop_bank", checked))
+        bank_row.addWidget(self.bank_checkbox)
+        self.bank_fill = QSpinBox()
+        self.bank_fill.setRange(50, 100)
+        self.bank_fill.setSuffix(" % spichlerza")
+        self.bank_fill.valueChanged.connect(lambda v: self._emit("crop_bank_fill_percent", v))
+        bank_row.addWidget(self.bank_fill)
+        self.bank_granaries = QCheckBox("spichlerze do maks.")
+        self.bank_granaries.setToolTip(
+            "Rozbudowuj spichlerze stolicy do maksymalnego poziomu przed innymi budynkami: "
+            "większe, rzadsze mielenia (mniej złota), ale dłuższa kolejka w stolicy."
+        )
+        self.bank_granaries.toggled.connect(lambda checked: self._emit("crop_bank_granaries", checked))
+        bank_row.addWidget(self.bank_granaries)
+        bank_row.addStretch()
+        status_layout.addLayout(bank_row)
+        storage_row = QHBoxLayout()
+        storage_row.addWidget(QLabel("Magazyn i spichlerz na co najmniej:"))
+        self.storage_hours = QSpinBox()
+        self.storage_hours.setRange(0, 72)
+        self.storage_hours.setSuffix(" h produkcji")
+        self.storage_hours.setToolTip(
+            "Np. 8 h, żeby magazyn nie przepełnił się w nocy. 0 = magazyn "
+            "rozbudowywany tylko wtedy, gdy koszt rozbudowy się w nim nie mieści."
+        )
+        self.storage_hours.valueChanged.connect(lambda v: self._emit("storage_hours", v))
+        storage_row.addWidget(self.storage_hours)
+        storage_row.addSpacing(16)
+        storage_row.addWidget(QLabel("Zapas dla rekrutacji:"))
+        self.recruitment_reserve = QSpinBox()
+        self.recruitment_reserve.setRange(0, 48)
+        self.recruitment_reserve.setSuffix(" h")
+        self.recruitment_reserve.setToolTip(
+            "Ile godzin ciągłej rekrutacji (z zakładki Rekrutacja) zostaje w "
+            "magazynie: budowa i transporty tego nie ruszają. Koszt rekrutacji na "
+            "godzinę jest też odejmowany od produkcji przy planowaniu."
+        )
+        self.recruitment_reserve.valueChanged.connect(
+            lambda v: self._emit("recruitment_reserve_hours", v)
+        )
+        storage_row.addWidget(self.recruitment_reserve)
+        storage_row.addSpacing(16)
+        storage_row.addWidget(QLabel("Kolejka budowniczego:"))
+        self.master_builder_slots = QSpinBox()
+        self.master_builder_slots.setRange(0, 4)
+        self.master_builder_slots.setSuffix(" budowy")
+        self.master_builder_slots.setSpecialValueText("nie używaj")
+        self.master_builder_slots.setToolTip(
+            "Gdy kolejka wioski jest zajęta, kolejne kroki planu trafiają do "
+            "budowniczego i ruszają same, gdy kolejka się zwolni (także w nocy, "
+            "bez aplikacji). Używane są tylko wolne miejsca — automat nigdy nie "
+            "kupuje nowego. Kolejności u budowniczego nie da się potem zmienić, "
+            "więc większa liczba to mniej elastyczny plan."
+        )
+        self.master_builder_slots.valueChanged.connect(
+            lambda v: self._emit("master_builder_slots", v)
+        )
+        storage_row.addWidget(self.master_builder_slots)
+        storage_row.addStretch()
+        status_layout.addLayout(storage_row)
+        self.summary = QLabel("Połącz z grą, aby wyliczyć plan.")
+        self.summary.setObjectName("secondaryText")
+        self.summary.setWordWrap(True)
+        status_layout.addWidget(self.summary)
+        layout.addWidget(status_card)
+
+        gold_card = QFrame()
+        gold_card.setObjectName("card")
+        gold_layout = QGridLayout(gold_card)
+        gold_layout.setContentsMargins(18, 16, 18, 16)
+        gold_layout.setHorizontalSpacing(12)
+        gold_layout.setVerticalSpacing(8)
+        gold_title = QLabel("Złoto: handlarz NPC i dokończanie budowy")
+        gold_title.setObjectName("sectionTitle")
+        gold_layout.addWidget(gold_title, 0, 0, 1, 6)
+
+        gold_layout.addWidget(QLabel("Handlarz NPC:"), 1, 0)
+        self.npc_mode = QComboBox()
+        for key, label in self._MODES:
+            self.npc_mode.addItem(label, key)
+        self.npc_mode.currentIndexChanged.connect(
+            lambda _i: self._emit("npc_mode", self.npc_mode.currentData())
+        )
+        self.npc_mode.setToolTip(
+            "Gdy łączna suma surowców pokrywa następny krok, ale brakuje jednego "
+            "rodzaju (np. pełny spichlerz), wymiana u handlarza pozwala budować od razu."
+        )
+        gold_layout.addWidget(self.npc_mode, 1, 1)
+        gold_layout.addWidget(QLabel("gdy oszczędza co najmniej:"), 1, 2)
+        self.npc_minutes = QSpinBox()
+        self.npc_minutes.setRange(0, 1440)
+        self.npc_minutes.setSuffix(" min")
+        self.npc_minutes.valueChanged.connect(
+            lambda value: self._emit("npc_min_saved_minutes", value)
+        )
+        gold_layout.addWidget(self.npc_minutes, 1, 3)
+
+        gold_layout.addWidget(QLabel("Dokończ teraz:"), 2, 0)
+        self.finish_mode = QComboBox()
+        for key, label in self._MODES:
+            self.finish_mode.addItem(label, key)
+        self.finish_mode.currentIndexChanged.connect(
+            lambda _i: self._emit("finish_mode", self.finish_mode.currentData())
+        )
+        self.finish_mode.setToolTip(
+            "Darmowe dokończenie automat wykonuje zawsze (poza trybem „Wyłączone”). "
+            "Płatne — tylko w trybie „Automat” i tylko wtedy, gdy "
+            "surowce na następny krok już czekają, a blokuje go zajęta kolejka."
+        )
+        gold_layout.addWidget(self.finish_mode, 2, 1)
+
+        self.finish_free_checkbox = QCheckBox("za darmo poniżej")
+        self.finish_free_checkbox.toggled.connect(lambda c: self._emit("finish_free", c))
+        gold_layout.addWidget(self.finish_free_checkbox, 3, 0)
+        self.finish_free_minutes = QSpinBox()
+        self.finish_free_minutes.setRange(0, 1440)
+        self.finish_free_minutes.setSuffix(" min")
+        self.finish_free_minutes.valueChanged.connect(
+            lambda v: self._emit("finish_free_minutes", v)
+        )
+        gold_layout.addWidget(self.finish_free_minutes, 3, 1)
+
+        self.finish_reduced_checkbox = QCheckBox("tańsze dokończenie, gdy zostało od")
+        self.finish_reduced_checkbox.setToolTip(
+            "Krótsze budowy czekają na darmowe dokończenie, zamiast płacić."
+        )
+        self.finish_reduced_checkbox.toggled.connect(lambda c: self._emit("finish_reduced", c))
+        gold_layout.addWidget(self.finish_reduced_checkbox, 4, 0)
+        self.finish_reduced_min_minutes = QSpinBox()
+        self.finish_reduced_min_minutes.setRange(0, 10080)
+        self.finish_reduced_min_minutes.setSuffix(" min")
+        self.finish_reduced_min_minutes.valueChanged.connect(
+            lambda v: self._emit("finish_reduced_min_minutes", v)
+        )
+        gold_layout.addWidget(self.finish_reduced_min_minutes, 4, 1)
+        gold_layout.addWidget(QLabel("do (próg ceny w grze):"), 4, 2)
+        self.finish_reduced_minutes = QSpinBox()
+        self.finish_reduced_minutes.setRange(0, 10080)
+        self.finish_reduced_minutes.setSuffix(" min")
+        self.finish_reduced_minutes.valueChanged.connect(
+            lambda v: self._emit("finish_reduced_minutes", v)
+        )
+        gold_layout.addWidget(self.finish_reduced_minutes, 4, 3)
+        gold_layout.addWidget(QLabel("cena:"), 4, 4)
+        self.finish_reduced_price = QSpinBox()
+        self.finish_reduced_price.setRange(0, 100)
+        self.finish_reduced_price.setSuffix(" złota")
+        self.finish_reduced_price.valueChanged.connect(
+            lambda v: self._emit("finish_reduced_price", v)
+        )
+        gold_layout.addWidget(self.finish_reduced_price, 4, 5)
+
+        self.finish_full_checkbox = QCheckBox("pełna cena, gdy zostało od")
+        self.finish_full_checkbox.setToolTip(
+            "Pomiędzy progiem ceny w grze a tą wartością budowa czeka, aż "
+            "dokończenie stanieje."
+        )
+        self.finish_full_checkbox.toggled.connect(lambda c: self._emit("finish_full", c))
+        gold_layout.addWidget(self.finish_full_checkbox, 5, 0)
+        self.finish_full_min_minutes = QSpinBox()
+        self.finish_full_min_minutes.setRange(0, 10080)
+        self.finish_full_min_minutes.setSuffix(" min")
+        self.finish_full_min_minutes.valueChanged.connect(
+            lambda v: self._emit("finish_full_min_minutes", v)
+        )
+        gold_layout.addWidget(self.finish_full_min_minutes, 5, 1)
+        gold_layout.addWidget(QLabel("cena:"), 5, 4)
+        self.finish_full_price = QSpinBox()
+        self.finish_full_price.setRange(0, 100)
+        self.finish_full_price.setSuffix(" złota")
+        self.finish_full_price.valueChanged.connect(
+            lambda v: self._emit("finish_full_price", v)
+        )
+        gold_layout.addWidget(self.finish_full_price, 5, 5)
+
+        gold_layout.addWidget(QLabel("Budżet złota:"), 8, 0)
+        self.gold_budget = QSpinBox()
+        self.gold_budget.setRange(0, 1_000_000)
+        self.gold_budget.setSuffix(" złota")
+        self.gold_budget.setSpecialValueText("brak (progi ręczne)")
+        self.gold_budget.setToolTip(
+            "Ile złota automat może wydać łącznie na dokończenia i handlarza. "
+            "Złoto trafia tam, gdzie oszczędza najwięcej godzin kolejki na 1 złoto "
+            "(wioski ograniczone kolejką), z wyborem: zapłać pełną cenę od razu albo "
+            "poczekaj do tańszej. Progi ręczne powyżej są wtedy pomijane. Wymaga "
+            "„Dokończ teraz: Automat”."
+        )
+        self.gold_budget.valueChanged.connect(lambda v: self._emit("gold_budget", v))
+        gold_layout.addWidget(self.gold_budget, 8, 1)
+        self.budget_status = QLabel("—")
+        self.budget_status.setObjectName("secondaryText")
+        self.budget_status.setWordWrap(True)
+        gold_layout.addWidget(self.budget_status, 8, 2, 1, 4)
+        gold_layout.addWidget(QLabel("Przeciw przepełnieniu:"), 9, 0)
+        self.overflow_finish = QSpinBox()
+        self.overflow_finish.setRange(0, 1_000_000)
+        self.overflow_finish.setSingleStep(500)
+        self.overflow_finish.setSuffix(" surowców / 1 zł")
+        self.overflow_finish.setSpecialValueText("nie używaj")
+        self.overflow_finish.setToolTip(
+            "Gdy magazyn się przepełni, zanim skończy się trwająca rozbudowa magazynu "
+            "lub spichlerza, automat dokończy ją za złoto, jeśli każde złoto uratuje "
+            "co najmniej tyle surowców. Liczy się do budżetu i rezerwy złota."
+        )
+        self.overflow_finish.valueChanged.connect(lambda v: self._emit("overflow_finish_per_gold", v))
+        gold_layout.addWidget(self.overflow_finish, 9, 1)
+
+        self.budget_reset = QPushButton("Zeruj licznik")
+        self.budget_reset.setToolTip("Zacznij liczyć wydane złoto od zera.")
+        self.budget_reset.clicked.connect(lambda: self._emit("gold_budget_spent", 0))
+        gold_layout.addWidget(self.budget_reset, 8, 6)
+
+        gold_layout.addWidget(QLabel("Zachowaj co najmniej:"), 6, 0)
+        self.gold_reserve = QSpinBox()
+        self.gold_reserve.setRange(0, 1_000_000)
+        self.gold_reserve.setSuffix(" złota")
+        self.gold_reserve.valueChanged.connect(lambda v: self._emit("gold_reserve", v))
+        gold_layout.addWidget(self.gold_reserve, 6, 1)
+        self.gold_status = QLabel("Saldo złota: brak danych")
+        self.gold_status.setObjectName("secondaryText")
+        gold_layout.addWidget(self.gold_status, 6, 2, 1, 2)
+        gold_hint = QLabel(
+            "Ceny w grze: dokończenie za darmo poniżej 5 min, 1 złota poniżej 2 h, "
+            "2 złota powyżej; handlarz NPC 5 złota. Przykład przy domyślnych "
+            "ustawieniach (od 60 min za 1 złota, od 180 min za 2 złota): budowa z 20 min "
+            "czeka do 5 min i kończy się za darmo; z 2 h 20 min czeka 21 min i kończy "
+            "się za 1 złota; z 4 h kończy się od razu za 2 złota. Płatne dokończenie "
+            "jest używane tylko wtedy, gdy surowce na następny krok już czekają. "
+            "Automat budzi się dokładnie w chwili przekroczenia progu i przed "
+            "kliknięciem sprawdza cenę pokazaną w grze. Uwaga: na tym koncie gra nie "
+            "pyta o potwierdzenie wydatku złota."
+        )
+        gold_hint.setObjectName("footnote")
+        gold_hint.setWordWrap(True)
+        gold_layout.addWidget(gold_hint, 7, 0, 1, 7)
+        gold_layout.setColumnStretch(6, 1)
+        layout.addWidget(gold_card)
+
+        plan_title = QLabel("Plan rozbudowy")
+        plan_title.setObjectName("sectionTitle")
+        layout.addWidget(plan_title)
+        self.plan_table = QTableWidget(0, len(self._PLAN_COLUMNS))
+        self.plan_table.setHorizontalHeaderLabels(self._PLAN_COLUMNS)
+        self.plan_table.verticalHeader().setVisible(False)
+        self.plan_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.plan_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.plan_table.setWordWrap(True)
+        header = self.plan_table.horizontalHeader()
+        for column in range(len(self._PLAN_COLUMNS) - 1):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(self._PLAN_COLUMNS) - 1, QHeaderView.Stretch)
+        self.plan_table.setMinimumHeight(200)
+        self.plan_table.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self.plan_table)
+
+        transfer_title = QLabel("Opłacalne transporty surowców")
+        transfer_title.setObjectName("sectionTitle")
+        layout.addWidget(transfer_title)
+        transfer_hint = QLabel(
+            "Wioska oddaje tylko to, co zostaje po zarezerwowaniu jej własnego "
+            "następnego kroku, więc transport nie opóźnia nadawcy. Wioska, którą "
+            "ogranicza kolejka (np. stolica), oddaje nadwyżkę wioskom, które "
+            "ogranicza ilość surowców; inne wioski oddają tylko to, co w ciągu 2 h "
+            "przepełniłoby magazyn. Gdy magazyn i tak by się przepełnił (wioska "
+            "czeka na kolejkę lub inny surowiec), nadmiar idzie do dowolnej wioski "
+            "z wolnym miejscem. Pokazywany jest też każdy transport, po którym "
+            "odbiorca zacznie następny krok wcześniej (czas drogi kupców wliczony). "
+            "Surowce już w drodze są odejmowane od potrzeb odbiorcy."
+        )
+        transfer_hint.setObjectName("footnote")
+        transfer_hint.setWordWrap(True)
+        layout.addWidget(transfer_hint)
+        transfer_row = QHBoxLayout()
+        transfer_row.addWidget(QLabel("Transporty:"))
+        self.transfer_mode = QComboBox()
+        for key, label in self._MODES:
+            self.transfer_mode.addItem(label, key)
+        self.transfer_mode.setToolTip(
+            "Automat: wysyła kliknięciami z targowiska (zakładka Wyślij, lista "
+            "własnych wiosek). Jedna wysyłka z wioski na 5 min."
+        )
+        self.transfer_mode.currentIndexChanged.connect(
+            lambda _i: self._emit("transfer_mode", self.transfer_mode.currentData())
+        )
+        transfer_row.addWidget(self.transfer_mode)
+        transfer_row.addSpacing(16)
+        transfer_row.addWidget(QLabel("najmniejsza wysyłka:"))
+        self.transfer_min_amount = QSpinBox()
+        self.transfer_min_amount.setRange(100, 1_000_000)
+        self.transfer_min_amount.setSingleStep(500)
+        self.transfer_min_amount.setSuffix(" surowców")
+        self.transfer_min_amount.valueChanged.connect(
+            lambda v: self._emit("transfer_min_amount", v)
+        )
+        transfer_row.addWidget(self.transfer_min_amount)
+        transfer_row.addStretch()
+        layout.addLayout(transfer_row)
+        self.transfer_table = QTableWidget(0, len(self._TRANSFER_COLUMNS))
+        self.transfer_table.setHorizontalHeaderLabels(self._TRANSFER_COLUMNS)
+        self.transfer_table.verticalHeader().setVisible(False)
+        self.transfer_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.transfer_table.setSelectionBehavior(QTableWidget.SelectRows)
+        header = self.transfer_table.horizontalHeader()
+        for column in range(len(self._TRANSFER_COLUMNS) - 1):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(self._TRANSFER_COLUMNS) - 1, QHeaderView.Stretch)
+        self.transfer_table.setMinimumHeight(110)
+        layout.addWidget(self.transfer_table)
+
+        overflow_title = QLabel("Nadmiar surowców → rekrutacja")
+        overflow_title.setObjectName("sectionTitle")
+        layout.addWidget(overflow_title)
+        overflow_hint = QLabel(
+            "Gdy surowce i tak by przepadły w ciągu godziny (pełny magazyn, zajęta "
+            "kolejka budowy i budowniczego, transporty nie wywiozą reszty), automat "
+            "kliknięciem zleca tyle wybranych jednostek, ile trzeba — zawsze zostawiając "
+            "surowce na następny krok budowy."
+        )
+        overflow_hint.setObjectName("footnote")
+        overflow_hint.setWordWrap(True)
+        layout.addWidget(overflow_hint)
+        overflow_box = QWidget()
+        self.overflow_grid = QGridLayout(overflow_box)
+        self.overflow_grid.setContentsMargins(0, 0, 0, 0)
+        self.overflow_grid.setHorizontalSpacing(12)
+        layout.addWidget(overflow_box)
+        self._overflow_combos: dict[str, QComboBox] = {}
+        self._overflow_signature = None
+
+        military_title = QLabel("Wojsko: koszary i stajnia")
+        military_title.setObjectName("sectionTitle")
+        layout.addWidget(military_title)
+        military_hint = QLabel(
+            "Wioski w podanej kolejności rozbudowują koszary i stajnię do docelowego "
+            "poziomu i stale szkolą wybrane jednostki z nadwyżki (koszt następnej "
+            "budowy zostaje). Kolejna wioska zaczyna, gdy poprzednia szkoli bez przerwy. "
+            "Kolejność 0 = wioska wyłączona."
+        )
+        military_hint.setObjectName("footnote")
+        military_hint.setWordWrap(True)
+        layout.addWidget(military_hint)
+        military_row = QHBoxLayout()
+        military_row.addWidget(QLabel("Kolejka szkolenia do:"))
+        self.military_queue_hours = QSpinBox()
+        self.military_queue_hours.setRange(1, 72)
+        self.military_queue_hours.setSuffix(" h")
+        self.military_queue_hours.valueChanged.connect(
+            lambda v: self._emit("military_queue_hours", v)
+        )
+        military_row.addWidget(self.military_queue_hours)
+        military_row.addSpacing(16)
+        military_row.addWidget(QLabel("następna wioska, gdy kolejki mają co najmniej:"))
+        self.military_saturated_hours = QSpinBox()
+        self.military_saturated_hours.setRange(1, 72)
+        self.military_saturated_hours.setSuffix(" h")
+        self.military_saturated_hours.valueChanged.connect(
+            lambda v: self._emit("military_saturated_hours", v)
+        )
+        military_row.addWidget(self.military_saturated_hours)
+        military_row.addStretch()
+        layout.addLayout(military_row)
+        military_box = QWidget()
+        self.military_grid = QGridLayout(military_box)
+        self.military_grid.setContentsMargins(0, 0, 0, 0)
+        self.military_grid.setHorizontalSpacing(12)
+        layout.addWidget(military_box)
+        self._military_controls: dict[str, dict] = {}
+        self._military_signature = None
+
+        log_title = QLabel("Dziennik")
+        log_title.setObjectName("sectionTitle")
+        layout.addWidget(log_title)
+        self.log_list = QListWidget()
+        self.log_list.setMinimumHeight(140)
+        layout.addWidget(self.log_list)
+        self.set_state("Nie połączono z grą", "muted")
+
+    def _emit(self, field: str, value):
+        if not self._loading:
+            self.setting_changed.emit(field, value)
+
+    def _on_item_changed(self, item: QTableWidgetItem):
+        if self._loading or item.column() != 0:
+            return
+        village_id = item.data(Qt.UserRole)
+        if village_id:
+            self.village_toggled.emit(str(village_id), item.checkState() == Qt.Checked)
+
+    def load_settings(self, settings):
+        self._loading = True
+        try:
+            self.enabled_toggle.blockSignals(True)
+            self.enabled_toggle.setChecked(settings.enabled)
+            self.enabled_toggle.blockSignals(False)
+            self.capital_target.setValue(settings.capital_target)
+            self.village_target.setValue(settings.village_target)
+            self.transfer_minutes.setValue(settings.transfer_min_saved_minutes)
+            self.main_building_checkbox.setChecked(settings.main_building)
+            self.balance_checkbox.setChecked(settings.balance_resources)
+            self.bonus_checkbox.setChecked(settings.bonus_buildings)
+            self.hero_checkbox.setChecked(settings.hero_production_auto)
+            self.raid_checkbox.setChecked(settings.raid_protection)
+            self.raid_minutes.setValue(settings.raid_lead_minutes)
+            self.bank_checkbox.setChecked(settings.crop_bank)
+            self.bank_fill.setValue(settings.crop_bank_fill_percent)
+            self.bank_granaries.setChecked(settings.crop_bank_granaries)
+            self.storage_hours.setValue(settings.storage_hours)
+            self.recruitment_reserve.setValue(settings.recruitment_reserve_hours)
+            self.master_builder_slots.setValue(settings.master_builder_slots)
+            self.military_queue_hours.setValue(int(settings.military_queue_hours))
+            self.military_saturated_hours.setValue(int(settings.military_saturated_hours))
+            self.transfer_mode.setCurrentIndex(
+                max(0, self.transfer_mode.findData(settings.transfer_mode))
+            )
+            self.transfer_min_amount.setValue(settings.transfer_min_amount)
+            self.npc_mode.setCurrentIndex(max(0, self.npc_mode.findData(settings.npc_mode)))
+            self.npc_minutes.setValue(settings.npc_min_saved_minutes)
+            self.finish_mode.setCurrentIndex(
+                max(0, self.finish_mode.findData(settings.finish_mode))
+            )
+            self.finish_free_checkbox.setChecked(settings.finish_free)
+            self.finish_reduced_checkbox.setChecked(settings.finish_reduced)
+            self.finish_full_checkbox.setChecked(settings.finish_full)
+            self.finish_free_minutes.setValue(settings.finish_free_minutes)
+            self.finish_reduced_minutes.setValue(settings.finish_reduced_minutes)
+            self.finish_reduced_min_minutes.setValue(settings.finish_reduced_min_minutes)
+            self.finish_full_min_minutes.setValue(settings.finish_full_min_minutes)
+            self.finish_reduced_price.setValue(settings.finish_reduced_price)
+            self.finish_full_price.setValue(settings.finish_full_price)
+            self.gold_reserve.setValue(settings.gold_reserve)
+            self.gold_budget.setValue(settings.gold_budget)
+            self.overflow_finish.setValue(settings.overflow_finish_per_gold)
+        finally:
+            self._loading = False
+
+    def set_state(self, text: str, kind: str):
+        _set_status_chip(self.state_chip, text, kind)
+
+    def update_overflow(self, snapshot, chosen: dict[str, int], unit_names: dict[int, str]):
+        """One unit picker per village that has a recruitment building."""
+        rows = []
+        for plan in snapshot.plans:
+            village = plan.village
+            units = [
+                unit for unit, info in sorted(snapshot.troops.items())
+                if set(info["building_types"]) & village.recruit_buildings
+            ]
+            if units:
+                rows.append((village.id, village.name, tuple(units)))
+        signature = tuple(rows)
+        if signature != self._overflow_signature:
+            self._overflow_signature = signature
+            while self.overflow_grid.count():
+                item = self.overflow_grid.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            self._overflow_combos.clear()
+            for row, (village_id, name, units) in enumerate(rows):
+                self.overflow_grid.addWidget(QLabel(name), row, 0)
+                combo = QComboBox()
+                combo.addItem("— nie rekrutuj —", 0)
+                for unit in units:
+                    combo.addItem(unit_names.get(unit, f"Jednostka {unit}"), unit)
+                combo.currentIndexChanged.connect(
+                    lambda _i, vid=village_id, box=combo: None if self._loading
+                    else self.overflow_unit_changed.emit(vid, int(box.currentData() or 0))
+                )
+                self.overflow_grid.addWidget(combo, row, 1)
+                self._overflow_combos[village_id] = combo
+            self.overflow_grid.setColumnStretch(2, 1)
+        self._loading = True
+        try:
+            for village_id, combo in self._overflow_combos.items():
+                index = combo.findData(int(chosen.get(village_id, 0) or 0))
+                combo.setCurrentIndex(max(0, index))
+        finally:
+            self._loading = False
+
+    def update_military(self, snapshot, entries: list[dict], unit_names: dict[int, str]):
+        """One row per village with barracks or stable: order, units, level."""
+        rows = []
+        for plan in snapshot.plans:
+            village = plan.village
+            buildings = village.recruit_buildings
+            if not buildings & {19, 20, 29, 30}:
+                continue
+            barracks = tuple(
+                unit for unit, info in sorted(snapshot.troops.items())
+                if 19 in info["building_types"] and buildings & {19, 29}
+            )
+            stable = tuple(
+                unit for unit, info in sorted(snapshot.troops.items())
+                if 20 in info["building_types"] and buildings & {20, 30}
+            )
+            rows.append((village.id, village.name, barracks, stable))
+        signature = tuple(rows)
+        if signature != self._military_signature:
+            self._military_signature = signature
+            while self.military_grid.count():
+                item = self.military_grid.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            self._military_controls.clear()
+            for column, caption in enumerate(
+                ("Kolejność", "Wioska", "Koszary", "Stajnia", "Do poziomu")
+            ):
+                label = QLabel(caption.upper())
+                label.setObjectName("columnHeader")
+                self.military_grid.addWidget(label, 0, column)
+            for row, (village_id, name, barracks, stable) in enumerate(rows, start=1):
+                order = QSpinBox()
+                order.setRange(0, len(rows))
+                order.setSpecialValueText("wył.")
+                self.military_grid.addWidget(order, row, 0)
+                self.military_grid.addWidget(QLabel(name), row, 1)
+                combos = {}
+                for column, (building, units) in enumerate(((19, barracks), (20, stable)), start=2):
+                    combo = QComboBox()
+                    combo.addItem("— nie szkol —", 0)
+                    for unit in units:
+                        combo.addItem(unit_names.get(unit, f"Jednostka {unit}"), unit)
+                    combo.setEnabled(bool(units))
+                    self.military_grid.addWidget(combo, row, column)
+                    combos[building] = combo
+                level = QSpinBox()
+                level.setRange(1, 20)
+                self.military_grid.addWidget(level, row, 4)
+                controls = {"order": order, "units": combos, "level": level}
+                self._military_controls[village_id] = controls
+                order.valueChanged.connect(lambda _v: self._emit_military())
+                level.valueChanged.connect(lambda _v: self._emit_military())
+                for combo in combos.values():
+                    combo.currentIndexChanged.connect(lambda _i: self._emit_military())
+            self.military_grid.setColumnStretch(5, 1)
+        self._loading = True
+        try:
+            by_id = {str(e.get("village_id")): (index, e) for index, e in enumerate(entries or [])}
+            for village_id, controls in self._military_controls.items():
+                index, entry = by_id.get(village_id, (None, None))
+                controls["order"].setValue(0 if entry is None else index + 1)
+                units = {int(k): int(v) for k, v in ((entry or {}).get("units") or {}).items()}
+                for building, combo in controls["units"].items():
+                    combo.setCurrentIndex(max(0, combo.findData(units.get(building, 0))))
+                controls["level"].setValue(int((entry or {}).get("target_level") or 20))
+        finally:
+            self._loading = False
+
+    def _emit_military(self):
+        if self._loading:
+            return
+        chosen = []
+        for village_id, controls in self._military_controls.items():
+            order = controls["order"].value()
+            if not order:
+                continue
+            units = {
+                str(building): int(combo.currentData() or 0)
+                for building, combo in controls["units"].items()
+                if combo.currentData()
+            }
+            chosen.append((order, {
+                "village_id": village_id,
+                "units": units,
+                "target_level": controls["level"].value(),
+            }))
+        chosen.sort(key=lambda item: item[0])
+        self.military_changed.emit([entry for _order, entry in chosen])
+
+    def update_snapshot(self, snapshot, disabled_villages: set[str]):
+        self._loading = True
+        try:
+            self._fill_plans(snapshot, disabled_villages)
+            self._fill_transfers(snapshot)
+        finally:
+            self._loading = False
+        ready = sum(1 for plan in snapshot.plans if plan.ready_now)
+        done = sum(1 for plan in snapshot.plans if plan.finished)
+        parts = [
+            f"Odczyt {datetime.fromtimestamp(snapshot.read_at):%H:%M:%S}",
+            f"wiosek: {len(snapshot.plans)}",
+            f"gotowych do kliknięcia: {ready}",
+            f"ukończonych: {done}",
+            f"transportów: {len(snapshot.transfers)}",
+        ]
+        if snapshot.missing:
+            parts.append("bez danych: " + ", ".join(snapshot.missing))
+        network = snapshot.network
+        if network is not None:
+            names = {p.village.id: p.village.name for p in snapshot.plans}
+            fmt = lambda value: f"{value:,.0f}".replace(",", " ")
+            surplus = ", ".join(f"{names[v]} +{fmt(a)}/h" for v, a in network.surplus.items())
+            deficit = ", ".join(f"{names[v]} −{fmt(a)}/h" for v, a in network.deficit.items())
+            line = f"Bilans sieci (średnio do celu): nadwyżka {surplus or '—'}; niedobór {deficit or '—'}"
+            if network.unused > 0:
+                line += (
+                    f". Około {fmt(network.unused)}/h nadwyżki nikt nie zużyje — trafi do "
+                    "magazynów, rekrutacji albo przepadnie"
+                )
+            if network.extra_merchants:
+                line += ". Brakuje kupców: " + ", ".join(
+                    f"{names[v]} {n}" for v, n in network.extra_merchants.items()
+                )
+            parts.append(line)
+        self.summary.setText(" · ".join(parts))
+        self.gold_status.setText(f"Saldo złota: {snapshot.gold:,}".replace(",", " "))
+        plan = snapshot.gold_plan
+        if plan is None:
+            self.budget_status.setText("Budżet wyłączony — płatne dokończenia według progów.")
+        else:
+            names = {p.village.id: p.village.name for p in snapshot.plans}
+            parts = [
+                f"{names.get(vid, vid)}: {gold} zł → ~{plan.hours_by_village[vid]:.0f} h"
+                for vid, gold in sorted(plan.gold_by_village.items(), key=lambda i: -i[1])
+            ]
+            self.budget_status.setText(
+                f"Zostało {snapshot.budget_left} zł. Plan: {plan.gold} zł skróci kolejki "
+                f"o ~{plan.hours:.0f} h (opłaca się od {plan.threshold:.1f} h na 1 zł). "
+                + "; ".join(parts)
+            )
+
+    def _fill_plans(self, snapshot, disabled_villages: set[str]):
+        plans = snapshot.plans
+        self.plan_table.setRowCount(len(plans))
+        for row, plan in enumerate(plans):
+            village = plan.village
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            check.setCheckState(
+                Qt.Unchecked if village.id in disabled_villages else Qt.Checked
+            )
+            check.setData(Qt.UserRole, village.id)
+            self.plan_table.setItem(row, 0, check)
+            levels = [b.level for b in village.fields]
+            name = village.name + (" (stolica)" if village.is_capital else "")
+            fields_text = (
+                f"{min(levels)}–{max(levels)} / cel {plan.target}" if levels else "—"
+            )
+            if not plan.finished and plan.remaining_queue_hours > 0:
+                fields_text += (
+                    f"\nogranicza: {'kolejka' if plan.queue_bound else 'surowce'} "
+                    f"(budowa {_format_hours(plan.remaining_queue_hours)}, "
+                    f"surowce {_format_hours(plan.produce_hours)})"
+                )
+            if plan.weights:
+                fields_text += "\nwartość D/G/Ż/Z: " + " / ".join(
+                    f"{plan.weights[r]:.2f}" for r in (1, 2, 3, 4)
+                )
+            if village.recruitment:
+                fields_text += "\nrekrutacja: −" + " / ".join(
+                    f"{village.recruitment.get(r, 0):,.0f}".replace(",", " ")
+                    for r in (1, 2, 3, 4)
+                ) + "/h (D/G/Ż/Z)"
+            if village.incoming:
+                total = sum(sum(amounts.values()) for _at, amounts in village.incoming)
+                first = min(at for at, _amounts in village.incoming)
+                fields_text += (
+                    f"\nw drodze: {int(total):,} surowców".replace(",", " ")
+                    + f" (pierwsze za {_format_hours(max(0.0, first - snapshot.server_time) / 3600)})"
+                )
+            step = plan.next_step
+            if step is None:
+                next_text = "Gotowe" if plan.finished else (plan.blocked or "—")
+                cost_text = payback_text = ready_text = ""
+            else:
+                next_text = (
+                    f"{step.name} {step.from_level}→{step.from_level + 1}"
+                    f" (miejsce {step.location}) — {step.reason}"
+                )
+                cost_text = _format_costs(step.costs)
+                payback_text = (
+                    "—" if step.payback_hours is None else _format_hours(step.payback_hours)
+                )
+                if plan.ready_now:
+                    ready_text = "teraz"
+                else:
+                    ready_text = _format_hours(plan.ready_hours)
+                    if plan.queue_hours > 0 and (plan.afford_hours or 0) < plan.queue_hours:
+                        ready_text += " (kolejka)"
+            later = ", ".join(
+                f"{s.name} {s.from_level}→{s.from_level + 1}" for s in plan.steps[1:6]
+            )
+            gold_parts = []
+            for offer in snapshot.finish.get(village.id, []):
+                left = _format_hours(offer.remaining_seconds / 3600)
+                if offer.wait_seconds:
+                    price = (
+                        "za darmo" if offer.next_price == 0 else f"za {offer.next_price} zł"
+                    )
+                    gold_parts.append(
+                        f"Dokończ {price} za {_format_hours(offer.wait_seconds / 3600)}"
+                        f" (zostało {left})"
+                    )
+                else:
+                    gold_parts.append(
+                        "Dokończ teraz "
+                        + ("za darmo" if offer.price == 0 else f"za {offer.price} zł")
+                        + f" (zostało {left})"
+                    )
+            if village.id in snapshot.npc:
+                saved = snapshot.npc[village.id]
+                gold_parts.append(
+                    f"Handlarz NPC za {snapshot.npc_price} zł → buduj teraz"
+                    + ("" if saved is None else f" zamiast za {_format_hours(saved)}")
+                )
+            elif (
+                step is not None
+                and not plan.ready_now
+                and plan.afford_hours_npc is not None
+                and plan.afford_hours
+                and plan.afford_hours_npc < plan.afford_hours
+            ):
+                gold_parts.append(
+                    f"z handlarzem NPC gotowe za {_format_hours(plan.afford_hours_npc)}"
+                )
+            gold_text = "\n".join(gold_parts)
+            for column, value in enumerate(
+                (name, fields_text, next_text, cost_text, payback_text, ready_text,
+                 gold_text, later),
+                start=1,
+            ):
+                item = QTableWidgetItem(value)
+                if column == 6 and plan.ready_now:
+                    background, foreground = _RECRUITMENT_STATUS_COLORS["active"]
+                    item.setBackground(QColor(background))
+                    item.setForeground(QColor(foreground))
+                self.plan_table.setItem(row, column, item)
+        self.plan_table.resizeRowsToContents()
+
+    def _fill_transfers(self, snapshot):
+        transfers = snapshot.transfers
+        self.transfer_table.setRowCount(len(transfers))
+        for row, transfer in enumerate(transfers):
+            step = transfer.step
+            values = (
+                transfer.source_name,
+                transfer.target_name,
+                _format_costs(transfer.resources),
+                str(transfer.merchants),
+                _format_hours(transfer.travel_hours),
+                _format_hours(transfer.wait_before_hours),
+                _format_hours(transfer.wait_after_hours),
+                f"{transfer.reason}; następny krok: "
+                f"{step.name} {step.from_level}→{step.from_level + 1}",
+            )
+            for column, value in enumerate(values):
+                self.transfer_table.setItem(row, column, QTableWidgetItem(value))
+        self.transfer_table.resizeRowsToContents()
+
+    def add_log(self, text: str):
+        self.log_list.insertItem(0, f"{datetime.now():%d.%m %H:%M:%S}  {text}")
+        while self.log_list.count() > 300:
+            self.log_list.takeItem(self.log_list.count() - 1)
+
+
 def _app_start_times() -> list[datetime]:
     """When this app was started, from its log ("Database initialized")."""
     starts = []
@@ -3404,6 +4363,15 @@ _TK_FRESHNESS_COLORS = {
     "lt7": ("#FFF3D6", "#8A5A00"),
     "older": ("#FCE7EC", "#A31739"),
     "never": ("#F1F1F4", "#75747F"),
+}
+
+# Scout verdicts in the EXP and result columns: green = the hero left (real
+# target), red = he stayed home, yellow = no conclusion, grey = no hero.
+_SCOUT_VERDICT_COLORS = {
+    "left": _TK_FRESHNESS_COLORS["lt3"],
+    "home": _TK_FRESHNESS_COLORS["older"],
+    "unknown": _TK_FRESHNESS_COLORS["lt7"],
+    "absent": _TK_FRESHNESS_COLORS["never"],
 }
 
 
@@ -3870,6 +4838,15 @@ class ScoutWidget(QWidget):
             header.setSectionResizeMode(column, QHeaderView.Interactive)
             self.plan_table.setColumnWidth(column, width)
         header.setStretchLastSection(True)
+        # Sort by any column; the default is chronological (departure).
+        header.setSortIndicator(4, Qt.AscendingOrder)
+        self.plan_table.setSortingEnabled(True)
+        self.plan_table.horizontalHeaderItem(7).setToolTip(
+            "Zielony — EXP wzrósł po pierwszej parze, po drugiej już nie: bohater "
+            "wyszedł (prawdziwy cel). Czerwony — wzrósł po obu parach: bohater "
+            "został. Żółty — wzrósł dopiero po drugiej parze: bez wniosku. "
+            "Szary — nie wzrósł wcale: bohatera nie było w wiosce."
+        )
         self.plan_table.setMinimumHeight(240)
         layout.addWidget(self.plan_table)
         cancel_row = QHBoxLayout()
@@ -4342,6 +5319,7 @@ class ScoutWidget(QWidget):
             "absent": "bohatera nie było w wiosce",
             "unknown": "bez wniosku",
         }
+        self.plan_table.setSortingEnabled(False)
         self.plan_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             xp = row["xp"]
@@ -4361,12 +5339,22 @@ class ScoutWidget(QWidget):
                 f"{clock(row['sends'][1])} · {row['send_status'][1]}",
                 xp_text, result,
             )
+            # Numbers and times sort by value (times may cross midnight).
+            sort_keys = {
+                0: row["operation"], 3: row["level"], 4: row["departure"],
+                5: row["sends"][0], 6: row["sends"][1],
+            }
             for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 8 and row["verdict"] == "left":
-                    item.setBackground(QColor(_TK_FRESHNESS_COLORS["lt3"][0]))
-                    item.setForeground(QColor(_TK_FRESHNESS_COLORS["lt3"][1]))
+                if column in sort_keys:
+                    item = _NumberItem(sort_keys[column], value)
+                else:
+                    item = QTableWidgetItem(value)
+                colors = _SCOUT_VERDICT_COLORS.get(row["verdict"])
+                if column in (7, 8) and colors:
+                    item.setBackground(QColor(colors[0]))
+                    item.setForeground(QColor(colors[1]))
                 self.plan_table.setItem(index, column, item)
+        self.plan_table.setSortingEnabled(True)
 
 
 class IncomingAttacksWidget(QWidget):
@@ -4939,6 +5927,9 @@ class MainWindow(QMainWindow):
     manual_attacker_resolved = Signal(object, int, int)
     manual_attacker_xp = Signal(str, int)
     scout_found = Signal(object)
+    build_log_message = Signal(str)
+    build_snapshot_ready = Signal(object)
+    recruitment_click_done = Signal(str, object, object)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -4958,6 +5949,8 @@ class MainWindow(QMainWindow):
             key: monotonic() for key in settings.recruitment.pending_orders
         }
         self._milling_candidates: list[dict] = []
+        # Hourly recruitment costs per village (recruitment tab estimate).
+        self._recruitment_cost_rates: dict[str, dict] = {}
         # Hourly production of every village read from the game models.
         self._village_production: dict[str, dict[str, int]] = {}
         self._milling_order_active = False
@@ -4973,6 +5966,8 @@ class MainWindow(QMainWindow):
         self._hero_xp_requested: set[str] = set()
         self._unit_speeds: dict[int, dict[int, float]] | None = None
         self._incoming_attacks_by_key: dict[str, dict] = {}
+        # Immutable copy of the live incoming attacks for the build worker thread.
+        self._build_threats: tuple[dict, ...] = ()
         self._dismissed_incoming_attack_ids: set[str] = set()
         self._vacation_pending_request: tuple[str, bool, int] | None = None
         self._vacation_retry_after = 0.0
@@ -5054,6 +6049,18 @@ class MainWindow(QMainWindow):
         self.kingdom_timer = QTimer(self)
         self.kingdom_timer.setInterval(_KINGDOM_REFRESH_INTERVAL_MS)
         self.kingdom_timer.timeout.connect(self._refresh_kingdom)
+        self.recruitment_click_done.connect(self._on_recruitment_click_done)
+        self.build_automation = None
+        self._build_worker = None
+        self._build_worker_started = 0.0
+        self.build_log_message.connect(self.build_tab.add_log)
+        self.build_snapshot_ready.connect(self._on_build_snapshot)
+        self.build_timer = QTimer(self)
+        self.build_timer.setInterval(_BUILD_CHECK_INTERVAL_MS)
+        self.build_timer.timeout.connect(lambda: self._run_build(click=True))
+        self._build_wakeup = QTimer(self)
+        self._build_wakeup.setSingleShot(True)
+        self._build_wakeup.timeout.connect(lambda: self._run_build(click=True))
         self.incoming_attack_eta_timer = QTimer(self)
         self.incoming_attack_eta_timer.setInterval(1000)
         self.incoming_attack_eta_timer.timeout.connect(
@@ -5116,6 +6123,109 @@ class MainWindow(QMainWindow):
             self._on_village_names_update
         )
         self._refresh_data()
+        self._auto_connecting = False
+        self._auto_connect_attempts = 0
+        self._auto_connect_timer = QTimer(self)
+        self._auto_connect_timer.setInterval(5000)
+        self._auto_connect_timer.timeout.connect(self._try_auto_connect)
+        if self.settings.browser.auto_connect:
+            QTimer.singleShot(1000, self._start_auto_connect)
+
+    # Automatic connection on start -------------------------------------------------
+    def _cdp_tabs(self) -> list[dict] | None:
+        """Pages of the debug browser, or None when it is not running."""
+        import urllib.request
+
+        url = f"http://{self.settings.browser.cdp_address}/json/list"
+        try:
+            with urllib.request.urlopen(url, timeout=1.5) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _open_game_tab(self) -> None:
+        """Open the remembered game world in the debug browser."""
+        import urllib.parse
+        import urllib.request
+
+        url = self.settings.browser.game_url or "https://www.kingdoms.com/"
+        if not url.startswith("https://") or "kingdoms.com" not in url:
+            url = "https://www.kingdoms.com/"
+        endpoint = (
+            f"http://{self.settings.browser.cdp_address}/json/new?"
+            + urllib.parse.quote(url, safe=":/#?=&")
+        )
+        try:
+            request = urllib.request.Request(endpoint, method="PUT")
+            urllib.request.urlopen(request, timeout=3).close()
+            logger.info("Opened the game page %s", url)
+        except Exception as error:
+            logger.warning("Could not open the game page: %s", error)
+
+    def _remember_game_url(self) -> None:
+        """Store the game world's address for opening it automatically."""
+        from urllib.parse import urlsplit
+
+        try:
+            url = self.browser_session._tab._kwargs.get("url") or ""
+        except Exception:
+            return
+        parts = urlsplit(url)
+        if parts.scheme == "https" and parts.hostname and parts.hostname.endswith("kingdoms.com")                 and not parts.hostname.startswith("www."):
+            game_url = f"https://{parts.hostname}/"
+            if self.settings.browser.game_url != game_url:
+                self.settings.browser.game_url = game_url
+                self._save_recruitment_settings()
+
+    def _start_auto_connect(self):
+        """Open the game browser if needed and connect as soon as the game is up."""
+        if self.browser_session is not None:
+            return
+        self._game_tab_opened = False
+        if self._cdp_tabs() is None:
+            self._launch_browser()
+        self._auto_connect_attempts = 0
+        self.dashboard_tab.connection_status.setText(
+            "Łączę automatycznie — czekam na zalogowaną kartę gry…"
+        )
+        self._auto_connect_timer.start()
+
+    def _try_auto_connect(self):
+        if self.browser_session is not None:
+            self._auto_connect_timer.stop()
+            return
+        self._auto_connect_attempts += 1
+        if self._auto_connect_attempts > 180:  # 15 minutes
+            self._auto_connect_timer.stop()
+            self.dashboard_tab.connection_status.setText(
+                "Nie znaleziono zalogowanej gry. Zaloguj się i kliknij „Połącz”."
+            )
+            return
+        tabs = self._cdp_tabs()
+        if tabs is None:
+            return  # the browser is still starting
+        pages = [tab for tab in tabs if tab.get("type") == "page"]
+        if not any("kingdoms.com" in tab.get("url", "") for tab in pages):
+            if not getattr(self, "_game_tab_opened", False):
+                self._game_tab_opened = True
+                self._open_game_tab()
+            return
+        game = [
+            tab for tab in pages
+            if "kingdoms.com" in tab.get("url", "")
+            and "www." not in tab.get("url", "")
+        ]
+        if not game:
+            return
+        self._auto_connecting = True
+        try:
+            self._connect_browser()
+        finally:
+            self._auto_connecting = False
+        if self.browser_session is not None:
+            self._auto_connect_timer.stop()
+            logger.info("Connected automatically on start")
+
     
     def _create_menu_bar(self):
         """Create the application menu bar."""
@@ -5224,6 +6334,16 @@ class MainWindow(QMainWindow):
         self.scout_tab.manual_attacker_requested.connect(self._resolve_manual_attacker)
         self.content_tabs.addTab(self.scout_tab, "Zwiad")
 
+        self.build_tab = VillageBuildWidget()
+        self.build_tab.load_settings(self.settings.build)
+        self.build_tab.enabled_toggled.connect(self._set_build_enabled)
+        self.build_tab.setting_changed.connect(self._set_build_setting)
+        self.build_tab.village_toggled.connect(self._set_build_village)
+        self.build_tab.refresh_requested.connect(lambda: self._run_build(click=False))
+        self.build_tab.overflow_unit_changed.connect(self._set_build_overflow_unit)
+        self.build_tab.military_changed.connect(self._set_build_military)
+        self.content_tabs.addTab(self.build_tab, "Budowa")
+
         self.kingdom_tab = KingdomWidget()
         self.kingdom_tab.refresh_requested.connect(self._refresh_kingdom)
         self.kingdom_tab.update_tk_requested.connect(self._update_tktools_troops)
@@ -5258,6 +6378,7 @@ class MainWindow(QMainWindow):
             )
             state = self.browser_session.connect()
             logger.info("Connected to the game")
+            self._remember_game_url()
             self.browser_session.set_incoming_attack_handler(
                 self.incoming_attack_update.emit
             )
@@ -5307,6 +6428,7 @@ class MainWindow(QMainWindow):
                 self._start_hideout_defense()
                 self.kingdom_timer.start()
                 self._start_scouting()
+                self._start_building()
                 QTimer.singleShot(4500, self._refresh_kingdom)
                 QTimer.singleShot(7000, self._backfill_attacker_squares)
             else:
@@ -5317,7 +6439,8 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.browser_session = None
             logger.warning("Travian browser connection failed: %s", error)
-            QMessageBox.warning(self, "Connection failed", str(error))
+            if not getattr(self, "_auto_connecting", False):
+                QMessageBox.warning(self, "Connection failed", str(error))
 
     def _launch_browser(self):
         """Launch a dedicated local browser profile for the game session."""
@@ -5351,6 +6474,9 @@ class MainWindow(QMainWindow):
             self.dashboard_tab.connection_status.setText(
                 f"Utracono połączenie: {error}"
             )
+            if self.settings.browser.auto_connect:
+                # Reopen the browser if it is gone and connect again by itself.
+                QTimer.singleShot(5000, self._start_auto_connect)
 
     def _select_village(self, index: int):
         """Switch the game view to the village selected in the dashboard."""
@@ -5478,6 +6604,8 @@ class MainWindow(QMainWindow):
             current_attacks,
             observed_at,
         )
+        self._build_threats = tuple(dict(attack) for attack in current_attacks)
+        self._wake_build_for_attacks(server_time)
         if self.scout_automation is not None:
             for key in previous_keys - active_movement_keys:
                 self.scout_automation.attack_withdrawn(key)
@@ -5743,6 +6871,8 @@ class MainWindow(QMainWindow):
             self.settings.recruitment.villages,
             self.settings.recruitment.automatic_enabled,
         )
+        # The building planner keeps these resources for recruitment.
+        self._recruitment_cost_rates = cost_rates
         state = self.dashboard_tab._live_state
         villages = (
             state.get("villages", [])
@@ -5821,6 +6951,12 @@ class MainWindow(QMainWindow):
             return False
 
     def _set_automatic_recruitment_enabled(self, enabled: bool):
+        if enabled and self.settings.build.enabled:
+            # Recruitment automation takes over: stop the building automation.
+            self.build_tab.enabled_toggle.setChecked(False)
+            self.recruitment_tab.recruitment_queue_status.setText(
+                "Automat budowy wyłączony — działa automat rekrutacji."
+            )
         previous = self.settings.recruitment.automatic_enabled
         self.settings.recruitment.automatic_enabled = enabled
         if not self._save_recruitment_settings():
@@ -6421,13 +7557,28 @@ class MainWindow(QMainWindow):
                 1 for other in self._auto_recruitment_candidates
                 if other["village_id"] == row["village_id"]
             )
-            result = self.browser_session.queue_recruitment(
-                row,
-                batch_size,
-                queue_threshold,
-                min_quantity=1 if duration_mode else batch_size,
-                resource_share=1.0 / same_village,
+            min_quantity = 1 if duration_mode else batch_size
+            executor = self._click_executor()
+            building_types = row.get("building_types") or [row["building_type"]]
+
+            def run():
+                # Clicked like a player: barracks window, unit, amount, Train.
+                try:
+                    outcome = executor.recruit(
+                        row["village_id"], building_types,
+                        int(row["unit_type"]), batch_size, min_quantity,
+                        queue_threshold, 1.0 / same_village,
+                    )
+                    self.recruitment_click_done.emit(key, row, outcome)
+                except Exception as click_error:
+                    logger.exception("Clicked recruitment failed")
+                    self.recruitment_click_done.emit(key, row, click_error)
+
+            threading.Thread(target=run, daemon=True, name="recruit-click").start()
+            self.recruitment_tab.recruitment_queue_status.setText(
+                f"Zlecam w grze (klikając): {row['unit']} w wiosce {row['village']}…"
             )
+            return
         except Exception as error:
             logger.exception("Automatic recruitment outcome is uncertain")
             self.recruitment_tab.recruitment_queue_status.setText(
@@ -6494,6 +7645,64 @@ class MainWindow(QMainWindow):
             f"{messages.get(status, 'warunki gry nie pozwalają na rekrutację')}."
         )
         QTimer.singleShot(0, self._run_next_automatic_recruitment)
+
+    def _click_executor(self):
+        """The background-tab clicker shared with the building automation."""
+        automation = self.build_automation
+        if automation is not None:
+            return automation._executor
+        if getattr(self, "_recruit_executor", None) is None:
+            from src.core.build_clicker import BuildClickExecutor
+
+            self._recruit_executor = BuildClickExecutor(self.browser_session)
+        return self._recruit_executor
+
+    def _on_recruitment_click_done(self, key: str, row: dict, outcome):
+        """Result of a clicked recruitment order (main thread)."""
+        from src.core.build_clicker import GoldGuardError
+
+        self.settings.recruitment.pending_orders.discard(key)
+        self._pending_order_since.pop(key, None)
+        self._save_recruitment_settings()
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, GoldGuardError):
+                self.settings.recruitment.automatic_enabled = False
+                self._save_recruitment_settings()
+                self.recruitment_tab.auto_recruitment_checkbox.setChecked(False)
+                QMessageBox.critical(self, "Rekrutacja zatrzymana", str(outcome))
+            self.recruitment_tab.recruitment_queue_status.setText(
+                f"Nie zlecono {row['unit']} w wiosce {row['village']}: {outcome}"
+            )
+            self._auto_recruitment_candidates.clear()
+            self._auto_recruitment_active = False
+            return
+        status = outcome.get("status")
+        if status == "confirmed":
+            rows = [
+                {**queue, "count": outcome["count"]}
+                if queue["village_id"] == row["village_id"]
+                and str(queue.get("unit_id", queue.get("unit_type", queue["unit"])))
+                == str(row.get("unit_id", row.get("unit_type", row["unit"])))
+                else queue
+                for queue in self.dashboard_tab._recruitment_queue_rows
+            ]
+            self._update_recruitment_queues(rows, self.settings.recruitment.pending_orders)
+            self.recruitment_tab.recruitment_queue_status.setText(
+                f"Zlecono (kliknięciem): {outcome.get('quantity')} × {row['unit']} "
+                f"w wiosce {row['village']}; w kolejce {outcome['count']}."
+            )
+            logger.info("Recruitment clicked: %s x %s in %s", outcome.get("quantity"), row["unit"], row["village"])
+        else:
+            messages = {
+                "queue_not_low": "kolejka wzrosła przed zleceniem",
+                "building_missing": "brak odpowiednich koszar lub stajni",
+                "insufficient_resources": "za mało surowców",
+            }
+            self.recruitment_tab.recruitment_queue_status.setText(
+                f"Nie dodano {row['unit']} w wiosce {row['village']}: "
+                f"{messages.get(status, status)}."
+            )
+        QTimer.singleShot(_AUTO_RECRUITMENT_ORDER_INTERVAL_MS, self._run_next_automatic_recruitment)
 
     def _verify_automatic_recruitment_response(
         self,
@@ -6862,6 +8071,253 @@ class MainWindow(QMainWindow):
         setattr(self.settings.scout, field, getattr(updated, field))
         if not self._save_recruitment_settings():
             setattr(self.settings.scout, field, previous)
+
+    # Village building ----------------------------------------------------------
+    def _start_building(self):
+        if self.browser_session is None:
+            return
+        self.build_automation = BuildAutomation(
+            self.browser_session,
+            lambda: self.settings.build,
+            self.build_log_message.emit,
+            recruitment_getter=lambda: self._recruitment_cost_rates,
+            threats_getter=lambda: self._build_threats,
+        )
+        self.build_timer.start()
+        self.build_tab.set_state("Połączono z grą", "active")
+        if self.settings.build.enabled:
+            self._turn_off_recruitment_for_building()
+        QTimer.singleShot(5500, lambda: self._run_build(click=True))
+
+    def _stop_building(self):
+        self.build_timer.stop()
+        self._build_wakeup.stop()
+        automation = self.build_automation
+        self.build_automation = None
+        if automation is not None:
+            threading.Thread(target=automation.close, daemon=True, name="build-close").start()
+        self.build_tab.set_state("Nie połączono z grą", "muted")
+
+    def _wake_build_for_attacks(self, server_time: float):
+        """A hostile attack lands within the protection window (or will soon
+        enter it): check the villages then, not only at the next timer tick."""
+        build = self.settings.build
+        if self.build_automation is None or not build.enabled or not build.raid_protection:
+            return
+        lead = build.raid_lead_minutes * 60
+        starts = [
+            float(attack["arrival_time"]) - lead - server_time
+            for attack in self._build_threats
+            if attack.get("movement_type") != "Zwiad"
+            and float(attack.get("arrival_time") or 0) > server_time
+        ]
+        if not starts:
+            return
+        wait = max(2.0, min(starts) + 5)
+        if wait * 1000 < self.build_timer.remainingTime() and (
+            not self._build_wakeup.isActive()
+            or wait * 1000 < self._build_wakeup.remainingTime()
+        ):
+            self._build_wakeup.start(int(wait * 1000))
+
+    def _run_build(self, click: bool):
+        automation = self.build_automation
+        if automation is None:
+            self.build_tab.summary.setText("Połącz z grą, aby wyliczyć plan.")
+            return
+        worker = self._build_worker
+        if (
+            worker is not None and worker.is_alive()
+            and monotonic() - self._build_worker_started > _BUILD_WORKER_STALL_SECONDS
+        ):
+            # A call into the browser never returned: drop that instance (it
+            # will not click again) and continue with a fresh background tab.
+            logger.warning("Village build worker stalled; starting a fresh automation")
+            try:
+                import traceback
+
+                frame = sys._current_frames().get(worker.ident)
+                if frame is not None:
+                    logger.warning(
+                        "Stalled worker stack:\n%s", "".join(traceback.format_stack(frame)),
+                    )
+            except Exception:
+                pass
+            self.build_tab.add_log(
+                "Automat nie odpowiadał od kilku minut — uruchamiam go od nowa z nową kartą w tle."
+            )
+            automation.abandoned = True
+            self.build_automation = automation = BuildAutomation(
+                self.browser_session,
+                lambda: self.settings.build,
+                self.build_log_message.emit,
+                recruitment_getter=lambda: self._recruitment_cost_rates,
+                threats_getter=lambda: self._build_threats,
+            )
+            worker = None
+        if worker is not None and worker.is_alive():
+            if click and not self._build_wakeup.isActive():
+                # Busy with a previous check: try again shortly, do not skip.
+                self._build_wakeup.start(5000)
+            return
+
+        def run():
+            logger.info("Village build check started (click=%s)", click)
+            try:
+                snapshot = automation.tick() if click else automation.refresh()
+                logger.info("Village build check finished")
+            except Exception as error:
+                logger.exception("Village build check failed")
+                self.build_log_message.emit(f"Błąd odczytu: {error}")
+                return
+            self.build_snapshot_ready.emit(snapshot)
+
+        self._build_worker = threading.Thread(target=run, daemon=True, name="village-build")
+        self._build_worker_started = monotonic()
+        self._build_worker.start()
+
+    def _on_build_snapshot(self, snapshot):
+        self.build_tab.update_snapshot(snapshot, self.settings.build.disabled_villages)
+        try:
+            from src.core.browser_session import _TROOP_NAMES_BY_TYPE as unit_names
+        except ModuleNotFoundError:  # pragma: no cover
+            from core.browser_session import _TROOP_NAMES_BY_TYPE as unit_names
+        self.build_tab.update_overflow(snapshot, self.settings.build.overflow_units, unit_names)
+        self.build_tab.update_military(snapshot, self.settings.build.military_villages, unit_names)
+        automation = self.build_automation
+        if automation is not None and automation.budget_changed:
+            automation.budget_changed = False
+            self._save_recruitment_settings()
+        if automation is not None and automation.halted and self.settings.build.enabled:
+            # Gold went missing during an action: switch everything off.
+            self.settings.build.enabled = False
+            self._save_recruitment_settings()
+            self.build_tab.load_settings(self.settings.build)
+            self._build_wakeup.stop()
+            self.build_tab.set_state("Zatrzymany — niespodziewany wydatek złota", "waiting")
+            QApplication.beep()
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Critical)
+            box.setWindowTitle("Automat budowy zatrzymany")
+            box.setText(automation.halted)
+            box.setInformativeText(
+                "Automat wyłączył się sam, bo saldo złota spadło bardziej, niż "
+                "pozwalała wykonywana akcja. Sprawdź w grze, co się stało, zanim "
+                "włączysz go ponownie."
+            )
+            box.setModal(False)
+            box.setAttribute(Qt.WA_DeleteOnClose)
+            box.show()
+            return
+        wait = snapshot.next_wakeup
+        if (
+            wait is not None
+            and self.settings.build.enabled
+            and wait * 1000 < self.build_timer.remainingTime()
+        ):
+            # A short pause after the threshold so the game shows the new price.
+            self._build_wakeup.start(int(wait * 1000) + 2000)
+
+    def _set_build_enabled(self, enabled: bool):
+        if enabled:
+            answer = QMessageBox.question(
+                self,
+                "Włączyć automat budowy?",
+                "Automat co kilka minut otworzy w tle osobną kartę gry i — jak "
+                "gracz — kliknie rozbudowę pola, magazynu, budynku bonusowego lub "
+                "budynku głównego według planu, gdy wioska ma surowce i wolną "
+                "kolejkę. Przy transportach ustawionych na Automat wyśle też "
+                "surowce między wioskami przez targowisko.\n\n"
+                "Jeśli handlarz NPC lub „Dokończ teraz” są ustawione na Automat, "
+                "będzie też wydawał złoto (zawsze zostawiając ustawioną rezerwę). "
+                "Na tym koncie gra nie pyta o potwierdzenie złota.\n\n"
+                "Wydanych surowców ani złota nie da się odzyskać. Włączyć?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.build_tab.load_settings(self.settings.build)
+                return
+        self.settings.build.enabled = enabled
+        if not self._save_recruitment_settings():
+            self.settings.build.enabled = not enabled
+            self.build_tab.load_settings(self.settings.build)
+            return
+        self.build_tab.add_log("Automat budowy włączony." if enabled else "Automat budowy wyłączony.")
+        if enabled:
+            self._turn_off_recruitment_for_building()
+            self._run_build(click=True)
+
+    def _set_build_setting(self, field: str, value):
+        previous = getattr(self.settings.build, field)
+        try:
+            updated = BuildSettings.model_validate({**self.settings.build.model_dump(), field: value})
+        except ValueError as error:
+            self.build_tab.add_log(f"Nieprawidłowe ustawienie: {error}")
+            return
+        setattr(self.settings.build, field, getattr(updated, field))
+        if not self._save_recruitment_settings():
+            setattr(self.settings.build, field, previous)
+            return
+        self._run_build(click=False)
+
+    def _set_build_overflow_unit(self, village_id: str, unit: int):
+        units = self.settings.build.overflow_units
+        previous = units.get(village_id)
+        if unit:
+            units[village_id] = int(unit)
+        else:
+            units.pop(village_id, None)
+        if not self._save_recruitment_settings():
+            if previous:
+                units[village_id] = previous
+            else:
+                units.pop(village_id, None)
+            return
+        self.build_tab.add_log(
+            "Nadmiar surowców: " + (f"rekrutacja jednostki {unit}" if unit else "bez rekrutacji")
+            + f" w wiosce {village_id}."
+        )
+
+    def _set_build_military(self, entries: list):
+        previous = list(self.settings.build.military_villages)
+        self.settings.build.military_villages = list(entries)
+        if not self._save_recruitment_settings():
+            self.settings.build.military_villages = previous
+            return
+        automation = self.build_automation
+        names = {
+            plan.village.id: plan.village.name
+            for plan in (automation.snapshot.plans if automation else [])
+        }
+        self.build_tab.add_log(
+            "Wojsko: " + (", ".join(
+                f"{i + 1}. {names.get(e['village_id'], e['village_id'])} "
+                f"(do poziomu {e['target_level']})"
+                for i, e in enumerate(entries)
+            ) or "wyłączone") + "."
+        )
+
+    def _turn_off_recruitment_for_building(self):
+        """The building automation and the recruitment tab must not compete."""
+        if self.settings.recruitment.automatic_enabled:
+            self.recruitment_tab.auto_recruitment_checkbox.setChecked(False)
+            self.build_tab.add_log(
+                "Automat rekrutacji wyłączony — przy włączonej budowie rekrutacja "
+                "dostaje tylko nadmiar (sekcja „Nadmiar surowców → rekrutacja”)."
+            )
+
+    def _set_build_village(self, village_id: str, enabled: bool):
+        disabled = self.settings.build.disabled_villages
+        if enabled:
+            disabled.discard(village_id)
+        else:
+            disabled.add(village_id)
+        if not self._save_recruitment_settings():
+            if enabled:
+                disabled.add(village_id)
+            else:
+                disabled.discard(village_id)
 
     # Kingdom -------------------------------------------------------------------
     def _refresh_kingdom(self):
@@ -8072,6 +9528,7 @@ class MainWindow(QMainWindow):
         self.scout_timer.stop()
         self.scout_automation = None
         self.scout_tab.set_state("Nie połączono z grą", "muted")
+        self._stop_building()
         self.incoming_attack_eta_timer.stop()
         if self.browser_session is not None:
             self.browser_session.stop_incoming_attack_listener()

@@ -15,13 +15,19 @@ def setup_logging():
     """Configure logging for the application."""
     log_path = get_data_dir() / "travian.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    
+    # Polish text and arrows must never break logging (Windows consoles
+    # default to a code page without them).
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stderr),
-            logging.FileHandler(str(log_path)),
+            logging.FileHandler(str(log_path), encoding="utf-8"),
         ],
     )
 

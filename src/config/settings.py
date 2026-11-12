@@ -36,6 +36,10 @@ class BrowserSettings(BaseModel):
     cdp_address: str = Field(default="127.0.0.1:9222", description="Chrome DevTools Protocol address")
     cdp_port: int = Field(default=9222, description="Chrome DevTools Protocol port")
     timeout_seconds: int = Field(default=30, description="Connection timeout in seconds")
+    # Open the game browser (if needed) and connect when the app starts.
+    auto_connect: bool = True
+    # Game world opened automatically (remembered on every connection).
+    game_url: str = Field(default="https://www.kingdoms.com/", max_length=200)
 
 
 class DatabaseSettings(BaseModel):
@@ -382,10 +386,97 @@ class KingdomSettings(BaseModel):
         return value
 
 
+class BuildSettings(BaseModel):
+    """Resource-field building (upgrades are clicked like a player would)."""
+
+    enabled: bool = False
+    capital_target: int = Field(default=14, ge=1, le=20)
+    village_target: int = Field(default=10, ge=1, le=20)
+    # Villages the automation must not build in (planned and shown anyway).
+    disabled_villages: set[str] = Field(default_factory=set)
+    transfer_min_saved_minutes: int = Field(default=30, ge=5, le=1440)
+    # Upgrade the main building first in queue-bound villages.
+    main_building: bool = True
+    # Value resources by scarcity (surplus crop counts less), not 1:1.
+    balance_resources: bool = True
+    # Keep warehouse/granary large enough for this many hours of production.
+    storage_hours: int = Field(default=8, ge=0, le=72)
+    # Upgrade existing production bonus buildings (sawmill, …).
+    bonus_buildings: bool = True
+    # Point the hero's resource production at the scarcest resource (clicked).
+    hero_production_auto: bool = True
+    # Before an incoming attack lands: spend or send away what could be looted.
+    raid_protection: bool = True
+    raid_lead_minutes: int = Field(default=10, ge=2, le=60)
+    # Crop bank: the capital's granaries go up to the maximum level, the other
+    # villages send their spare crop there and once they are nearly full the
+    # NPC merchant (gold) turns the crop into what the network lacks.
+    crop_bank: bool = False
+    crop_bank_village: str = ""  # empty: the capital
+    # Raise the bank's granaries to their maximum level first (bigger, rarer
+    # milling batches, at the cost of the bank village's building queue).
+    crop_bank_granaries: bool = True
+    crop_bank_fill_percent: int = Field(default=99, ge=50, le=100)
+    crop_bank_min_amount: int = Field(default=30_000, ge=1_000, le=1_000_000)
+    crop_bank_gold_spent: int = Field(default=0, ge=0)
+    # Resource shipments between own villages (marketplace, clicked).
+    transfer_mode: Literal["off", "recommend", "auto"] = "recommend"
+    transfer_min_amount: int = Field(default=2000, ge=100, le=1_000_000)
+    # Hours of continuous recruitment kept in stock (not built with/shipped).
+    recruitment_reserve_hours: int = Field(default=2, ge=0, le=48)
+    # Gold helpers: "off", "recommend" (shown only) or "auto" (clicked).
+    npc_mode: Literal["off", "recommend", "auto"] = "recommend"
+    npc_min_saved_minutes: int = Field(default=60, ge=0, le=1440)
+    finish_mode: Literal["off", "recommend", "auto"] = "recommend"
+    finish_free: bool = True
+    finish_reduced: bool = False
+    finish_full: bool = False
+    # Defaults match the game's finishNow config (free < 5 min, 1 gold < 2 h).
+    finish_free_minutes: int = Field(default=5, ge=0, le=1440)
+    finish_reduced_minutes: int = Field(default=120, ge=0, le=10080)
+    finish_reduced_price: int = Field(default=1, ge=0, le=100)
+    finish_full_price: int = Field(default=2, ge=0, le=100)
+    # Pay the reduced price only from this much remaining time (shorter
+    # builds wait for the free finish) and the full price only from this
+    # much (in between the build waits until it gets cheaper).
+    finish_reduced_min_minutes: int = Field(default=60, ge=0, le=10080)
+    finish_full_min_minutes: int = Field(default=180, ge=0, le=10080)
+    # Upgrades lined up in the master builder queue per village (0 = off).
+    master_builder_slots: int = Field(default=4, ge=0, le=4)
+    # Replace unreserved master builder entries the plan no longer prefers.
+    master_replan: bool = True
+    # Village id -> unit type trained when resources would overflow anyway.
+    overflow_units: dict[str, int] = Field(default_factory=dict)
+    overflow_hours: float = Field(default=1.0, ge=0.25, le=12)
+    # Pick the unit automatically where none is chosen, and keep the
+    # recruitment queue of a building at most this long.
+    overflow_auto: bool = True
+    overflow_max_queue_hours: float = Field(default=24, ge=1, le=72)
+    # Villages that build up an army, in order: the next one starts when the
+    # previous trains without pause. building type -> unit trained there.
+    military_villages: list[dict] = Field(default_factory=lambda: [
+        {"village_id": "538001407", "units": {"19": 21, "20": 26}, "target_level": 20},
+        {"village_id": "537968638", "units": {"19": 21, "20": 26}, "target_level": 20},
+    ])
+    # Training queue kept per building (hours) and when a village counts as
+    # training without pause (queue at least this long).
+    military_queue_hours: float = Field(default=24, ge=1, le=72)
+    military_saturated_hours: float = Field(default=20, ge=1, le=72)
+    # Finish a running warehouse/granary with gold when each gold saves at
+    # least this many resources from overflowing (0 = never).
+    overflow_finish_per_gold: int = Field(default=2000, ge=0, le=1_000_000)
+    # Gold that the building automation never spends.
+    gold_reserve: int = Field(default=50, ge=0, le=1_000_000)
+    # Gold budget for instant finishes / NPC (0 = use the manual tiers) and
+    # how much of it the automation has spent so far.
+    gold_budget: int = Field(default=0, ge=0, le=1_000_000)
+    gold_budget_spent: int = Field(default=0, ge=0, le=1_000_000)
+
+
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.2.1")
+    version: str = Field(default="1.3.0")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
@@ -401,6 +492,7 @@ class AppSettings(BaseModel):
     hideout_defense: HideoutDefenseSettings = Field(default_factory=HideoutDefenseSettings)
     kingdom: KingdomSettings = Field(default_factory=KingdomSettings)
     scout: ScoutSettings = Field(default_factory=ScoutSettings)
+    build: BuildSettings = Field(default_factory=BuildSettings)
 
     # Data directory
     data_dir: Path = Field(default_factory=get_data_dir, repr=False)

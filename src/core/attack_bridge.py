@@ -59,8 +59,14 @@ _READ_CONTEXT_JS = "(() => {" + _SERVER_CLOCK_JS + r"""
     const result = {
         player_id: playerId, tribe, unit_costs: unitCosts,
         server_offset_ms: serverOffsetMs, server_time: serverNowMs() / 1000,
-        villages: {}, hero: null
+        villages: {}, hero: null, truce: null
     };
+    try {
+        const truce = Gameworld.getNightTruceTimes();
+        if (truce && Number(truce.start) && Number(truce.end)) {
+            result.truce = {start: Number(truce.start), end: Number(truce.end)};
+        }
+    } catch (error) { /* no night truce on this world */ }
     for (const village of villages) {
         const id = String(village.villageId);
         const stationary = Troops.getCollection("stationary", id);

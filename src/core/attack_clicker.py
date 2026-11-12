@@ -70,7 +70,7 @@ class _Lane:
         self.target_id = opener.id
         self.tab = opener
         self.tab.start()
-        self.tab.call_method("Page.enable")
+        self.tab.call_method("Page.enable", _timeout=10)
         self.tab.call_method("Page.navigate", url=self.game_url, _timeout=15)
         self.wake()
         deadline = time.monotonic() + 60

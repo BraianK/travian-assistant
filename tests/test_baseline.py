@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1695,16 +1696,33 @@ class BaselineSmokeTests(unittest.TestCase):
             window.dashboard_tab._live_state = {
                 "villages": [{"id": "101", "name": "Testonia"}],
             }
+
+            class FakeClicker:
+                """Recruitment is clicked in the game, not sent as a request."""
+
+                def __init__(self):
+                    self.recruited = []
+                    self.done = threading.Event()
+
+                def recruit(self, village_id, building_types, unit_type,
+                            max_quantity, min_quantity, queue_threshold, share):
+                    self.recruited.append((unit_type, max_quantity, queue_threshold))
+                    self.done.set()
+                    return {"status": "confirmed", "count": 7, "quantity": max_quantity}
+
+            clicker = FakeClicker()
+            window._recruit_executor = clicker
             try:
                 with patch.object(AppSettings, "save", return_value=None):
                     window._check_recruitment_queues()
                     self.qt_app.processEvents()
+                    self.assertTrue(clicker.done.wait(5))
+                    for _ in range(20):
+                        self.qt_app.processEvents()
 
-                self.assertEqual(
-                    [("Theutates Thunder", 5, 2)],
-                    fake_session.queued,
-                )
-                self.assertIn(
+                self.assertEqual([(24, 5, 2)], clicker.recruited)
+                self.assertEqual([], fake_session.queued)  # no game request
+                self.assertNotIn(
                     "101:24",
                     settings.recruitment.pending_orders,
                 )

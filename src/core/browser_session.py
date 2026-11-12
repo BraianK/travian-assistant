@@ -1275,7 +1275,19 @@ class TravianBrowserSession:
                 "No Travian tab found. Open the game in your browser and sign in first."
             )
 
-        self._tab = game_tabs[0]
+        # Never attach to a background tab of the assistant itself.
+        try:
+            from src.core.build_clicker import is_lane_tab
+        except ModuleNotFoundError:  # pragma: no cover - script fallback
+            from core.build_clicker import is_lane_tab
+        own = [tab.id for tab in game_tabs if not is_lane_tab(tab)]
+        chosen = own[0] if own else game_tabs[0].id
+        # The check above started and stopped those tab objects: use a fresh one.
+        fresh = {tab.id: tab for tab in self._browser.list_tab(timeout=3)}
+        if chosen not in fresh:
+            self._browser = None
+            raise RuntimeError("The Travian tab disappeared while connecting.")
+        self._tab = fresh[chosen]
         try:
             self._attach_network_listeners()
             self._tab.start()
@@ -3609,14 +3621,22 @@ def launch_chrome_for_game(address: str, port: int) -> None:
     profile_dir = get_data_dir() / "travian-browser-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    subprocess.Popen(
-        [
-            str(browser_path),
-            "--remote-debugging-address=127.0.0.1",
-            f"--remote-debugging-port={resolved_port}",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
-        close_fds=True,
-    )
+    arguments = [
+        str(browser_path),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={resolved_port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if os.name == "nt":
+        # Start through "cmd /c start" so the browser is not a child of the
+        # assistant: closing or restarting the assistant (which may end its
+        # whole process tree) must not close the game browser.
+        subprocess.Popen(
+            ["cmd", "/c", "start", "Travian Browser", *arguments],
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    else:
+        subprocess.Popen(arguments, close_fds=True, start_new_session=True)

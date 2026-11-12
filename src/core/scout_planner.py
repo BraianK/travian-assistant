@@ -80,6 +80,23 @@ def attack_travel(distance_fields: float, speed: float, level: int, siege: bool)
     return float(math.floor(seconds + 1e-6))
 
 
+DAY = 86400
+
+
+def truce_windows(truce: dict | None, around: float) -> list[tuple[float, float]]:
+    """Daily night-truce windows near ``around`` from one window the game gave."""
+    if not truce:
+        return []
+    start, end = float(truce["start"]), float(truce["end"])
+    shift = math.floor((around - start) / DAY)
+    return [(start + DAY * k, end + DAY * k) for k in range(shift - 2, shift + 3)]
+
+
+def in_truce(moment: float, windows: list[tuple[float, float]]) -> bool:
+    """Nothing can be sent, and nothing can land, during the night truce."""
+    return any(start <= moment < end for start, end in windows)
+
+
 def plan_candidates(
     source: tuple[int, int],
     targets: list[ScoutTarget],
@@ -89,8 +106,13 @@ def plan_candidates(
     scout_travel: float,
     now: float,
     lead_seconds: float = 5.0,
+    truce: list[tuple[float, float]] = (),
 ) -> list[Candidate]:
-    """Departures for every target and level whose scouts can still be sent."""
+    """Departures for every target and level whose scouts can still be sent.
+
+    During the night truce the attacker cannot send his army and our scouts
+    can neither leave nor land, so such departures are skipped.
+    """
     candidates = []
     for target in targets:
         fields = distance(source[0], source[1], target.x, target.y)
@@ -98,6 +120,9 @@ def plan_candidates(
             departure = round(target.arrival - attack_travel(fields, speed, level, siege))
             sends = [departure + offset - scout_travel for offset in SCOUT_OFFSETS]
             if min(sends) < now + lead_seconds:
+                continue
+            moments = [departure, *sends, *(departure + offset for offset in SCOUT_OFFSETS)]
+            if any(in_truce(moment, truce) for moment in moments):
                 continue
             candidates.append(Candidate(
                 target=target.name, level=level, departure=departure,

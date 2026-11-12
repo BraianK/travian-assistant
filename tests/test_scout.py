@@ -46,6 +46,28 @@ class PlannerTests(unittest.TestCase):
         # Departures whose scouts can no longer be sent are skipped.
         self.assertEqual([], plan_candidates((-34, 29), [target], 8.0, [10], True, 600, arrival))
 
+    def test_departures_in_night_truce_are_skipped(self):
+        from datetime import datetime
+        from src.core.scout_planner import in_truce, truce_windows
+        # Truce 22:00-06:00; catapults (6 fields/h) of KunS to arrive at 06:59:59.
+        truce = {"start": datetime(2026, 11, 10, 22).timestamp(),
+                 "end": datetime(2026, 11, 11, 6).timestamp()}
+        now = datetime(2026, 11, 10, 14).timestamp()
+        windows = truce_windows(truce, now)
+        self.assertTrue(in_truce(datetime(2026, 11, 11, 23).timestamp(), windows))  # next night
+        self.assertFalse(in_truce(datetime(2026, 11, 11, 7).timestamp(), windows))
+        target = ScoutTarget("Jessica", 30, 35, datetime(2026, 11, 11, 6, 59, 59).timestamp())
+        levels = list(range(0, 15))
+        every = plan_candidates((-34, 29), [target], 6.0, levels, False, 600, now)
+        allowed = plan_candidates((-34, 29), [target], 6.0, levels, False, 600, now, truce=windows)
+        self.assertGreater(len(every), len(allowed))
+        self.assertTrue(allowed)
+        for candidate in allowed:
+            self.assertLess(candidate.departure + 1, truce["start"])
+        # Rams under siege leave long before the truce: nothing skipped.
+        siege = plan_candidates((-34, 29), [target], 8.0, levels, True, 600, now, truce=windows)
+        self.assertEqual(len(levels), len(siege))
+
     def test_judge(self):
         self.assertIsNone(judge({-3: 100, 0: 110}))
         self.assertEqual(VERDICT_LEFT, judge({-3: 100, 0: 110, 2: 110}))
@@ -306,3 +328,49 @@ class PlanManyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanTableSortTests(unittest.TestCase):
+    def test_plan_table_sorts_by_value(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+        from src.app import ScoutWidget
+        QApplication.instance() or QApplication([])
+        widget = ScoutWidget()
+
+        def row(operation, level, departure):
+            return {"operation": operation, "attacker": "KunS", "target": "Jessica",
+                    "level": level, "departure": departure,
+                    "sends": [departure - 601, departure - 599],
+                    "send_status": ["zaplanowany", "zaplanowany"],
+                    "xp": {}, "verdict": None, "status": "aktywna"}
+
+        # Default order: departure, also across midnight (23:50 before 00:10).
+        widget.update_plan([row(2, 10, 1_000_000 + 1200), row(1, 9, 1_000_000), row(3, 2, 999_000)])
+        table = widget.plan_table
+        self.assertEqual(["3", "1", "2"], [table.item(r, 0).text() for r in range(3)])
+        table.sortItems(3, Qt.DescendingOrder)   # PT: 10, 9, 2 (numeric, not text)
+        self.assertEqual(["10", "9", "2"], [table.item(r, 3).text() for r in range(3)])
+        widget.update_plan([row(2, 10, 1_000_000 + 1200), row(1, 9, 1_000_000), row(3, 2, 999_000)])
+        self.assertEqual(["10", "9", "2"], [table.item(r, 3).text() for r in range(3)])
+
+    def test_exp_column_colour_follows_the_verdict(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.app import _SCOUT_VERDICT_COLORS, ScoutWidget
+        QApplication.instance() or QApplication([])
+        widget = ScoutWidget()
+        rows = []
+        for number, verdict in enumerate(("left", "home", "unknown", "absent", None), 1):
+            rows.append({"operation": 1, "attacker": "KunS", "target": "Jessica",
+                         "level": number, "departure": 1_000_000 + number * 60,
+                         "sends": [999_000, 999_002], "send_status": ["wysłany", "wysłany"],
+                         "xp": {-3: 100, 0: 104, 2: 104}, "verdict": verdict,
+                         "status": "aktywna"})
+        widget.update_plan(rows)
+        table = widget.plan_table
+        for index, verdict in enumerate(("left", "home", "unknown", "absent")):
+            self.assertEqual(_SCOUT_VERDICT_COLORS[verdict][0].lower(),
+                             table.item(index, 7).background().color().name())
+        self.assertEqual("czeka", table.item(4, 8).text())
