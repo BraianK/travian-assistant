@@ -416,6 +416,12 @@ class BuildSettings(BaseModel):
     # Raise the bank's granaries to their maximum level first (bigger, rarer
     # milling batches, at the cost of the bank village's building queue).
     crop_bank_granaries: bool = True
+    # Settlers: village that prepares them ("" = off), server time they must be
+    # ready by, how many, and the residence level they need.
+    settle_village: str = ""
+    settle_ready_at: float = Field(default=0.0, ge=0)
+    settle_settlers: int = Field(default=3, ge=1, le=6)
+    settle_residence_level: int = Field(default=10, ge=1, le=20)
     crop_bank_fill_percent: int = Field(default=99, ge=50, le=100)
     crop_bank_min_amount: int = Field(default=30_000, ge=1_000, le=1_000_000)
     crop_bank_gold_spent: int = Field(default=0, ge=0)
@@ -476,7 +482,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.0")
+    version: str = Field(default="1.3.1")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)

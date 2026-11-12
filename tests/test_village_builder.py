@@ -1423,3 +1423,60 @@ def test_storage_not_sized_for_a_temporary_hero_switch():
     assert vb.plan_village(village, 10, 0, storage_hours=12).steps[0].type == 10  # 8 800 x 12 > 70 000
     village.hero_excess = {1: -1080, 2: 3240, 3: -1080, 4: -1080}  # hero on clay
     assert vb.plan_village(village, 10, 0, storage_hours=12).steps[0].type != 10  # 5 560 x 12 < 70 000
+
+
+# Settlers ---------------------------------------------------------------------------
+
+RESIDENCE_CONFIG = {25: {"costs": {"1": 580, "2": 460, "3": 350, "4": 180}, "time": 450, "supply": 1,
+                         "requirements": [{"type": 2, "building": 15, "level": 5}]}}
+
+
+def _settle_village(main_level=1):
+    village = _village([_field(1, 1, 3)], vid="5", production={1: 1000, 2: 1000, 3: 1000, 4: 1000})
+    village.main_building = _main_building(level=main_level, effects=(100, 96, 93, 90, 86, 83, 80, 78))
+    village.empty_slots = [19, 20]
+    village.settler_unit = 30
+    village.settler_costs = {1: 3000, 2: 4000, 3: 3000, 4: 0}
+    village.settler_seconds = 11_350
+    return village
+
+
+def test_settlers_main_building_then_residence_first():
+    village = _settle_village()
+    plan = vb.plan_village(village, 10, 0, construct_config=RESIDENCE_CONFIG, settle_level=10, settle_count=3)
+    kinds = [(s.type, s.from_level, s.construct) for s in plan.steps[:5]]
+    assert kinds == [(15, 1, False), (15, 2, False), (15, 3, False), (15, 4, False), (25, 0, True)]
+    assert "osadnicy" in plan.steps[0].reason
+
+
+def test_settlers_hold_the_village_until_trained():
+    village = _settle_village(main_level=5)
+    residence = _storage(19, 25, 10)
+    village.residence = residence
+    plan = vb.plan_village(village, 10, 0, settle_level=10, settle_count=3)
+    assert len(plan.steps) == 1 and plan.steps[0].train
+    assert plan.steps[0].costs == {1: 9000, 2: 12000, 3: 9000, 4: 0}
+    assert vb.master_next_step(village, 10, 0, 4, settle_level=10, settle_count=3) is None
+    village.settlers = 3
+    plan = vb.plan_village(village, 10, 0, settle_level=10, settle_count=3)
+    assert not any(s.train for s in plan.steps)
+
+
+def test_settle_hours_counts_build_and_training():
+    village = _settle_village()
+    hours = vb.settle_hours(village, 10, 3, 11_350)
+    # main building 4 x 900 s + residence 0->10 (~30 500 s x 0.86) + 3 x 11 350 s
+    assert 15 < hours < 18
+
+
+def test_settle_goal_starts_early_enough():
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation
+
+    village = _settle_village()
+    logs = []
+    settings = BuildSettings(enabled=True, settle_village="5", settle_ready_at=100 * 3600)
+    automation = BuildAutomation(None, lambda: settings, logs.append, executor=object())
+    assert automation._settle_goal([village], settings, 0) == {}  # 100 h ahead: not yet
+    assert automation._settle_goal([village], settings, 90 * 3600) == {"5": (10, 3)}
+    assert any("osadnicy" in line for line in logs)

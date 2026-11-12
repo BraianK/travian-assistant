@@ -198,6 +198,9 @@ class BuildAutomation:
         self._raid_noted: set[tuple[str, float]] = set()
         self._crop_bank: str | None = None
         self._first_steps: dict[str, list] = {}
+        # Settlers goal: village id -> (residence level, settlers) while active.
+        self._settle: dict[str, tuple[int, int]] = {}
+        self._settle_noted: str = ""
         self._bank_gold_noted = False
         # village id -> {"wood"|"clay"|"iron"|"grain": cost per hour or None}
         self._recruitment = recruitment_getter or (lambda: {})
@@ -295,6 +298,7 @@ class BuildAutomation:
             for village in villages:
                 if village.id == str(hero.get("village_id")):
                     village.hero_excess = {r: current[r] - steady[r] for r in vb.RESOURCES}
+        self._settle = self._settle_goal(villages, settings, server_time)
         plans = vb.plan_all(
             villages,
             settings.capital_target,
@@ -309,6 +313,7 @@ class BuildAutomation:
             military=military_targets,
             military_first=military_first,
             granary_max={self._crop_bank} if self._crop_bank and settings.crop_bank_granaries else None,
+            settle=self._settle,
         )
         merchant_speed = {}
         for key, value in (state.get("merchant_speed") or {}).items():
@@ -524,6 +529,8 @@ class BuildAutomation:
                 acted = True
                 time.sleep(SETTLE_SECONDS)
                 snapshot = self.refresh()
+        if not self.halted and self._settle and self._train_settlers(snapshot, settings):
+            acted = True
         if not self.halted and settings.crop_bank and self._mill(snapshot, settings):
             acted = True
             time.sleep(SETTLE_SECONDS)
@@ -616,6 +623,8 @@ class BuildAutomation:
                         military_first=village.id in self._military_first,
                         granary_max=village.id == snapshot.crop_bank and settings.crop_bank_granaries,
                         first_steps=self._first_steps.get(village.id),
+                        settle_level=self._settle.get(village.id, (0, 0))[0],
+                        settle_count=self._settle.get(village.id, (0, 0))[1],
                     )
                     recent = self._recent_master.get(village.id, {})
                     now_m = time.monotonic()
@@ -689,6 +698,8 @@ class BuildAutomation:
                         military_first=village.id in self._military_first,
                         granary_max=village.id == snapshot.crop_bank and settings.crop_bank_granaries,
                         first_steps=self._first_steps.get(village.id),
+                        settle_level=self._settle.get(village.id, (0, 0))[0],
+                        settle_count=self._settle.get(village.id, (0, 0))[1],
                     )
                     if master_step is not None:
                         step = master_step
@@ -832,6 +843,83 @@ class BuildAutomation:
             amounts = " / ".join(f"{accepted.get(r, 0):,}".replace(",", " ") for r in vb.RESOURCES)
             self._log(f"{label}: wysłano D/G/Ż/Z {amounts} ({transfer.reason}).")
         return sent
+
+    # -- settlers -----------------------------------------------------------------
+    def _settle_goal(self, villages, settings, server_time) -> dict[str, tuple[int, int]]:
+        """The settlers goal while it has to be worked on: start early enough
+        for the deadline; switch off once the settlers are all there."""
+        village = next((v for v in villages if v.id == settings.settle_village), None)
+        if village is None or settings.settle_ready_at <= 0:
+            return {}
+        level, count = settings.settle_residence_level, settings.settle_settlers
+        if village.settlers >= count and village.residence is not None and village.residence.level >= level:
+            settings.settle_village = ""
+            self.budget_changed = True  # saves the settings
+            self._log(f"{village.name}: osadnicy gotowi lub w szkoleniu ({village.settlers}/{count}) — zadanie zakończone.")
+            return {}
+        seconds = village.settler_seconds or 0.0
+        need = vb.settle_hours(village, level, count, seconds)
+        start = settings.settle_ready_at - (need * vb.SETTLE_TIME_MARGIN + vb.SETTLE_BUFFER_HOURS) * 3600
+        key = f"{village.id}:{int(settings.settle_ready_at)}:{server_time >= start}"
+        if key != self._settle_noted:
+            self._settle_noted = key
+            ready = time.strftime("%d.%m %H:%M", time.localtime(settings.settle_ready_at))
+            if server_time >= start:
+                self._log(
+                    f"{village.name}: osadnicy na {ready} — przygotowanie trwa (~{need:.1f} h budowy "
+                    f"i szkolenia, bez czasu na zebranie surowców)."
+                )
+            else:
+                begin = time.strftime("%d.%m %H:%M", time.localtime(start))
+                self._log(
+                    f"{village.name}: osadnicy na {ready} — start przygotowań ok. {begin} "
+                    f"(~{need:.1f} h budowy i szkolenia + zapas)."
+                )
+        return {village.id: (level, count)} if server_time >= start else {}
+
+    def _train_settlers(self, snapshot: BuildSnapshot, settings) -> bool:
+        """Residence ready: train the missing settlers (as many as affordable)."""
+        acted = False
+        for village_id, (level, count) in self._settle.items():
+            plan = next((p for p in snapshot.plans if p.village.id == village_id), None)
+            if plan is None:
+                continue
+            village = plan.village
+            residence = village.residence
+            missing = count - village.settlers
+            if (
+                residence is None or residence.level < level or missing <= 0 or not village.settler_unit
+                or self._backoff.get("settle:" + village_id, 0) > time.monotonic()
+            ):
+                continue
+            costs = village.settler_costs
+            afford = min(
+                (int(village.resources.get(r, 0) // costs[r]) for r in vb.RESOURCES if costs.get(r, 0) > 0),
+                default=0,
+            )
+            quantity = min(missing, afford)
+            if quantity <= 0 or self.abandoned:
+                continue
+            logger.info("Village build action: %s train %s settlers", village.name, quantity)
+            try:
+                result = self._executor.recruit(
+                    village.id, [vb.RESIDENCE, vb.PALACE], village.settler_unit, quantity, 1, 10**9, 1.0,
+                )
+            except GoldGuardError as error:
+                self.halted = str(error)
+                self._log(f"{village.name}: STOP — {error}")
+                return acted
+            except Exception as error:
+                self._backoff["settle:" + village_id] = time.monotonic() + FAILURE_BACKOFF_SECONDS
+                self._log(f"{village.name}: szkolenie osadników nie powiodło się — {error}")
+                continue
+            if result.get("status") == "confirmed":
+                acted = True
+                self._log(
+                    f"{village.name}: szkolenie {result.get('quantity')} osadników "
+                    f"(brakowało {missing})."
+                )
+        return acted
 
     # -- crop bank ----------------------------------------------------------------
     def _mill(self, snapshot: BuildSnapshot, settings) -> bool:

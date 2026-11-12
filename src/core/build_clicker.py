@@ -43,7 +43,7 @@ READ_BUILD_STATE_JS = r"""(() => {
     const serverTime = Number(rootScope.currentServerTime) || Date.now() / 1000;
     const options = [...document.querySelectorAll(".villageListDropDown .dropdownOption")];
     const ids = options.map(o => (o.className.match(/\bdropDownItem(\d+)\b/) || [])[1]).filter(Boolean);
-    const keep = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 17, 19, 20, 21, 29, 30, 38, 39]);
+    const keep = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 17, 19, 20, 21, 25, 26, 29, 30, 38, 39]);
     const villages = [];
     // Resources on their way to own villages: raid loot, merchants.
     const incoming = {};
@@ -168,13 +168,36 @@ READ_BUILD_STATE_JS = r"""(() => {
                                 live = Number(e.durationPerUnit);
                     if (live) { out[unit] = live; continue; }
                     const need = (troop.requirements || []).map(r => Number(r.buildingType));
+                    // Settlers and chiefs train in the residence or palace.
+                    if ([9, 10].includes(Number(troop.nr)) && !need.length) need.push(25, 26);
                     const b = rows.find(d => need.includes(Number(d.buildingType))
                         || (need.includes(19) && Number(d.buildingType) === 29)
                         || (need.includes(20) && Number(d.buildingType) === 30));
                     const effect = b && b.currentEffect && b.currentEffect.values && Number(b.currentEffect.values[0]);
                     if (b && effect) out[unit] = Number(troop.time) / speed * effect / 100;
+                    else if (b && [9, 10].includes(Number(troop.nr))) out[unit] = Number(troop.time) / speed;
                 }
                 return out;
+            })(),
+            // Settlers of this village: at home and in the training queue.
+            settlers: (() => {
+                const unit = Object.entries(Travian.Config.troopConfig || {}).find(([, t]) =>
+                    Number(t.tribe) === Number(village.data.tribeId) && Number(t.nr) === 10);
+                if (!unit) return null;
+                let home = 0, queued = 0;
+                const stationary = typeof Troops !== "undefined" ? Troops.getCollection("stationary", id) : null;
+                for (const row of (stationary && stationary.data) || []) {
+                    const d = row.data || {};
+                    if (String(d.playerId) !== String(Travian.Player.data.playerId) || d.status !== "home") continue;
+                    home += Number((d.units || {})["10"]) || 0;
+                }
+                const uq = typeof UnitQueue !== "undefined" ? UnitQueue.get(id) : null;
+                for (const entries of Object.values((uq && uq.data && uq.data.buildingTypes) || {}))
+                    for (const e of entries || [])
+                        if (Number(e.unitType) === Number(unit[0])) queued += Number(e.count) || 0;
+                const t = unit[1];
+                return {unit: Number(unit[0]), home, queued, costs: t.costs,
+                        seconds: Number(t.time) / (Number(Travian.Config.TG_TROOP_SPEED) || 1)};
             })(),
             merchants_free: merchantsFree, merchant_carry: merchantCarry
         });
@@ -197,7 +220,7 @@ READ_BUILD_STATE_JS = r"""(() => {
         // Base data of buildings that may be constructed (bonus, storage, marketplace).
         building_config: (() => {
             const out = {};
-            for (const t of [5, 6, 7, 8, 9, 10, 11, 17]) {
+            for (const t of [5, 6, 7, 8, 9, 10, 11, 17, 25]) {
                 const c = (Travian.Config.buildingConfig || {})[t];
                 if (!c) continue;
                 out[t] = {
@@ -431,12 +454,24 @@ class BuildClickExecutor:
     def _select_village(self, lane: _Lane, village_id: str) -> None:
         if lane.evaluate(_SELECTED_JS) == village_id:
             return
-        if not lane.evaluate(
-            "!!(document.querySelector('#villageList .dropdownHead.opened'))"
-        ):
-            self._click(lane, "#villageList .dropdownHead")
-            time.sleep(0.5)
-        self._click(lane, f".villageListDropDown .dropdownOption.dropDownItem{int(village_id)}")
+        option = f".villageListDropDown .dropdownOption.dropDownItem{int(village_id)}"
+        # A tab that sat idle for a while renders the list slowly: wait for
+        # the village to show up, and open the list once more if it does not.
+        for _attempt in range(2):
+            if not lane.evaluate(
+                "!!(document.querySelector('#villageList .dropdownHead.opened'))"
+            ):
+                self._click(lane, "#villageList .dropdownHead")
+            try:
+                lane.wait_for(
+                    f"(e => !!e && e.getBoundingClientRect().width > 0)(document.querySelector('{option}'))",
+                    timeout=6,
+                )
+                break
+            except ClickModeError:
+                self._close_windows(lane)
+        time.sleep(0.3)
+        self._click(lane, option)
         try:
             lane.wait_for(f"({_SELECTED_JS}) === {json.dumps(village_id)}", timeout=8)
         except ClickModeError:
@@ -613,7 +648,9 @@ class BuildClickExecutor:
         info = lane.evaluate(
             "(() => { const w = document.querySelector('" + window + "');"
             " const b = w && w.querySelector(\"button[clickable='confirm()']\");"
-            " return w ? {icon: !!w.querySelector('.premium_" + feature + "_medium_illu'),"
+            # The icon's case differs per window (premium_npcTrader_… vs NPCTrader).
+            " return w ? {icon: [...w.querySelectorAll('i')].some(i => (i.className || '').toLowerCase()"
+            ".includes('premium_" + feature.lower() + "_medium_illu')),"
             " price: b ? Number(b.getAttribute('price')) : null,"
             " dontShow: [...w.querySelectorAll('input[type=checkbox]')].some(i => i.checked)} : null; })()"
         ) or {}

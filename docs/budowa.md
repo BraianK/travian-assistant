@@ -284,6 +284,16 @@ Zboże rośnie szybciej, niż jest potrzebne, a jednostki w tym świecie nie kos
 
 ---
 
+## 11c. Osadnicy (`settle_village`, `settle_ready_at`, `settle_settlers`, `settle_residence_level`)
+
+- **Cel:** wioska, liczba osadników (domyślnie 3), poziom rezydencji (10) i godzina, na którą mają być gotowi (np. gdy będą punkty kultury). W zakładce Budowa ustawia się to w wierszu „Osadnicy”.
+- **Kiedy startuje:** termin minus (czas budowy i szkolenia × 1,25 + 4 h na zebranie surowców). Czas obejmuje budynek główny do 5 (wymóg rezydencji), rezydencję do celu i osadników po kolei. Dla poziomów rezydencji bez tabel z gry czas jest szacowany.
+- **Plan wioski:** najpierw budynek główny do 5, potem nowa rezydencja i jej poziomy. Pola idą dopiero po nich.
+- **Szkolenie:** gdy rezydencja ma poziom docelowy, plan wioski to tylko krok „osadnicy do wyszkolenia”. Jego koszt dowożą inne wioski, a pola i budowniczy czekają. Automat szkoli tylu osadników, na ilu starcza surowców, klikaniem w rezydencji.
+- **Koniec:** gdy osadnicy są w domu lub w szkoleniu, a rezydencja ma poziom docelowy, zadanie wyłącza się samo. Dzięki temu po wysłaniu osadników automat nie szkoli kolejnych.
+
+---
+
 ## 12. Mapa zależności
 
 ```

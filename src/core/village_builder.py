@@ -38,7 +38,8 @@ FIELD_NAMES = {1: "Las", 2: "Glinianka", 3: "Kopalnia żelaza", 4: "Pole zboża"
 BUILDING_NAMES = {
     5: "Tartak", 6: "Cegielnia", 7: "Huta żelaza", 8: "Młyn", 9: "Piekarnia",
     10: "Magazyn", 11: "Spichlerz", 15: "Budynek główny", 17: "Targowisko",
-    19: "Koszary", 20: "Stajnia", 21: "Warsztat", 29: "Wielkie koszary", 30: "Wielka stajnia",
+    19: "Koszary", 20: "Stajnia", 21: "Warsztat", 25: "Rezydencja", 26: "Pałac",
+    29: "Wielkie koszary", 30: "Wielka stajnia",
     38: "Wielki magazyn", 39: "Wielki spichlerz",
 }
 # Production bonus buildings and the resource they boost (effect = % bonus).
@@ -137,6 +138,12 @@ class Village:
     # Hero production above its "all resources" setting (a temporary switch
     # to one resource): not counted when sizing storage.
     hero_excess: dict[int, float] = field(default_factory=dict)
+    residence: Building | None = None  # residence or palace (settlers)
+    # Settlers (home + in training), their unit type, costs and seconds each.
+    settlers: int = 0
+    settler_unit: int = 0
+    settler_costs: dict[int, float] = field(default_factory=dict)
+    settler_seconds: float = 0.0
 
     def build_production(self) -> dict[int, float]:
         """Production left for building after continuous recruitment."""
@@ -153,6 +160,8 @@ class Village:
 
     def buildings(self) -> list[Building]:
         extra = [self.main_building] if self.main_building else []
+        if self.residence is not None:
+            extra.append(self.residence)
         return self.fields + self.storages + self.bonus + self.military + extra
 
     def incoming_total(self) -> dict[int, float]:
@@ -176,6 +185,7 @@ class Step:
     reason: str
     raw_gain: float = 0.0  # production gain per hour of its resource
     construct: bool = False  # a new building on an empty site
+    train: bool = False  # not a building: units to train (settlers)
     upkeep: float = 0.0  # crop eaten by a new building (construct only)
 
     @property
@@ -523,8 +533,15 @@ def plan_village(
     military: dict[int, int] | None = None,
     military_first: bool = False,
     granary_max: bool = False,
+    settle_level: int = 0,
+    settle_count: int = 0,
 ) -> VillagePlan:
     """Order the next field, storage, bonus and main building upgrades.
+
+    With *settle_level* the village prepares *settle_count* settlers first:
+    main building up to the residence's requirement, a residence up to that
+    level, then nothing else until the settlers are in training (the plan
+    holds a training step whose cost the other villages ship in).
 
     With *granary_max* (the crop bank village) every granary goes up to its
     maximum level before any other step.
@@ -693,6 +710,52 @@ def plan_village(
 
     last_military = False
 
+    def settle_step() -> Step | None:
+        """Settlers: main building to the residence's minimum, a residence,
+        then its levels up to *settle_level*."""
+        if not settle_level:
+            return None
+        residence = village.residence
+        if residence is None:
+            if RESIDENCE in planned_types:
+                return None
+            main = village.main_building
+            if main is not None and levels[main.location] < RESIDENCE_MAIN_LEVEL:
+                level = levels[main.location]
+                if level not in main.costs:
+                    return None
+                return Step(
+                    village_id=village.id, location=main.location, type=MAIN_BUILDING,
+                    from_level=level,
+                    costs={r: int(main.costs[level].get(r, 0)) for r in RESOURCES},
+                    seconds=int(main.times.get(level, 0) * time_factor),
+                    gain=0.0, payback_hours=None,
+                    reason=f"osadnicy: budynek główny do {RESIDENCE_MAIN_LEVEL} (wymóg rezydencji)",
+                )
+            info = (construct_config or {}).get(RESIDENCE)
+            sites = free_sites(village, taken_slots)
+            if info is None or not sites:
+                return None
+            return Step(
+                village_id=village.id, location=sites[0], type=RESIDENCE, from_level=0,
+                costs=_config_costs(info),
+                seconds=int(float(info.get("time") or 0) or NEW_BUILDING_HOURS * 3600),
+                gain=0.0, payback_hours=None,
+                reason=f"osadnicy: nowa rezydencja (cel poziom {settle_level})",
+                construct=True, upkeep=float(info.get("supply") or 0),
+            )
+        level = levels[residence.location]
+        if level >= settle_level or level not in residence.costs:
+            return None
+        return Step(
+            village_id=village.id, location=residence.location, type=residence.type,
+            from_level=level,
+            costs={r: int(residence.costs[level].get(r, 0)) for r in RESOURCES},
+            seconds=int(residence.times.get(level, 0) * time_factor),
+            gain=0.0, payback_hours=None,
+            reason=f"osadnicy: rezydencja do poziomu {settle_level}",
+        )
+
     def bank_step() -> Step | None:
         """Crop bank: the existing granaries up to their maximum level, and
         the warehouse along with them, so milled crop fits in."""
@@ -744,8 +807,40 @@ def plan_village(
             )
         return None
 
+    missing_settlers = max(0, settle_count - village.settlers) if settle_level else 0
+    ready_residence = (
+        village.residence is not None and village.residence.level >= settle_level
+    )
+    if settle_level and ready_residence and missing_settlers and village.settler_costs:
+        # Residence ready: nothing else until the settlers are in training.
+        costs = {r: int(village.settler_costs.get(r, 0)) * missing_settlers for r in RESOURCES}
+        plan.steps.append(Step(
+            village_id=village.id, location=village.residence.location, type=village.residence.type,
+            from_level=village.residence.level, costs=costs,
+            seconds=int(village.settler_seconds * missing_settlers), gain=0.0, payback_hours=None,
+            reason=f"osadnicy: {missing_settlers} do wyszkolenia w rezydencji", train=True,
+        ))
+        depth = 0
     for _ in range(depth):
         options = candidates()
+        settle = settle_step()
+        if settle is not None:
+            plan.steps.append(settle)
+            if settle.construct:
+                taken_slots.add(settle.location)
+                planned_types.add(settle.type)
+                production[4] = production.get(4, 0) - _upkeep(village, settle)
+                continue
+            building = _building(village, settle.location)
+            if settle.type == MAIN_BUILDING:
+                lvl = settle.from_level
+                if lvl in building.effects and lvl + 1 in building.effects and building.effects[lvl]:
+                    ratio = building.effects[lvl + 1] / building.effects[lvl]
+                    time_factor *= ratio
+                    queue_left *= ratio
+            levels[settle.location] += 1
+            production[4] = production.get(4, 0) - _upkeep(village, settle)
+            continue
         # Crop bank first: granaries (and the warehouse for the milled crop)
         # before anything else until they are at their maximum.
         bank = bank_step()
@@ -928,6 +1023,7 @@ def plan_all(
     military: dict[str, dict[int, int]] | None = None,
     military_first: set[str] | None = None,
     granary_max: set[str] | None = None,
+    settle: dict[str, tuple[int, int]] | None = None,
 ) -> list[VillagePlan]:
     return [
         plan_village(
@@ -942,6 +1038,8 @@ def plan_all(
             military=(military or {}).get(v.id),
             military_first=v.id in (military_first or set()),
             granary_max=v.id in (granary_max or set()),
+            settle_level=(settle or {}).get(v.id, (0, 0))[0],
+            settle_count=(settle or {}).get(v.id, (0, 0))[1],
         )
         for v in villages
     ]
@@ -1759,6 +1857,14 @@ def village_from_raw(raw: dict) -> Village:
         type_levels={int(k): int(v) for k, v in (raw.get("type_levels") or {}).items()},
         unit_queue_end={int(k): float(v) for k, v in (raw.get("unit_queue_end") or {}).items()},
         protected=float(raw.get("protected") or 0),
+        residence=next((b for b in buildings if b.type in (RESIDENCE, PALACE)), None),
+        settlers=int((raw.get("settlers") or {}).get("home") or 0)
+        + int((raw.get("settlers") or {}).get("queued") or 0),
+        settler_unit=int((raw.get("settlers") or {}).get("unit") or 0),
+        settler_costs={
+            int(k): float(v) for k, v in ((raw.get("settlers") or {}).get("costs") or {}).items()
+        },
+        settler_seconds=float((raw.get("settlers") or {}).get("seconds") or 0),
     )
 
 
@@ -1919,6 +2025,8 @@ def master_replacements(
     first = plan_options.pop("first_steps", None) or []
     plan = plan_village(free, target, server_time, depth=max(keep_window + 1, 2), **plan_options)
     plan.steps = list(first) + plan.steps
+    if plan.steps and plan.steps[0].train:
+        return []  # waiting for settlers: leave the queue as it is
     wanted: dict[int, int] = {}
     for step in plan.steps[:keep_window]:
         wanted[step.location] = wanted.get(step.location, 0) + 1
@@ -2131,6 +2239,8 @@ def master_next_step(
             continue
         if avoid and step.location in avoid:
             continue
+        if step.train:
+            return None  # waiting for settlers: nothing else goes in
         if step.construct:
             return step  # a new building on an empty site
         # The level the game will show once the covered entries are built.
@@ -2454,6 +2564,10 @@ NEW_BUILDING_HOURS = 1.0
 SPECIAL_SITES = (39, 40)
 WAREHOUSE = 10
 GRANARY = 11
+RESIDENCE = 25
+PALACE = 26
+# The residence needs the main building at this level.
+RESIDENCE_MAIN_LEVEL = 5
 
 
 def free_sites(village: Village, taken: set[int] | None = None) -> list[int]:
@@ -3101,3 +3215,41 @@ def hero_stall_choice(
     if best == current or waits[current] - waits[best] < HERO_STALL_MIN_SAVED_HOURS:
         return None
     return best, waits[current], waits[best]
+
+
+# Settlers ---------------------------------------------------------------------------
+
+# Residence build seconds per level (from level -> level+1) with the main
+# building at 100 %, from the game's tables (7-9) and extrapolated below.
+RESIDENCE_BASE_SECONDS = {0: 450, 1: 600, 2: 900, 3: 1390, 4: 2290, 5: 3190, 6: 4090,
+                          7: 4990, 8: 5880, 9: 6780, 10: 8090, 11: 9480, 12: 11030}
+# Start this much earlier than the pure build and training time: resources
+# have to be gathered and shipped.
+SETTLE_TIME_MARGIN = 1.25
+SETTLE_BUFFER_HOURS = 4.0
+
+
+def settle_hours(village: Village, level: int, count: int, settler_seconds: float) -> float:
+    """Build and training hours still needed for *count* settlers: main
+    building to the residence's minimum, the residence to *level*, then the
+    settlers one after another (resources assumed to be there)."""
+    hours = 0.0
+    main = village.main_building
+    factor = 1.0
+    residence = village.residence
+    if residence is None and main is not None:
+        for lvl in range(main.planned_level, RESIDENCE_MAIN_LEVEL):
+            hours += main.times.get(lvl, 600) / 3600
+        top = max(main.planned_level, RESIDENCE_MAIN_LEVEL)
+        if top in main.effects:
+            factor = main.effects[top] / 100
+    elif main is not None and main.planned_level in main.effects:
+        factor = main.effects[main.planned_level] / 100
+    start = residence.planned_level if residence is not None else 0
+    for lvl in range(start, level):
+        if residence is not None and lvl in residence.times:
+            hours += residence.times[lvl] / 3600
+        else:
+            hours += RESIDENCE_BASE_SECONDS.get(lvl, 8000) * factor / 3600
+    missing = max(0, count - village.settlers)
+    return hours + missing * settler_seconds / 3600

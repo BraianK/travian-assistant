@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 from datetime import date, datetime
+import time
 from pathlib import Path
 from time import monotonic
 
@@ -3572,6 +3573,36 @@ class VillageBuildWidget(QWidget):
         bank_row.addWidget(self.bank_granaries)
         bank_row.addStretch()
         status_layout.addLayout(bank_row)
+        settle_row = QHBoxLayout()
+        settle_row.addWidget(QLabel("Osadnicy:"))
+        self.settle_village = QComboBox()
+        self.settle_village.setMinimumWidth(140)
+        settle_row.addWidget(self.settle_village)
+        self.settle_count = QSpinBox()
+        self.settle_count.setRange(1, 6)
+        self.settle_count.setSuffix(" osadn.")
+        settle_row.addWidget(self.settle_count)
+        settle_row.addWidget(QLabel("gotowi za"))
+        self.settle_hours = QSpinBox()
+        self.settle_hours.setRange(1, 240)
+        self.settle_hours.setSuffix(" h")
+        settle_row.addWidget(self.settle_hours)
+        settle_set = QPushButton("Ustaw")
+        settle_set.setToolTip(
+            "Wioska zbuduje budynek główny do 5 i rezydencję do 10, a potem wyszkoli "
+            "osadników — zaczynając tak wcześnie, żeby byli gotowi na ten czas "
+            "(np. na punkty kultury). Pozostałe wioski dowiozą surowce."
+        )
+        settle_set.clicked.connect(self._set_settle_goal)
+        settle_row.addWidget(settle_set)
+        settle_off = QPushButton("Wyłącz")
+        settle_off.clicked.connect(lambda: self._emit("settle_village", ""))
+        settle_row.addWidget(settle_off)
+        self.settle_status = QLabel()
+        self.settle_status.setObjectName("secondaryText")
+        settle_row.addWidget(self.settle_status)
+        settle_row.addStretch()
+        status_layout.addLayout(settle_row)
         storage_row = QHBoxLayout()
         storage_row.addWidget(QLabel("Magazyn i spichlerz na co najmniej:"))
         self.storage_hours = QSpinBox()
@@ -3937,6 +3968,24 @@ class VillageBuildWidget(QWidget):
         if not self._loading:
             self.setting_changed.emit(field, value)
 
+    def _set_settle_goal(self):
+        village_id = self.settle_village.currentData()
+        if not village_id:
+            return
+        self._emit("settle_ready_at", time.time() + self.settle_hours.value() * 3600)
+        self._emit("settle_settlers", self.settle_count.value())
+        self._emit("settle_village", str(village_id))
+
+    def _show_settle(self, settings):
+        if settings.settle_village and settings.settle_ready_at:
+            name = self.settle_village.itemText(max(0, self.settle_village.findData(settings.settle_village)))
+            self.settle_status.setText(
+                f"cel: {name or settings.settle_village}, {settings.settle_settlers} osadn. na "
+                f"{datetime.fromtimestamp(settings.settle_ready_at):%d.%m %H:%M}"
+            )
+        else:
+            self.settle_status.setText("brak celu")
+
     def _on_item_changed(self, item: QTableWidgetItem):
         if self._loading or item.column() != 0:
             return
@@ -3962,6 +4011,10 @@ class VillageBuildWidget(QWidget):
             self.bank_checkbox.setChecked(settings.crop_bank)
             self.bank_fill.setValue(settings.crop_bank_fill_percent)
             self.bank_granaries.setChecked(settings.crop_bank_granaries)
+            self.settle_count.setValue(settings.settle_settlers)
+            if settings.settle_ready_at:
+                self.settle_hours.setValue(max(1, min(240, round((settings.settle_ready_at - time.time()) / 3600))))
+            self._show_settle(settings)
             self.storage_hours.setValue(settings.storage_hours)
             self.recruitment_reserve.setValue(settings.recruitment_reserve_hours)
             self.master_builder_slots.setValue(settings.master_builder_slots)
@@ -4127,6 +4180,14 @@ class VillageBuildWidget(QWidget):
     def update_snapshot(self, snapshot, disabled_villages: set[str]):
         self._loading = True
         try:
+            current = self.settle_village.currentData()
+            names = [(plan.village.id, plan.village.name) for plan in snapshot.plans]
+            if [self.settle_village.itemData(i) for i in range(self.settle_village.count())] != [i for i, _ in names]:
+                self.settle_village.clear()
+                for village_id, name in names:
+                    self.settle_village.addItem(name, village_id)
+                if current:
+                    self.settle_village.setCurrentIndex(max(0, self.settle_village.findData(current)))
             self._fill_plans(snapshot, disabled_villages)
             self._fill_transfers(snapshot)
         finally:
@@ -8259,6 +8320,8 @@ class MainWindow(QMainWindow):
         if not self._save_recruitment_settings():
             setattr(self.settings.build, field, previous)
             return
+        if field.startswith("settle_"):
+            self.build_tab._show_settle(self.settings.build)
         self._run_build(click=False)
 
     def _set_build_overflow_unit(self, village_id: str, unit: int):
