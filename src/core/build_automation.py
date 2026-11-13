@@ -819,8 +819,20 @@ class BuildAutomation:
                     continue
                 if step is None:
                     continue
+                ready_now = plan.ready_now
+                if not ready_now and plan.queue_free and not step.train:
+                    # The queue would stand idle for a while: a later planned
+                    # step that can start right away goes first.
+                    other = vb.affordable_alternative(plan)
+                    if other is not None:
+                        self._log(
+                            f"{village.name}: {step.name} {step.from_level}→{step.from_level + 1} czeka "
+                            f"~{plan.afford_hours * 60:.0f} min na surowce — najpierw "
+                            f"{other.name} {other.from_level}→{other.from_level + 1}, na który są od razu."
+                        )
+                        step, ready_now = other, True
                 label = f"{village.name}: {step.name} {step.from_level}→{step.from_level + 1}"
-                if not plan.ready_now:
+                if not ready_now:
                     if (
                         settings.npc_mode != "auto"
                         or village.id not in snapshot.npc

@@ -1542,3 +1542,18 @@ def test_raid_lead_counts_merchant_trips():
     assert lead == 3600
     donor.resources = {r: 3000 for r in vb.RESOURCES}  # 12 000 -> 1 trip -> 15 min + 2
     assert vb.raid_lead_seconds(donor, [p.village for p in plans], {"1"}, {3: 24}, 1, 600, 3600) == 900 + 120
+
+
+def test_idle_queue_takes_an_affordable_later_step():
+    expensive = _field(1, 3, 3)
+    expensive.costs = {lvl: {1: 9801, 2: 7837, 3: 2939, 4: 5878} for lvl in expensive.costs}
+    cheap = _field(2, 2, 3)
+    cheap.costs = {lvl: {1: 7837, 2: 3918, 3: 7837, 4: 4898} for lvl in cheap.costs}
+    village = _village([expensive, cheap], resources=9000, production={1: 2600, 2: 2600, 3: 2000, 4: 2500})
+    village.resources = {1: 9036, 2: 19155, 3: 43728, 4: 15041}
+    plan = vb.plan_village(village, 10, 0)
+    plan.steps = [s for s in plan.steps if s.location == 1][:1] + [s for s in plan.steps if s.location == 2][:1]
+    plan.afford_hours = 0.3
+    assert vb.affordable_alternative(plan).location == 2
+    plan.afford_hours = 0.1  # a few minutes: just wait
+    assert vb.affordable_alternative(plan) is None

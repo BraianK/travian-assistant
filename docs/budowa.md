@@ -122,6 +122,8 @@ Ustawienie `master_builder_slots` (4) określa, ile kolejnych kroków trzyma si�
   - żaden transport do wioski nie jest w drodze.
 
   Wraca do kolejki, gdy plan do niego dojdzie.
+- **Wolna kolejka:** gdy pierwszy krok planu czekałby na surowce co najmniej 15 min, a jeden z trzech kolejnych kroków (na innym polu/budynku) jest dostępny od razu, automat buduje ten dostępny.
+- **Osadnicy:** dopóki trwa przygotowanie osadników, wpisy rezydencji nigdy nie są usuwane z kolejki budowniczego.
 - **Bez kręcenia się w kółko:** miejsca dodanego albo usuniętego automat nie dotyka przez 30 min.
 
 ---

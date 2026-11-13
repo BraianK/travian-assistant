@@ -2052,7 +2052,10 @@ def master_replacements(
     multipliers = production_multipliers(free)
     keep_counts = dict(wanted)
     replace = []
+    settling = bool(plan_options.get("settle_level")) and village.residence is not None
     for entry in unpaid:  # queue order
+        if settling and entry.location == village.residence.location:
+            continue  # settlers: residence levels are never taken out
         if keep_counts.get(entry.location, 0) > 0:
             keep_counts[entry.location] -= 1
             continue
@@ -3293,3 +3296,36 @@ def raid_lead_seconds(
     trips = math.ceil(sum(raid_exposed(village).values()) / per_trip) if per_trip > 0 else 0
     round_trip = max(2 * distance(village, target) / speed * 3600, 60.0)
     return max(min_seconds, min(max_seconds, trips * round_trip + 120))
+
+
+# An idle queue: wait at least this long for step 1 before a later step goes first.
+IDLE_ALTERNATIVE_HOURS = 0.25
+# Only this many planned steps are looked at for an alternative.
+IDLE_ALTERNATIVE_DEPTH = 4
+
+
+def affordable_alternative(plan: VillagePlan) -> Step | None:
+    """With the queue free and step 1 waiting at least IDLE_ALTERNATIVE_HOURS
+    for resources: the first of the next planned steps (on a building not
+    planned before it, so its level is the current one) that the village can
+    pay right now."""
+    step = plan.next_step
+    if (
+        step is None or not plan.queue_free or plan.afford_hours is None
+        or plan.afford_hours < IDLE_ALTERNATIVE_HOURS
+    ):
+        return None
+    stock = plan.village.build_resources()
+    queue = QUEUE_RESOURCES if step.is_field else QUEUE_VILLAGE
+    seen = {step.location}
+    for other in plan.steps[1:IDLE_ALTERNATIVE_DEPTH]:
+        if other.location in seen or other.train:
+            seen.add(other.location)
+            continue
+        seen.add(other.location)
+        other_queue = QUEUE_RESOURCES if other.is_field else QUEUE_VILLAGE
+        if plan.village.free_slots.get(other_queue, 0) <= 0 and other_queue != queue:
+            continue
+        if all(other.costs.get(r, 0) <= stock[r] for r in RESOURCES):
+            return other
+    return None
