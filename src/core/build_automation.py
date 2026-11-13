@@ -77,6 +77,11 @@ class BuildSnapshot:
     merchant_speed: dict[int, float] = field(default_factory=dict)
     world_speed: float = 1.0
     crop_bank: str | None = None  # village id of the crop bank (setting on)
+    # Village id -> server time the last attack of the current wave lands.
+    threats_last: dict[str, float] = field(default_factory=dict)
+    unit_speeds: dict[int, float] = field(default_factory=dict)
+    # Village id -> seconds before the attack the evacuation starts.
+    raid_leads: dict[str, float] = field(default_factory=dict)
 
 
 # Hero production: re-check the best setting this often, and keep a new
@@ -93,6 +98,38 @@ HERO_STALL_SECONDS = 10 * 60
 RAID_SHIPMENT_WINDOW_HOURS = 2.0
 # While an attack is about to land the villages are checked this often.
 RAID_RECHECK_SECONDS = 60
+# Attacks on a village landing within this long of each other are one wave:
+# the troops stay away until the last one has landed.
+EVASION_WAVE_SECONDS = 180
+# The troops come back once the last attack has landed this long ago.
+EVASION_RETURN_AFTER_SECONDS = 10
+# Too late to leave: the attack lands sooner than this.
+EVASION_MIN_SECONDS = 15
+
+
+def wave_ends(attacks, server_time: float) -> dict[str, float]:
+    """Village id -> landing of the last hostile attack in the first wave."""
+    times: dict[str, list[float]] = {}
+    for attack in attacks or []:
+        if str(attack.get("movement_type") or "") == "Zwiad":
+            continue
+        try:
+            arrival = float(attack.get("arrival_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        village_id = str(attack.get("village_id") or "")
+        if village_id and arrival > server_time - 60:
+            times.setdefault(village_id, []).append(arrival)
+    result = {}
+    for village_id, arrivals in times.items():
+        arrivals.sort()
+        last = arrivals[0]
+        for arrival in arrivals[1:]:
+            if arrival - last > EVASION_WAVE_SECONDS:
+                break
+            last = arrival
+        result[village_id] = last
+    return result
 
 
 def hostile_arrivals(attacks, server_time: float) -> dict[str, float]:
@@ -197,6 +234,10 @@ class BuildAutomation:
         # (village id, landing time) already reported as "nothing to save".
         self._raid_noted: set[tuple[str, float]] = set()
         self._crop_bank: str | None = None
+        # Evaded troops: village id -> {"target", "until", "units"}.
+        self._evaded: dict[str, dict] = {}
+        # Village id -> server time its merchants are back from an evacuation.
+        self._merchants_back: dict[str, float] = {}
         self._first_steps: dict[str, list] = {}
         # Settlers goal: village id -> (residence level, settlers) while active.
         self._settle: dict[str, tuple[int, int]] = {}
@@ -400,7 +441,18 @@ class BuildAutomation:
         finish = {}
         npc = {}
         waits = []
-        threats = hostile_arrivals(self._threats(), server_time) if settings.raid_protection else {}
+        attacks = list(self._threats() or []) + list(state.get("attacks") or [])
+        threats = hostile_arrivals(attacks, server_time) if settings.raid_protection else {}
+        raid_leads: dict[str, float] = {}
+        threats_last = wave_ends(attacks, server_time) if settings.troop_evasion else {}
+        if settings.troop_evasion:
+            for village_id, landing in hostile_arrivals(attacks, server_time).items():
+                start = landing - settings.troop_evasion_seconds - server_time - 10
+                if start > 0:
+                    waits.append(start)
+            for village_id, info in self._evaded.items():
+                back = info["until"] + EVASION_RETURN_AFTER_SECONDS - server_time
+                waits.append(max(5.0, back))
         if threats:
             # Shipments into a village about to be raided feed the attacker.
             transfers = [
@@ -409,14 +461,30 @@ class BuildAutomation:
                     threats, t.target_id, server_time, t.travel_hours, RAID_SHIPMENT_WINDOW_HOURS,
                 )
             ]
-            for landing in threats.values():
-                start = landing - settings.raid_lead_minutes * 60 - server_time
+            by_id = {p.village.id: p.village for p in plans}
+            for village_id, landing in threats.items():
+                village = by_id.get(village_id)
+                lead = settings.raid_lead_minutes * 60
+                if village is not None:
+                    back = self._merchants_back.get(village_id)
+                    if back is not None and server_time >= back and village.marketplace is not None:
+                        # The game shows returned merchants late: count them.
+                        village.merchants_free = max(village.merchants_free, village.marketplace.level)
+                    lead = vb.raid_lead_seconds(
+                        village, [p.village for p in plans], set(threats), merchant_speed,
+                        float(state.get("world_speed") or 1),
+                        settings.raid_lead_minutes * 60, settings.raid_lead_max_minutes * 60,
+                    )
+                raid_leads[village_id] = lead
+                start = landing - lead - server_time
                 if start > 0:
                     waits.append(start + 5)
                 else:
                     # Inside the window: check again as soon as merchants may
                     # be back for another trip.
-                    waits.append(RAID_RECHECK_SECONDS)
+                    back = self._merchants_back.get(village_id)
+                    waits.append(max(5.0, back - server_time + 2) if back and back > server_time
+                                 else RAID_RECHECK_SECONDS)
         for plan in plans:
             if settings.finish_mode != "off":
                 if gold_plan is not None:
@@ -476,6 +544,14 @@ class BuildAutomation:
                 saved = npc_saving(plan, settings.npc_min_saved_minutes)
                 if saved is not False:
                     npc[plan.village.id] = saved
+        # The game does not let some buildings finish instantly (residence).
+        blocked = {int(t) for t in state.get("no_instant_finish") or []}
+        if blocked:
+            finish = {
+                village_id: kept
+                for village_id, offers in finish.items()
+                if (kept := [o for o in offers if o.building_type not in blocked])
+            }
         self.snapshot = BuildSnapshot(
             plans=plans,
             transfers=transfers,
@@ -495,6 +571,9 @@ class BuildAutomation:
             merchant_speed=merchant_speed,
             world_speed=float(state.get("world_speed") or 1),
             crop_bank=self._crop_bank,
+            threats_last=threats_last,
+            raid_leads=raid_leads,
+            unit_speeds={int(k): float(v) for k, v in (state.get("unit_speeds") or {}).items()},
             troops={
                 int(k): {
                     "costs": {int(r): float(v) for r, v in (info.get("costs") or {}).items()},
@@ -511,14 +590,21 @@ class BuildAutomation:
         settings = self._settings()
         if not settings.enabled or self.halted:
             return snapshot
-        acted = self._act(snapshot, settings)
+        evaded = False
+        if settings.troop_evasion and (snapshot.threats_last or self._evaded):
+            # Seconds matter: troops go out (and come back) before anything else.
+            evaded = self._evade(snapshot, settings)
+            if evaded:
+                snapshot = self.refresh()
+        acted = self._act(snapshot, settings) or evaded
         if not self.halted and self._train(snapshot, settings):
             acted = True
         if not self.halted and settings.hero_production_auto and self._hero(snapshot):
             acted = True
         imminent = {
             village_id: landing for village_id, landing in snapshot.threats.items()
-            if landing - snapshot.server_time <= settings.raid_lead_minutes * 60
+            if landing - snapshot.server_time
+            <= snapshot.raid_leads.get(village_id, settings.raid_lead_minutes * 60)
         }
         if not self.halted and imminent:
             if acted:
@@ -844,6 +930,100 @@ class BuildAutomation:
             self._log(f"{label}: wysłano D/G/Ż/Z {amounts} ({transfer.reason}).")
         return sent
 
+    # -- troop evasion ------------------------------------------------------------
+    def _evade(self, snapshot: BuildSnapshot, settings) -> bool:
+        """Own troops leave as reinforcement to the nearest safe own village
+        shortly before a hostile attack lands, and come back after the
+        attack wave (they travel back as long as they went)."""
+        acted = False
+        now = snapshot.server_time
+        plans = {plan.village.id: plan for plan in snapshot.plans}
+        villages = [plan.village for plan in snapshot.plans]
+        first = {}
+        for attack_village, landing in snapshot.threats_last.items():
+            first[attack_village] = landing
+        arrivals = hostile_arrivals(
+            [{"village_id": v, "arrival_time": t, "movement_type": "Atak"} for v, t in snapshot.threats.items()],
+            now,
+        ) if snapshot.threats else {}
+        # Leave: the first attack of the wave lands within the evasion time.
+        for village_id, landing in arrivals.items():
+            plan = plans.get(village_id)
+            if plan is None or village_id in self._evaded or village_id in settings.disabled_villages:
+                continue
+            left = landing - now
+            if left > settings.troop_evasion_seconds or left < EVASION_MIN_SECONDS:
+                continue
+            village = plan.village
+            units = dict(village.units_home)
+            if not units:
+                continue
+            target = vb.evasion_target(villages, village, set(snapshot.threats))
+            if target is None:
+                self._log(f"{village.name}: atak za {left:.0f} s — brak bezpiecznej wioski na unik wojsk.")
+                continue
+            if self.abandoned:
+                return acted
+            logger.info("Village build action: %s troop evasion to %s %s", village.name, target.name, units)
+            try:
+                sent = self._executor.send_troops(village.id, target.x, target.y, 5, units)
+            except GoldGuardError as error:
+                self.halted = str(error)
+                self._log(f"{village.name}: STOP — {error}")
+                return acted
+            except Exception as error:
+                self._log(f"{village.name}: unik wojsk nie powiódł się — {error}")
+                continue
+            acted = True
+            until = snapshot.threats_last.get(village_id, landing)
+            self._evaded[village_id] = {"target": target.id, "until": until, "units": sent}
+            travel = vb.evasion_travel_seconds(sent, snapshot.unit_speeds, vb.distance(village, target))
+            total = sum(sent.values())
+            self._log(
+                f"{village.name}: unik — {total} jednostek wyszło jako posiłki do {target.name} "
+                f"(atak za {left:.0f} s, droga ~{travel / 60:.0f} min; powrót po ataku "
+                f"{time.strftime('%H:%M:%S', time.localtime(until))})."
+            )
+        # Come back: the wave has landed.
+        for village_id, info in list(self._evaded.items()):
+            plan = plans.get(village_id)
+            if plan is None:
+                self._evaded.pop(village_id, None)
+                continue
+            still = snapshot.threats_last.get(village_id)
+            if still is not None and still > info["until"]:
+                info["until"] = still  # another attack joined the wave
+            if now < info["until"] + EVASION_RETURN_AFTER_SECONDS:
+                continue
+            village = plan.village
+            support = [
+                s for s in village.units_elsewhere
+                if str(s.get("location")) == str(info["target"])
+            ]
+            if not support:
+                # Still on the way there (or already back): try again shortly.
+                if now > info["until"] + 3 * 3600:
+                    self._evaded.pop(village_id, None)
+                continue
+            if self.abandoned:
+                return acted
+            target = plans.get(str(info["target"]))
+            try:
+                self._executor.recall_troops(village.id, str(info["target"]), info["units"])
+            except GoldGuardError as error:
+                self.halted = str(error)
+                self._log(f"{village.name}: STOP — {error}")
+                return acted
+            except Exception as error:
+                self._log(f"{village.name}: powrót wojsk z uniku nie powiódł się — {error}")
+                continue
+            acted = True
+            self._evaded.pop(village_id, None)
+            self._log(
+                f"{village.name}: wojska wracają z {target.village.name if target else 'posiłków'} po ataku."
+            )
+        return acted
+
     # -- settlers -----------------------------------------------------------------
     def _settle_goal(self, villages, settings, server_time) -> dict[str, tuple[int, int]]:
         """The settlers goal while it has to be worked on: start early enough
@@ -1022,6 +1202,7 @@ class BuildAutomation:
                 continue
             acted = True
             self._sent_at[source.id] = now
+            self._merchants_back[source.id] = snapshot.server_time + 2 * evacuation.travel_hours * 3600 + 5
             for r in vb.RESOURCES:
                 shipped[source.id][r] += float(accepted.get(r, 0) or 0)
             amounts = " / ".join(f"{accepted.get(r, 0):,}".replace(",", " ") for r in vb.RESOURCES)

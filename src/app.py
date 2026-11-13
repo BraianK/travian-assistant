@@ -3544,6 +3544,23 @@ class VillageBuildWidget(QWidget):
         raid_row.addWidget(self.raid_minutes)
         raid_row.addStretch()
         status_layout.addLayout(raid_row)
+        evade_row = QHBoxLayout()
+        self.evade_checkbox = QCheckBox("Unik wojskami: przed atakiem wyprowadzaj wojsko na")
+        self.evade_checkbox.setToolTip(
+            "Gdy atak lub napad (nie zwiad) zaraz dotrze, wojsko wioski (bez bohatera) wychodzi "
+            "jako posiłki do najbliższej własnej wioski, która nie jest atakowana. Po ostatnim "
+            "ataku fali automat wycofuje dokładnie te jednostki z powrotem (plac zbiórki → "
+            "Stacjonujące → Wycofaj). Wojska w drodze nie biorą udziału w walce."
+        )
+        self.evade_checkbox.toggled.connect(lambda checked: self._emit("troop_evasion", checked))
+        evade_row.addWidget(self.evade_checkbox)
+        self.evade_seconds = QSpinBox()
+        self.evade_seconds.setRange(30, 600)
+        self.evade_seconds.setSuffix(" s przed atakiem")
+        self.evade_seconds.valueChanged.connect(lambda v: self._emit("troop_evasion_seconds", v))
+        evade_row.addWidget(self.evade_seconds)
+        evade_row.addStretch()
+        status_layout.addLayout(evade_row)
         bank_row = QHBoxLayout()
         self.bank_checkbox = QCheckBox(
             "Bank zboża w stolicy: spichlerze do maks., nadwyżki zboża do stolicy, mielenie u handlarza przy"
@@ -4008,6 +4025,8 @@ class VillageBuildWidget(QWidget):
             self.hero_checkbox.setChecked(settings.hero_production_auto)
             self.raid_checkbox.setChecked(settings.raid_protection)
             self.raid_minutes.setValue(settings.raid_lead_minutes)
+            self.evade_checkbox.setChecked(settings.troop_evasion)
+            self.evade_seconds.setValue(settings.troop_evasion_seconds)
             self.bank_checkbox.setChecked(settings.crop_bank)
             self.bank_fill.setValue(settings.crop_bank_fill_percent)
             self.bank_granaries.setChecked(settings.crop_bank_granaries)

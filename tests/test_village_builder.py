@@ -1480,3 +1480,65 @@ def test_settle_goal_starts_early_enough():
     assert automation._settle_goal([village], settings, 0) == {}  # 100 h ahead: not yet
     assert automation._settle_goal([village], settings, 90 * 3600) == {"5": (10, 3)}
     assert any("osadnicy" in line for line in logs)
+
+
+# Troop evasion ------------------------------------------------------------------------
+
+
+class _EvadeExecutor:
+    def __init__(self):
+        self.sent = []
+        self.recalled = []
+
+    def send_troops(self, source_id, x, y, movement_type, units):
+        self.sent.append((source_id, x, y, movement_type, dict(units)))
+        return dict(units)
+
+    def recall_troops(self, village_id, location_id, units):
+        self.recalled.append((village_id, location_id, dict(units)))
+        return dict(units)
+
+
+def test_troops_leave_before_the_attack_and_come_back_after():
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation, BuildSnapshot
+
+    settings = BuildSettings(enabled=True, troop_evasion_seconds=90)
+    executor = _EvadeExecutor()
+    automation = BuildAutomation(None, lambda: settings, lambda _t: None, executor=executor)
+    home = _village([_field(1, 1, 3)], vid="1")
+    home.units_home = {1: 96, 6: 9}
+    near = _village([_field(1, 1, 3)], vid="2", x=1)
+    far = _village([_field(1, 1, 3)], vid="3", x=20)
+    plans = [vb.plan_village(v, 10, 0) for v in (home, near, far)]
+    snap = lambda now, threats: BuildSnapshot(
+        plans=plans, server_time=now, threats=threats, threats_last=threats, unit_speeds={1: 14, 6: 38})
+    assert not automation._evade(snap(0, {"1": 300.0}), settings)  # 5 min ahead: not yet
+    assert automation._evade(snap(220, {"1": 300.0}), settings)  # 80 s ahead: leave
+    assert executor.sent == [("1", 1, 0, 5, {1: 96, 6: 9})]  # nearest safe village
+    assert not automation._evade(snap(305, {}), settings)  # landed, troops still travelling
+    home.units_elsewhere = [{"troop_id": 7, "location": "2", "units": {"1": 96, "6": 9}}]
+    assert automation._evade(snap(320, {}), settings)
+    assert executor.recalled == [("1", "2", {1: 96, 6: 9})]
+
+
+def test_wave_end_keeps_troops_away_for_close_attacks():
+    from src.core.build_automation import wave_ends
+
+    attacks = [
+        {"village_id": "1", "arrival_time": 100, "movement_type": "Atak"},
+        {"village_id": "1", "arrival_time": 200, "movement_type": "Napad"},
+        {"village_id": "1", "arrival_time": 1000, "movement_type": "Atak"},
+        {"village_id": "1", "arrival_time": 150, "movement_type": "Zwiad"},
+    ]
+    assert wave_ends(attacks, 0) == {"1": 200}
+
+
+def test_raid_lead_counts_merchant_trips():
+    plans = _raid_villages(resources=60_000)  # marketplace 10: 10 x 2000 = 20 000 per trip
+    donor = plans[0].village
+    lead = vb.raid_lead_seconds(donor, [p.village for p in plans], {"1"}, {3: 24}, 1, 600, 3600)
+    # 240 000 lootable -> 12 trips; 3 fields at 24/h -> 15 min round trip: capped at 1 h.
+    assert lead == 3600
+    donor.resources = {r: 3000 for r in vb.RESOURCES}  # 12 000 -> 1 trip -> 15 min + 2
+    assert vb.raid_lead_seconds(donor, [p.village for p in plans], {"1"}, {3: 24}, 1, 600, 3600) == 900 + 120

@@ -179,6 +179,31 @@ READ_BUILD_STATE_JS = r"""(() => {
                 }
                 return out;
             })(),
+            // Own units at home (unit number 1-10 -> count, hero excluded) and
+            // own units standing as reinforcement elsewhere (to bring back).
+            units_home: (() => {
+                const out = {};
+                const stationary = typeof Troops !== "undefined" ? Troops.getCollection("stationary", id) : null;
+                for (const row of (stationary && stationary.data) || []) {
+                    const d = row.data || {};
+                    if (String(d.playerId) !== String(Travian.Player.data.playerId) || d.status !== "home") continue;
+                    for (const [nr, count] of Object.entries(d.units || {})) {
+                        if (Number(nr) >= 1 && Number(nr) <= 10 && Number(count) > 0)
+                            out[nr] = (out[nr] || 0) + Number(count);
+                    }
+                }
+                return out;
+            })(),
+            units_elsewhere: (() => {
+                const out = [];
+                const elsewhere = typeof Troops !== "undefined" ? Troops.getCollection("elsewhere", id) : null;
+                for (const row of (elsewhere && elsewhere.data) || []) {
+                    const d = row.data || {};
+                    if (d.status !== "support") continue;
+                    out.push({troop_id: Number(d.troopId), location: String(d.villageIdLocation), units: d.units || {}});
+                }
+                return out;
+            })(),
             // Settlers of this village: at home and in the training queue.
             settlers: (() => {
                 const unit = Object.entries(Travian.Config.troopConfig || {}).find(([, t]) =>
@@ -249,6 +274,39 @@ READ_BUILD_STATE_JS = r"""(() => {
         })(),
         merchant_speed: Travian.Config.merchantSpeed || {},
         world_speed: Number(Travian.Config.TG_SPEED) || 1,
+        // Speed (fields per hour, world speed included) of the tribe's units by number.
+        unit_speeds: (() => {
+            const out = {};
+            const tribe = Number(Travian.Player.data.tribeId) || 0;
+            const factor = Number(Travian.Config.TG_TROOP_SPEED) || 1;
+            for (const troop of Object.values(Travian.Config.troopConfig || {})) {
+                if (Number(troop.tribe) === tribe) out[Number(troop.nr)] = Number(troop.speed) * factor;
+            }
+            return out;
+        })(),
+        // Building types the game does not let finish instantly (residence, ...).
+        no_instant_finish: Object.entries(Travian.Config.buildingConfig || {})
+            .filter(([, c]) => c && c.canFinishInstantly === false).map(([t]) => Number(t)),
+        // Hostile movements on the way to own villages (read every time, so
+        // attacks already flying when the app started count too).
+        attacks: (() => {
+            const out = [];
+            if (typeof Troops === "undefined" || typeof Troops.getCollection !== "function") return out;
+            for (const id of [...new Set(ids)]) {
+                const c = Troops.getCollection(Troops.COLLECTION_MOVING, String(id));
+                for (const row of (c && c.data) || []) {
+                    if (typeof row.getMovementGroup !== "function"
+                        || row.getMovementGroup(Number(id)) !== "incoming_attacks") continue;
+                    const m = (row.data || {}).movement || {};
+                    out.push({
+                        village_id: String(m.villageIdTarget || id),
+                        arrival_time: Number(m.timeFinish) || 0,
+                        movement_type: Number(m.movementType) === Number(Troops.MOVEMENT_TYPE_SPY) ? "Zwiad" : "Atak",
+                    });
+                }
+            }
+            return out;
+        })(),
         villages
     };
 })()"""
@@ -745,6 +803,129 @@ class BuildClickExecutor:
         self._close_option_menu(lane)
         spent = gold_before - self._gold(lane)
         return f"traded:{spent}"
+
+    # -- troops ---------------------------------------------------------------------
+    def _send_troops(self, source_id, target_x, target_y, movement_type, units) -> dict:
+        """Send own troops from the rally point window, like a player: pick
+        the mission, type the units, check the confirmation, press send."""
+        units = {int(nr): int(count) for nr, count in units.items() if int(count) > 0}
+        if not units:
+            raise ValueError("No units to send.")
+        lane = self._ensure_lane()
+        lane.wake()
+        self._close_windows(lane)
+        lane.prepare(str(source_id), int(target_x), int(target_y), int(movement_type), units, ())
+        lane.fire()
+        try:
+            lane.wait_for(
+                "!document.querySelector('.modalWrapper.sendTroops button.sendTroops')", timeout=8,
+            )
+        except ClickModeError:
+            pass
+        state = lane.read()
+        self._close_windows(lane)
+        if not state.get("ok"):
+            raise ClickModeError(f"Wojska nie wyruszyły: {state.get('error')}")
+        return units
+
+    def _recall_troops(self, village_id: str, location_village_id: str, units: dict[int, int]) -> dict:
+        """Bring own reinforcements home from another village, like a player:
+        rally point -> Stationed -> Withdraw at that village, type exactly
+        *units* (others standing there stay), press Withdraw."""
+        village_id = str(village_id)
+        location_village_id = str(location_village_id)
+        units = {int(nr): int(count) for nr, count in units.items() if int(count) > 0}
+        if not units or not village_id.isdigit() or not location_village_id.isdigit():
+            raise ValueError("Invalid recall.")
+        lane = self._ensure_lane()
+        lane.wake()
+        self._close_windows(lane)
+        self._select_village(lane, village_id)
+        self._show_page(lane, "village")
+        location = lane.evaluate(
+            "((id) => { const d = ((Building.getCollection(id) || {}).data || []).map(r => r.data)"
+            ".find(d => Number(d.buildingType) === 16); return d ? Number(d.locationId) : null; })"
+            f"({json.dumps(village_id)})"
+        )
+        if not location:
+            raise ClickModeError("Wioska nie ma placu zbiórki.")
+        try:
+            lane.wait_for(f"!!document.querySelector('#buildingImage{int(location)}')", timeout=10)
+        except ClickModeError:
+            raise ClickModeError("Nie znaleziono placu zbiórki w widoku wioski.") from None
+        time.sleep(0.6)
+        self._close_option_menu(lane)
+        self._click(lane, f"#buildingImage{int(location)}", accept=f"openBuildingDialog({int(location)})")
+        window = ".modalWrapper.building"
+        try:
+            lane.wait_for(f"!!document.querySelector('{window} .naviTabDeployed')", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Okno placu zbiórki się nie otworzyło.") from None
+        self._click(lane, f"{window} .naviTabDeployed")
+        button = f"{window} .jsButtonSendTroopsBack"
+        find = (
+            "((target) => { const buttons = [...document.querySelectorAll(" + json.dumps(button) + ")];"
+            " return buttons.findIndex(b => { let p = b; for (let i = 0; i < 8 && p; i++) {"
+            " if (p.querySelector && p.querySelector(\"[clickable*=\\\"'cellId': \" + target + \"}\\\"]\"))"
+            " return true; p = p.parentElement; } return false; }); })"
+            f"({json.dumps(location_village_id)})"
+        )
+        try:
+            lane.wait_for(f"({find}) >= 0", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Nie znaleziono posiłków w tej wiosce.") from None
+        time.sleep(1.5)  # let the list finish rendering
+        self._click(lane, button, int(lane.evaluate(find)))
+        dialog = ".modalWrapper.sendTroops"
+        withdraw = f"{dialog} button.jsButtonSendTroopsBack"
+        try:
+            lane.wait_for(f"!!document.querySelector('{withdraw}')", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Okno wycofania wojsk się nie otworzyło.") from None
+        time.sleep(0.5)
+        inputs = f"{dialog} input"
+        for nr in range(1, 12):
+            selector = f"{dialog} input.unitInput{nr - 1}"
+            position = lane.rect(selector)
+            wanted = units.get(nr, 0)
+            if position is None or position.get("disabled"):
+                if wanted:
+                    self._close_windows(lane)
+                    raise ClickModeError(f"Pole jednostki {nr} jest niedostępne.")
+                continue
+            self._type_at(lane, selector, 0, str(wanted))
+        time.sleep(0.4)
+        typed = lane.evaluate(
+            "[...Array(11).keys()].map(i => { const e = document.querySelector("
+            + json.dumps(dialog) + " + ' input.unitInput' + i);"
+            " return e ? Number((e.value || '').replace(/\\D/g, '')) || 0 : 0; })"
+        ) or []
+        if any(int(typed[nr - 1] if nr - 1 < len(typed) else 0) != units.get(nr, 0) for nr in range(1, 12)):
+            self._close_windows(lane)
+            raise ClickModeError(f"Okno wycofania pokazuje inne jednostki ({typed}) niż plan — przerwano.")
+        self._click(lane, withdraw)
+        try:
+            lane.wait_for(f"!document.querySelector('{withdraw}')", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie potwierdziła wycofania wojsk.") from None
+        self._close_windows(lane)
+        return units
+
+    @_exclusive
+    def recall_troops(self, village_id, location_village_id, units) -> dict:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "wycofanie wojsk"):
+            return self._recall_troops(village_id, location_village_id, units)
+
+    @_exclusive
+    def send_troops(self, source_id, target_x, target_y, movement_type, units) -> dict:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "wysyłka wojsk"):
+            return self._send_troops(source_id, target_x, target_y, movement_type, units)
 
     # -- NPC merchant in the marketplace ---------------------------------------------
     def _npc_convert(

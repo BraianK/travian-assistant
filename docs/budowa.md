@@ -259,6 +259,17 @@ Tryby: „zalecenia” pokazuje tabelę wysyłek, „automat” klika je na targ
 - **Po ataku:** surowce zostają w wioskach, do których pojechały. Zwykłe transfery (punkt 7) odeślą je tam, gdzie będą potrzebne.
 - Wioski z listy „bez działań” są pomijane.
 
+- **Kiedy zaczyna ewakuację:** tak wcześnie, żeby kupcy zdążyli wywieźć wszystko, co da się złupić: liczba kursów × czas kursu tam i z powrotem (kupcy wracają tyle samo, ile idą) + 2 min. Nigdy krócej niż `raid_lead_minutes` (10) ani dłużej niż `raid_lead_max_minutes` (60). Automat sam pamięta, kiedy kupcy wrócą, i wtedy od razu wysyła następny kurs. Gra pokazuje wolnych kupców z opóźnieniem.
+- **Skąd wie o atakach:** z nasłuchu zakładki Ataki oraz z odczytu ruchów wojsk przy każdym odczycie stanu gry. Dzięki temu widzi też ataki, które leciały już przy starcie aplikacji.
+
+## 11a-2. Unik wojskami (`troop_evasion`, `troop_evasion_seconds`)
+
+- **Kiedy:** atak lub napad (nie zwiad) dotrze za mniej niż ustawiony czas (domyślnie 90 s). Automat budzi się dokładnie na ten moment.
+- **Co robi:** całe wojsko wioski bez bohatera (jednostki 1–10) wychodzi jako posiłki do najbliższej własnej wioski, która nie jest atakowana. Wysyła je klikaniem w oknie wysyłki wojsk i sprawdza ekran potwierdzenia. Wojska w drodze nie biorą udziału w walce.
+- **Fala ataków:** ataki w odstępach do 3 min traktuje jako jedną falę. Wojsko wraca dopiero po ostatnim ataku fali (+10 s).
+- **Powrót:** plac zbiórki → Stacjonujące → Wycofaj przy tej wiosce. Automat wpisuje dokładnie te jednostki, które wysłał, więc inne posiłki stojące w tej samej wiosce zostają.
+- Wioski z listy „bez działań” są pomijane. Bohatera obsługuje osobna opcja w zakładce ataków.
+
 ---
 
 ## 11b. Bank zboża (`crop_bank`, `crop_bank_fill_percent`)

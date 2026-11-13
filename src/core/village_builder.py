@@ -139,6 +139,9 @@ class Village:
     # to one resource): not counted when sizing storage.
     hero_excess: dict[int, float] = field(default_factory=dict)
     residence: Building | None = None  # residence or palace (settlers)
+    units_home: dict[int, int] = field(default_factory=dict)  # unit number -> count (no hero)
+    # Own reinforcements standing elsewhere: [{troop_id, location, units}].
+    units_elsewhere: list[dict] = field(default_factory=list)
     # Settlers (home + in training), their unit type, costs and seconds each.
     settlers: int = 0
     settler_unit: int = 0
@@ -1858,6 +1861,8 @@ def village_from_raw(raw: dict) -> Village:
         unit_queue_end={int(k): float(v) for k, v in (raw.get("unit_queue_end") or {}).items()},
         protected=float(raw.get("protected") or 0),
         residence=next((b for b in buildings if b.type in (RESIDENCE, PALACE)), None),
+        units_home={int(k): int(v) for k, v in (raw.get("units_home") or {}).items() if int(v) > 0},
+        units_elsewhere=list(raw.get("units_elsewhere") or []),
         settlers=int((raw.get("settlers") or {}).get("home") or 0)
         + int((raw.get("settlers") or {}).get("queued") or 0),
         settler_unit=int((raw.get("settlers") or {}).get("unit") or 0),
@@ -3253,3 +3258,38 @@ def settle_hours(village: Village, level: int, count: int, settler_seconds: floa
             hours += RESIDENCE_BASE_SECONDS.get(lvl, 8000) * factor / 3600
     missing = max(0, count - village.settlers)
     return hours + missing * settler_seconds / 3600
+
+
+# Troop evasion ----------------------------------------------------------------------
+
+
+def evasion_target(villages: list[Village], source: Village, unsafe: set[str]) -> Village | None:
+    """The nearest own village not under attack, for the evading troops."""
+    options = [v for v in villages if v.id != source.id and v.id not in unsafe]
+    return min(options, key=lambda v: distance(source, v)) if options else None
+
+
+def evasion_travel_seconds(units: dict[int, int], speeds: dict[int, float], fields: float) -> float:
+    """Travel time of the slowest unit sent over *fields*."""
+    slowest = min((speeds.get(nr, 0) for nr, count in units.items() if count > 0), default=0)
+    return fields / slowest * 3600 if slowest > 0 else 0.0
+
+
+def raid_lead_seconds(
+    village: Village, villages: list[Village], unsafe: set[str],
+    merchant_speed: dict[int, float], world_speed: float,
+    min_seconds: float, max_seconds: float,
+) -> float:
+    """How long before an attack lands the evacuation has to start so the
+    merchants can carry all lootable stock to the nearest safe village: the
+    trips needed times the round trip (merchants come back as long as they
+    went), plus a couple of minutes; between *min_seconds* and *max_seconds*."""
+    market = village.marketplace
+    speed = merchant_fields_per_hour(village.tribe, merchant_speed, world_speed)
+    target = evasion_target(villages, village, unsafe)
+    if market is None or village.merchant_carry <= 0 or speed <= 0 or target is None:
+        return min_seconds
+    per_trip = market.level * village.merchant_carry
+    trips = math.ceil(sum(raid_exposed(village).values()) / per_trip) if per_trip > 0 else 0
+    round_trip = max(2 * distance(village, target) / speed * 3600, 60.0)
+    return max(min_seconds, min(max_seconds, trips * round_trip + 120))

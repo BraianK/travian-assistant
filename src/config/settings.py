@@ -408,6 +408,8 @@ class BuildSettings(BaseModel):
     # Before an incoming attack lands: spend or send away what could be looted.
     raid_protection: bool = True
     raid_lead_minutes: int = Field(default=10, ge=2, le=60)
+    # ... but earlier when the merchants need more trips (at most this long).
+    raid_lead_max_minutes: int = Field(default=60, ge=5, le=240)
     # Crop bank: the capital's granaries go up to the maximum level, the other
     # villages send their spare crop there and once they are nearly full the
     # NPC merchant (gold) turns the crop into what the network lacks.
@@ -418,6 +420,11 @@ class BuildSettings(BaseModel):
     crop_bank_granaries: bool = True
     # Settlers: village that prepares them ("" = off), server time they must be
     # ready by, how many, and the residence level they need.
+    # Troop evasion: before a hostile attack lands, the village's own troops
+    # leave as reinforcement to the nearest safe own village and come back
+    # after it. They leave this many seconds before the attack lands.
+    troop_evasion: bool = True
+    troop_evasion_seconds: int = Field(default=90, ge=30, le=600)
     settle_village: str = ""
     settle_ready_at: float = Field(default=0.0, ge=0)
     settle_settlers: int = Field(default=3, ge=1, le=6)
@@ -482,7 +489,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.1")
+    version: str = Field(default="1.3.2")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
