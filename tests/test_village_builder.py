@@ -1,8 +1,22 @@
 """Tests for the resource-field build planner and transfer advisor."""
 
-import pytest
+import math
 
 from src.core import village_builder as vb
+
+
+
+class _approx:
+    """Equal within a relative tolerance (CI runs the tests with unittest)."""
+
+    def __init__(self, expected, rel=1e-6):
+        self.expected, self.rel = expected, rel
+
+    def __eq__(self, actual):
+        return math.isclose(actual, self.expected, rel_tol=self.rel)
+
+    def __repr__(self):
+        return f"~{self.expected}"
 
 
 def _field(location, type_, level, cost=100, gain_per_level=10, max_level=10, supply_step=1, queued=0):
@@ -1762,17 +1776,17 @@ def test_completion_forecast_per_village_and_network():
     # 900 of each resource. Wood grows on the way (the wood field's effect
     # 30 → 50, scaled to the production the game reports: +33/h on
     # average), the others stay at 100/h and decide, resource by resource.
-    assert forecast.villages["A"] == pytest.approx(900 / 100)
+    assert forecast.villages["A"] == _approx(900 / 100)
     assert forecast.limits["A"] == 2  # clay, the first of the slowest
-    assert forecast.villages["B"] == pytest.approx(900 / 1000)
+    assert forecast.villages["B"] == _approx(900 / 1000)
     # Everything already in stock: only the build queue is left.
-    assert forecast.villages["C"] == pytest.approx(1 / 3)
+    assert forecast.villages["C"] == _approx(1 / 3)
     assert forecast.queue_bound["C"] and not forecast.queue_bound["A"]
     assert forecast.limits["C"] is None
     assert forecast.villages["D"] == 0.0
     # Shared resources: the network pays for both villages together, the
     # finished village D helps with its 100/h.
-    assert forecast.hours == pytest.approx(1800 / 1300)
+    assert forecast.hours == _approx(1800 / 1300)
     assert forecast.network_limit == 2
 
 
@@ -1781,14 +1795,14 @@ def test_completion_forecast_does_not_trade_one_resource_for_another():
     village = _village([_field(1, 1, 3)], resources=0, vid="A",
                        production={1: 100, 2: 10, 3: 100, 4: 5000})
     forecast = vb.completion_forecast([vb.VillagePlan(village=village, target=5)])
-    assert forecast.villages["A"] == pytest.approx(900 / 10)
+    assert forecast.villages["A"] == _approx(900 / 10)
     assert forecast.limits["A"] == 2 and not forecast.queue_bound["A"]
 
 
 def test_completion_forecast_counts_the_running_build_and_no_production():
     queued = _village([_field(1, 1, 3)], resources=100_000, vid="A")
     plan = vb.VillagePlan(village=queued, target=5, queue_hours=2.0)
-    assert vb.completion_forecast([plan]).villages["A"] == pytest.approx(2 + 1 / 3)
+    assert vb.completion_forecast([plan]).villages["A"] == _approx(2 + 1 / 3)
     idle = _village([_field(1, 1, 3, gain_per_level=0)], resources=0, vid="B",
                     production={1: 0, 2: 0, 3: 0, 4: 0})
     forecast = vb.completion_forecast([vb.VillagePlan(village=idle, target=5)])
