@@ -392,6 +392,9 @@ class BuildSettings(BaseModel):
     enabled: bool = False
     capital_target: int = Field(default=14, ge=1, le=20)
     village_target: int = Field(default=10, ge=1, le=20)
+    # Towns (the game's isTown, or villages marked here) go to this level.
+    town_target: int = Field(default=12, ge=1, le=20)
+    town_villages: set[str] = Field(default_factory=set)
     # Villages the automation must not build in (planned and shown anyway).
     disabled_villages: set[str] = Field(default_factory=set)
     transfer_min_saved_minutes: int = Field(default=30, ge=5, le=1440)
@@ -475,6 +478,14 @@ class BuildSettings(BaseModel):
     # training without pause (queue at least this long).
     military_queue_hours: float = Field(default=24, ge=1, le=72)
     military_saturated_hours: float = Field(default=20, ge=1, le=72)
+    # Continuous training in the active army villages, paid before building:
+    # percent of the building's full training speed (stable, barracks), at
+    # most this percent of the village's production (wood+clay+iron), and
+    # paused while the whole network makes less net crop than the floor.
+    military_stable_percent: int = Field(default=100, ge=0, le=100)
+    military_barracks_percent: int = Field(default=25, ge=0, le=100)
+    military_max_percent: int = Field(default=50, ge=0, le=100)
+    military_crop_floor: int = Field(default=1500, ge=0, le=1_000_000)
     # Finish a running warehouse/granary with gold when each gold saves at
     # least this many resources from overflowing (0 = never).
     overflow_finish_per_gold: int = Field(default=2000, ge=0, le=1_000_000)
@@ -489,7 +500,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.3")
+    version: str = Field(default="1.3.4")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)

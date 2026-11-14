@@ -313,6 +313,8 @@ READ_BUILD_STATE_JS = r"""(() => {
 
 
 LANE_MARKER = "travian-assistant-lane"
+# The background tab is reloaded this often, so its game models stay fresh.
+LANE_REFRESH_SECONDS = 30 * 60
 
 
 def is_lane_tab(tab) -> bool:
@@ -487,7 +489,25 @@ class BuildClickExecutor:
         # Mark the tab, so a later start can close it if it is left behind.
         lane.evaluate(f"(() => {{ window.name = {json.dumps(LANE_MARKER)}; return 1; }})()")
         self._lane = lane
+        self._lane_opened = time.monotonic()
         return lane
+
+    @_exclusive
+    def read_state(self) -> dict:
+        """Read the game state from the background tab. The player's own tab
+        can stop updating its models (e.g. idle behind the welcome screen),
+        which once hid a build about to finish; this tab is kept awake and
+        reloaded every LANE_REFRESH_SECONDS."""
+        lane = self._lane
+        if lane is not None and time.monotonic() - getattr(self, "_lane_opened", 0) > LANE_REFRESH_SECONDS:
+            lane.close()
+            self._lane = None
+        lane = self._ensure_lane()
+        lane.wake()
+        value = lane.evaluate(READ_BUILD_STATE_JS, timeout=10)
+        if not isinstance(value, dict) or not isinstance(value.get("villages"), list):
+            raise RuntimeError("Gra zwróciła nieprawidłowe dane budynków.")
+        return value
 
     @_exclusive
     def close(self) -> None:
@@ -497,6 +517,14 @@ class BuildClickExecutor:
 
     def _close_windows(self, lane: _Lane) -> None:
         """Close open game windows with the Escape key (no aiming needed)."""
+        # A fresh background tab can get the site's cookie banner, which
+        # covers the bottom bar (master builder slots). Only hidden in this
+        # tab: the player's own consent choice stays untouched.
+        lane.evaluate(
+            "(() => { document.querySelectorAll('.cmpwrapper, #cmpwrapper')"
+            ".forEach(e => { e.style.setProperty('display', 'none', 'important');"
+            " e.style.setProperty('pointer-events', 'none', 'important'); }); return 1; })()"
+        )
         for _ in range(4):
             if not lane.evaluate("!!document.querySelector('.modalWrapper')"):
                 return

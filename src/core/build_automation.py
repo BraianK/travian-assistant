@@ -267,6 +267,12 @@ class BuildAutomation:
         self._hero_stall_next = 0.0
         self._military_targets: dict[str, dict[int, int]] = {}
         self._military_first: set[str] = set()
+        # village id -> building type -> hourly cost of its continuous training.
+        self._continuous: dict[str, dict[int, dict[int, float]]] = {}
+        # (village id, building type) -> server time up to which the reserved
+        # (throttled) training is already paid for.
+        self._continuous_until: dict[tuple[str, int], float] = {}
+        self._crop_brake_noted = False
         # village -> {("added"|"cancelled", location): monotonic time}
         self._recent_master: dict[str, dict] = {}
         self.snapshot = BuildSnapshot()
@@ -281,7 +287,13 @@ class BuildAutomation:
     def refresh(self) -> BuildSnapshot:
         """Read the game and compute the plan and recommendations (no clicking)."""
         settings = self._settings()
-        state = read_build_state(self._session)
+        # The background tab first (the player's tab may have stale models).
+        reader = getattr(self._executor, "read_state", None)
+        try:
+            state = reader() if callable(reader) else read_build_state(self._session)
+        except Exception as error:
+            logger.warning("Reading the game from the background tab failed (%s); using the game tab", error)
+            state = read_build_state(self._session)
         villages = []
         missing = []
         for raw in state["villages"]:
@@ -326,6 +338,17 @@ class BuildAutomation:
             villages, settings, server_time,
         )
         self._military_targets, self._military_first = military_targets, military_first
+        # Continuous training is paid before building: its hourly cost is
+        # taken out of the production the planner builds and ships with.
+        self._continuous = self._continuous_rates(villages, state.get("troops") or {}, settings)
+        for village_id, rates in self._continuous.items():
+            village = next(v for v in villages if v.id == village_id)
+            for rate in rates.values():
+                for r, amount in rate.items():
+                    village.recruitment[r] = village.recruitment.get(r, 0.0) + amount
+                    village.recruitment_reserve[r] = (
+                        village.recruitment_reserve.get(r, 0.0) + amount * settings.recruitment_reserve_hours
+                    )
         self._crop_bank = (
             vb.crop_bank_village(villages, settings.crop_bank_village) if settings.crop_bank else None
         )
@@ -355,6 +378,8 @@ class BuildAutomation:
             military_first=military_first,
             granary_max={self._crop_bank} if self._crop_bank and settings.crop_bank_granaries else None,
             settle=self._settle,
+            town_target=settings.town_target,
+            towns=set(settings.town_villages),
         )
         merchant_speed = {}
         for key, value in (state.get("merchant_speed") or {}).items():
@@ -645,6 +670,7 @@ class BuildAutomation:
             if village.id in settings.disabled_villages or self._backoff.get(village.id, 0) > now:
                 continue
             finished_here = False
+            step = None
             try:
                 if finish and settings.finish_mode != "off":
                     for offer in snapshot.finish.get(village.id, []):
@@ -680,7 +706,31 @@ class BuildAutomation:
                     continue
                 # Resources in stock for the next master builder entry: reserve
                 # them now (they leave the storage and cannot overflow).
-                if settings.master_builder_slots > 0:
+                waiting_settlers = plan.next_step is not None and plan.next_step.train
+                if waiting_settlers:
+                    # The game itself starts master builder entries when the queue
+                    # frees: unreserved ones would eat the settlers' resources.
+                    entry = next(
+                        (e for e in reversed(village.queue) if e.queue_type == 4 and not e.paid), None,
+                    )
+                    if entry is not None:
+                        name = (vb.FIELD_NAMES.get(entry.building_type)
+                                or vb.BUILDING_NAMES.get(entry.building_type, f"budynek {entry.building_type}"))
+                        if acted:
+                            time.sleep(CLICK_PAUSE_SECONDS)
+                        if self.abandoned:
+                            return acted
+                        logger.info("Village build action: %s cancel master %s (settlers)", village.name, entry.id)
+                        self._executor.cancel_master(village.id, entry.id)
+                        self._recent_master.setdefault(village.id, {})[("cancelled", entry.location)] = time.monotonic()
+                        acted = True
+                        self._log(
+                            f"{village.name}: z kolejki budowniczego usunięto {name} — "
+                            f"wioska czeka na osadników, surowce idą na nich."
+                        )
+                        continue
+                if settings.master_builder_slots > 0 and not waiting_settlers:
+                    # (Waiting for settlers: their resources must not be reserved for fields.)
                     reservable = vb.reservable_master_entry(village)
                     if reservable is not None:
                         entry, _costs = reservable
@@ -714,6 +764,9 @@ class BuildAutomation:
                     )
                     recent = self._recent_master.get(village.id, {})
                     now_m = time.monotonic()
+                    if village.id == settings.settle_village:
+                        # A settlers goal is set here: its residence stays queued.
+                        stale = [e for e in stale if e.building_type not in (vb.RESIDENCE, vb.PALACE)]
                     stale = [
                         e for e in stale
                         if now_m - recent.get(("added", e.location), -1e9) > MASTER_CHURN_SECONDS
@@ -737,6 +790,11 @@ class BuildAutomation:
                         continue  # fill the freed slot on a fresh read
                 if settings.master_builder_slots > 0 and settings.master_replan:
                     stalled = vb.stalled_master_entry(plan)
+                    if (
+                        stalled is not None and village.id == settings.settle_village
+                        and stalled[0].building_type in (vb.RESIDENCE, vb.PALACE)
+                    ):
+                        stalled = None  # the settlers' residence waits for its resources
                     recent = self._recent_master.get(village.id, {})
                     if (
                         stalled is not None
@@ -787,6 +845,8 @@ class BuildAutomation:
                         settle_level=self._settle.get(village.id, (0, 0))[0],
                         settle_count=self._settle.get(village.id, (0, 0))[1],
                     )
+                    if master_step is not None and not self._can_construct(village, master_step):
+                        master_step = None  # requirements only met by planned levels: later
                     if master_step is not None:
                         step = master_step
                     if (
@@ -831,6 +891,18 @@ class BuildAutomation:
                             f"{other.name} {other.from_level}→{other.from_level + 1}, na który są od razu."
                         )
                         step, ready_now = other, True
+                if not self._can_construct(village, step):
+                    # A new building whose requirements the game does not see yet
+                    # (they come from levels still planned): try a later step.
+                    other = next(
+                        (s for s in plan.steps[1:vb.IDLE_ALTERNATIVE_DEPTH]
+                         if not s.construct and not s.train and s.location != step.location
+                         and all(s.costs.get(r, 0) <= village.build_resources()[r] for r in vb.RESOURCES)),
+                        None,
+                    )
+                    if other is None or not plan.queue_free:
+                        continue
+                    step, ready_now = other, True
                 label = f"{village.name}: {step.name} {step.from_level}→{step.from_level + 1}"
                 if not ready_now:
                     if (
@@ -885,7 +957,11 @@ class BuildAutomation:
                 self._backoff[village.id] = now + STALE_BACKOFF_SECONDS
                 self._log(f"{village.name}: dane gry jeszcze się odświeżały ({error}) — ponowię za chwilę.")
             except ClickModeError as error:
-                self._backoff[village.id] = now + FAILURE_BACKOFF_SECONDS
+                if step is not None and step.construct:
+                    # Only this new building waits; fields and upgrades go on.
+                    self._backoff[f"construct:{village.id}:{step.type}"] = now + FAILURE_BACKOFF_SECONDS
+                else:
+                    self._backoff[village.id] = now + FAILURE_BACKOFF_SECONDS
                 self._log(f"{village.name}: nie wykonano — {error}")
             except Exception as error:  # browser/tab problems
                 logger.exception("Build click failed")
@@ -941,6 +1017,15 @@ class BuildAutomation:
             amounts = " / ".join(f"{accepted.get(r, 0):,}".replace(",", " ") for r in vb.RESOURCES)
             self._log(f"{label}: wysłano D/G/Ż/Z {amounts} ({transfer.reason}).")
         return sent
+
+    def _can_construct(self, village, step) -> bool:
+        """A new building only when the game's current levels meet its requirements."""
+        if not step.construct:
+            return True
+        if self._backoff.get(f"construct:{village.id}:{step.type}", 0) > time.monotonic():
+            return False  # failed a moment ago: other steps first
+        info = self._construct_config.get(step.type) or {}
+        return vb.requirements_met(village, info.get("requirements"))
 
     # -- troop evasion ------------------------------------------------------------
     def _evade(self, snapshot: BuildSnapshot, settings) -> bool:
@@ -1401,6 +1486,52 @@ class BuildAutomation:
                 first.add(village_id)
         return targets, first, active
 
+    def _continuous_rates(self, villages, troops, settings) -> dict[str, dict[int, dict[int, float]]]:
+        """Hourly cost of the continuous training per active army village and
+        building: the chosen share of the building's full speed, scaled down
+        to at most the chosen share of the village's production."""
+        percents = {20: settings.military_stable_percent, 19: settings.military_barracks_percent}
+        if not any(percents.values()) or not self._military_active:
+            return {}
+        crop = sum(v.production.get(4, 0) for v in villages)
+        if crop < settings.military_crop_floor:
+            if not self._crop_brake_noted:
+                self._crop_brake_noted = True
+                self._log(
+                    f"stała rekrutacja wstrzymana: sieć ma {crop:.0f} zboża/h na plusie "
+                    f"(próg {settings.military_crop_floor}/h) — wojsko tylko z nadwyżki."
+                )
+            return {}
+        self._crop_brake_noted = False
+        by_id = {v.id: v for v in villages}
+        out = {}
+        for entry in self._military_active:
+            village = by_id.get(str(entry.get("village_id")))
+            if village is None or village.id in settings.disabled_villages:
+                continue
+            rates = {}
+            for building, unit in (entry.get("units") or {}).items():
+                building, unit = int(building), int(unit)
+                percent = percents.get(building, 0)
+                info = troops.get(str(unit)) or troops.get(unit) or {}
+                seconds = village.unit_times.get(unit, 0)
+                if percent <= 0 or seconds <= 0 or building not in village.recruit_buildings:
+                    continue
+                per_hour = 3600.0 / seconds * percent / 100
+                costs = {int(r): float(v) for r, v in (info.get("costs") or {}).items()}
+                if not any(costs.values()):
+                    continue
+                rates[building] = {r: costs.get(r, 0.0) * per_hour for r in vb.RESOURCES}
+            produced = sum(max(0.0, village.production.get(r, 0)) for r in (1, 2, 3))
+            limit = produced * settings.military_max_percent / 100
+            used = sum(sum(rate.values()) for rate in rates.values())
+            if used > limit:
+                scale = limit / used if used else 0.0
+                rates = {b: {r: a * scale for r, a in rate.items()} for b, rate in rates.items()}
+            if rates and limit > 0:
+                out[village.id] = rates
+        return out
+
     def _train(self, snapshot, settings) -> bool:
         """Keep the chosen units training in the active army villages, paid
         from what building does not need now (next step and queue unblock
@@ -1424,6 +1555,13 @@ class BuildAutomation:
                 r: village.build_resources()[r] - reserve.get(r, 0)
                 for r in vb.RESOURCES
             }
+            continuous = self._continuous.get(village.id, {})
+            # Stock actually held in the recruitment reserve, split by the
+            # hourly cost of each continuously training building.
+            held = {
+                r: min(village.resources.get(r, 0.0), village.recruitment_reserve.get(r, 0.0))
+                for r in vb.RESOURCES
+            }
             for building in present:
                 unit = units[building]
                 info = snapshot.troops.get(unit)
@@ -1434,8 +1572,25 @@ class BuildAutomation:
                     continue
                 share = 1.0 / len(present)
                 costs = info["costs"]
+                budget = {r: max(0.0, spare[r]) * share for r in vb.RESOURCES}
+                rate = continuous.get(building)
+                fraction = 0.0
+                seconds = village.unit_times.get(unit, 0)
+                if rate and seconds > 0:
+                    full = {r: costs.get(r, 0) * 3600 / seconds for r in vb.RESOURCES}
+                    fraction = max((rate[r] / full[r] for r in vb.RESOURCES if full[r] > 0), default=0.0)
+                    window = (
+                        settings.military_queue_hours * 3600 if fraction >= 0.999
+                        else max(3600.0, settings.recruitment_reserve_hours * 3600.0)
+                    )
+                    key = (village.id, building)
+                    if self._continuous_until.get(key, 0.0) - snapshot.server_time < window:
+                        for r in vb.RESOURCES:
+                            total = village.recruitment.get(r, 0.0)
+                            if total > 0:
+                                budget[r] += held[r] * rate.get(r, 0.0) / total
                 count = min(
-                    int(max(0.0, spare[r]) * share // costs[r])
+                    int(budget[r] // costs[r])
                     for r in vb.RESOURCES if costs.get(r, 0) > 0
                 )
                 if count < 5:
@@ -1463,8 +1618,16 @@ class BuildAutomation:
                     self._training_until[(village.id, building)] = (
                         snapshot.server_time + float(result.get("queue_seconds") or 0)
                     )
+                    trained = int(result.get("quantity") or 0)
                     for r in vb.RESOURCES:
-                        spare[r] -= costs.get(r, 0) * int(result.get("quantity") or 0)
+                        paid = costs.get(r, 0) * trained
+                        from_spare = min(paid, max(0.0, spare[r]) * share)
+                        held[r] = max(0.0, held[r] - (paid - from_spare))
+                        spare[r] -= from_spare
+                    if fraction > 0:
+                        key = (village.id, building)
+                        start = max(self._continuous_until.get(key, 0.0), snapshot.server_time)
+                        self._continuous_until[key] = start + trained * seconds / fraction
                     hours = float(result.get("queue_seconds") or 0) / 3600
                     self._log(
                         f"{village.name}: szkolenie {result.get('quantity')} × jednostka {unit} "

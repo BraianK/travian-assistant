@@ -1462,11 +1462,62 @@ def test_settlers_hold_the_village_until_trained():
     assert not any(s.train for s in plan.steps)
 
 
+def test_settlers_served_first_by_transfers():
+    settle = _settle_village(main_level=5)
+    settle.residence = _storage(19, 25, 10)
+    settle.resources = {r: 0 for r in vb.RESOURCES}
+    other = _village([_field(1, 1, 3, cost=1000)], resources=0, vid="1", x=0, y=12)
+    donor = _village([_field(1, 1, 9, max_level=10)], resources=50_000, vid="2", x=0, y=24,
+                     merchants=5, carry=2000)
+    plans = [vb.plan_village(other, 10, 0), vb.plan_village(donor, 10, 0),
+             vb.plan_village(settle, 10, 0, settle_level=10, settle_count=3)]
+    transfers = vb.plan_transfers(plans, {3: 24}, 1)
+    assert transfers and transfers[0].target_id == "5" and transfers[0].merchants == 5
+
+
+HAEDUAN = {"costs": {"1": 300, "2": 380, "3": 440, "4": 0}}
+PHALANX = {"costs": {"1": 85, "2": 100, "3": 50, "4": 0}}
+
+
+def _army_automation(**overrides):
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation
+
+    settings = BuildSettings(enabled=True, military_villages=[
+        {"village_id": "1", "units": {"19": 21, "20": 26}, "target_level": 20}], **overrides)
+    village = _village([_field(1, 1, 3)], production={1: 6000, 2: 6000, 3: 6000, 4: 4000})
+    village.recruit_buildings = {19, 20}
+    village.unit_times = {21: 99, 26: 546}
+    automation = BuildAutomation(None, lambda: settings, lambda text: None, executor=object())
+    automation._military_active = list(settings.military_villages)
+    return automation, settings, village
+
+
+def test_continuous_training_rates():
+    automation, settings, village = _army_automation()
+    village.production = {1: 7000, 2: 7000, 3: 7000, 4: 4000}
+    rates = automation._continuous_rates([village], {"26": HAEDUAN, "21": PHALANX}, settings)["1"]
+    # Stable at full speed: 3600 / 546 haeduans per hour; barracks at 25 %.
+    assert abs(rates[20][2] - 380 * 3600 / 546) < 1
+    assert abs(rates[19][1] - 85 * 3600 / 99 * 0.25) < 1
+    # Both (~9 500/h) under 50 % of 21 000/h production: not scaled down.
+    assert sum(sum(r.values()) for r in rates.values()) < 10_500
+
+
+def test_continuous_training_capped_and_braked():
+    automation, settings, village = _army_automation(military_max_percent=20)
+    rates = automation._continuous_rates([village], {"26": HAEDUAN, "21": PHALANX}, settings)["1"]
+    assert abs(sum(sum(r.values()) for r in rates.values()) - 3600) < 1  # 20 % of 18 000
+    village.production[4] = 1000  # network crop under the 1 500/h floor
+    assert automation._continuous_rates([village], {"26": HAEDUAN}, settings) == {}
+
+
 def test_settle_hours_counts_build_and_training():
     village = _settle_village()
     hours = vb.settle_hours(village, 10, 3, 11_350)
-    # main building 4 x 900 s + residence 0->10 (~30 500 s x 0.86) + 3 x 11 350 s
-    assert 15 < hours < 18
+    # main building 4 x 900 s + residence 0->10 (~30 500 s x 0.86)
+    # + 3 x 11 350 s x 0.9^9 (residence 10 trains faster)
+    assert 9 < hours < 12
 
 
 def test_settle_goal_starts_early_enough():
@@ -1557,3 +1608,18 @@ def test_idle_queue_takes_an_affordable_later_step():
     assert vb.affordable_alternative(plan).location == 2
     plan.afford_hours = 0.1  # a few minutes: just wait
     assert vb.affordable_alternative(plan) is None
+
+
+def test_towns_build_fields_to_the_town_target():
+    village = _village([_field(1, 1, 3)], vid="7")
+    assert vb.target_level(village, 14, 10, 12) == 10
+    village.is_town = True  # the game says it is a town
+    assert vb.target_level(village, 14, 10, 12) == 12
+    village.is_town = False
+    assert vb.target_level(village, 14, 10, 12, {"7"}) == 12  # marked by the player
+    village.is_capital = True
+    assert vb.target_level(village, 14, 10, 12, {"7"}) == 14
+    plain = _village([_field(1, 1, 3, max_level=12)], vid="8")
+    plain.is_town = True
+    plans = vb.plan_all([plain], 14, 10, 0, town_target=12)
+    assert plans[0].target == 12

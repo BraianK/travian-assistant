@@ -3465,6 +3465,16 @@ class VillageBuildWidget(QWidget):
         )
         settings_row.addWidget(self.village_target)
         settings_row.addSpacing(16)
+        settings_row.addWidget(QLabel("Miasta do poziomu:"))
+        self.town_target = QSpinBox()
+        self.town_target.setRange(1, 20)
+        self.town_target.setToolTip(
+            "Wioska zmieniona w miasto (gra to pokazuje sama) albo oznaczona niżej rozwija "
+            "pola do tego poziomu. Gra pozwala na więcej niż 10 dopiero w mieście."
+        )
+        self.town_target.valueChanged.connect(lambda value: self._emit("town_target", value))
+        settings_row.addWidget(self.town_target)
+        settings_row.addSpacing(16)
         settings_row.addWidget(QLabel("Transport, gdy oszczędza co najmniej:"))
         self.transfer_minutes = QSpinBox()
         self.transfer_minutes.setRange(5, 1440)
@@ -3590,6 +3600,25 @@ class VillageBuildWidget(QWidget):
         bank_row.addWidget(self.bank_granaries)
         bank_row.addStretch()
         status_layout.addLayout(bank_row)
+        town_row = QHBoxLayout()
+        town_row.addWidget(QLabel("Miasto:"))
+        self.town_village = QComboBox()
+        self.town_village.setMinimumWidth(140)
+        town_row.addWidget(self.town_village)
+        town_toggle = QPushButton("Oznacz / odznacz jako miasto")
+        town_toggle.setToolTip(
+            "Miasta gra rozpoznaje sama; to oznaczenie przydaje się, gdy chcesz planować "
+            "jak dla miasta (np. tuż po zmianie)."
+        )
+        town_toggle.clicked.connect(self._toggle_town)
+        town_row.addWidget(town_toggle)
+        self.town_status = QLabel()
+        self.town_status.setObjectName("secondaryText")
+        town_row.addWidget(self.town_status)
+        town_row.addStretch()
+        status_layout.addLayout(town_row)
+        self._towns_marked: set[str] = set()
+        self._towns_game: dict[str, str] = {}
         settle_row = QHBoxLayout()
         settle_row.addWidget(QLabel("Osadnicy:"))
         self.settle_village = QComboBox()
@@ -3965,6 +3994,49 @@ class VillageBuildWidget(QWidget):
         military_row.addWidget(self.military_saturated_hours)
         military_row.addStretch()
         layout.addLayout(military_row)
+        continuous_row = QHBoxLayout()
+        continuous_label = QLabel("Stała rekrutacja (przed budową): stajnia")
+        continuous_label.setToolTip(
+            "Część pełnego tempa szkolenia, którą automat trzyma bez przerwy w aktywnych "
+            "wioskach wojskowych. Ten koszt na godzinę planer odlicza od produkcji, więc "
+            "budowa i wysyłki liczą się z resztą. Nadwyżka nadal idzie na wojsko jak dotąd. "
+            "Wstrzymane, gdy cała sieć ma mniej zboża na plusie niż próg."
+        )
+        continuous_row.addWidget(continuous_label)
+        self.military_stable_percent = QSpinBox()
+        self.military_stable_percent.setRange(0, 100)
+        self.military_stable_percent.setSuffix(" %")
+        self.military_stable_percent.valueChanged.connect(
+            lambda v: self._emit("military_stable_percent", v)
+        )
+        continuous_row.addWidget(self.military_stable_percent)
+        continuous_row.addWidget(QLabel("koszary"))
+        self.military_barracks_percent = QSpinBox()
+        self.military_barracks_percent.setRange(0, 100)
+        self.military_barracks_percent.setSuffix(" %")
+        self.military_barracks_percent.valueChanged.connect(
+            lambda v: self._emit("military_barracks_percent", v)
+        )
+        continuous_row.addWidget(self.military_barracks_percent)
+        continuous_row.addWidget(QLabel("tempa, maks."))
+        self.military_max_percent = QSpinBox()
+        self.military_max_percent.setRange(0, 100)
+        self.military_max_percent.setSuffix(" % produkcji")
+        self.military_max_percent.valueChanged.connect(
+            lambda v: self._emit("military_max_percent", v)
+        )
+        continuous_row.addWidget(self.military_max_percent)
+        continuous_row.addWidget(QLabel("stop przy zbożu sieci poniżej"))
+        self.military_crop_floor = QSpinBox()
+        self.military_crop_floor.setRange(0, 1_000_000)
+        self.military_crop_floor.setSingleStep(500)
+        self.military_crop_floor.setSuffix(" /h")
+        self.military_crop_floor.valueChanged.connect(
+            lambda v: self._emit("military_crop_floor", v)
+        )
+        continuous_row.addWidget(self.military_crop_floor)
+        continuous_row.addStretch()
+        layout.addLayout(continuous_row)
         military_box = QWidget()
         self.military_grid = QGridLayout(military_box)
         self.military_grid.setContentsMargins(0, 0, 0, 0)
@@ -3984,6 +4056,28 @@ class VillageBuildWidget(QWidget):
     def _emit(self, field: str, value):
         if not self._loading:
             self.setting_changed.emit(field, value)
+
+    def _toggle_town(self):
+        village_id = self.town_village.currentData()
+        if not village_id:
+            return
+        marked = set(self._towns_marked)
+        marked.symmetric_difference_update({str(village_id)})
+        self._emit("town_villages", sorted(marked))
+
+    def _show_towns(self, marked=None):
+        if marked is not None:
+            self._towns_marked = set(marked)
+        names = {self.town_village.itemData(i): self.town_village.itemText(i)
+                 for i in range(self.town_village.count())}
+        game = sorted(self._towns_game.values())
+        manual = sorted(names.get(v, v) for v in self._towns_marked)
+        parts = []
+        if game:
+            parts.append("w grze: " + ", ".join(game))
+        if manual:
+            parts.append("oznaczone: " + ", ".join(manual))
+        self.town_status.setText("; ".join(parts) or "brak miast poza stolicą")
 
     def _set_settle_goal(self):
         village_id = self.settle_village.currentData()
@@ -4018,6 +4112,8 @@ class VillageBuildWidget(QWidget):
             self.enabled_toggle.blockSignals(False)
             self.capital_target.setValue(settings.capital_target)
             self.village_target.setValue(settings.village_target)
+            self.town_target.setValue(settings.town_target)
+            self._show_towns(settings.town_villages)
             self.transfer_minutes.setValue(settings.transfer_min_saved_minutes)
             self.main_building_checkbox.setChecked(settings.main_building)
             self.balance_checkbox.setChecked(settings.balance_resources)
@@ -4039,6 +4135,10 @@ class VillageBuildWidget(QWidget):
             self.master_builder_slots.setValue(settings.master_builder_slots)
             self.military_queue_hours.setValue(int(settings.military_queue_hours))
             self.military_saturated_hours.setValue(int(settings.military_saturated_hours))
+            self.military_stable_percent.setValue(settings.military_stable_percent)
+            self.military_barracks_percent.setValue(settings.military_barracks_percent)
+            self.military_max_percent.setValue(settings.military_max_percent)
+            self.military_crop_floor.setValue(settings.military_crop_floor)
             self.transfer_mode.setCurrentIndex(
                 max(0, self.transfer_mode.findData(settings.transfer_mode))
             )
@@ -4201,6 +4301,18 @@ class VillageBuildWidget(QWidget):
         try:
             current = self.settle_village.currentData()
             names = [(plan.village.id, plan.village.name) for plan in snapshot.plans]
+            if [self.town_village.itemData(i) for i in range(self.town_village.count())] != [i for i, _ in names]:
+                town_current = self.town_village.currentData()
+                self.town_village.clear()
+                for village_id, name in names:
+                    self.town_village.addItem(name, village_id)
+                if town_current:
+                    self.town_village.setCurrentIndex(max(0, self.town_village.findData(town_current)))
+            self._towns_game = {
+                plan.village.id: plan.village.name for plan in snapshot.plans
+                if plan.village.is_town and not plan.village.is_capital
+            }
+            self._show_towns()
             if [self.settle_village.itemData(i) for i in range(self.settle_village.count())] != [i for i, _ in names]:
                 self.settle_village.clear()
                 for village_id, name in names:
@@ -8341,6 +8453,8 @@ class MainWindow(QMainWindow):
             return
         if field.startswith("settle_"):
             self.build_tab._show_settle(self.settings.build)
+        if field == "town_villages":
+            self.build_tab._show_towns(self.settings.build.town_villages)
         self._run_build(click=False)
 
     def _set_build_overflow_unit(self, village_id: str, unit: int):

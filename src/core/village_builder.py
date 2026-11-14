@@ -138,6 +138,7 @@ class Village:
     # Hero production above its "all resources" setting (a temporary switch
     # to one resource): not counted when sizing storage.
     hero_excess: dict[int, float] = field(default_factory=dict)
+    is_town: bool = False  # a town: fields can go above 10 (the game's lvlMax)
     residence: Building | None = None  # residence or palace (settlers)
     units_home: dict[int, int] = field(default_factory=dict)  # unit number -> count (no hero)
     # Own reinforcements standing elsewhere: [{troop_id, location, units}].
@@ -260,8 +261,17 @@ class VillagePlan:
         )
 
 
-def target_level(village: Village, capital_target: int, village_target: int) -> int:
-    return capital_target if village.is_capital else village_target
+def target_level(
+    village: Village, capital_target: int, village_target: int,
+    town_target: int | None = None, towns: set[str] | None = None,
+) -> int:
+    """Field target: the capital's, a town's (the game says so, or the player
+    marked it), or a plain village's. The game's own maximum caps it anyway."""
+    if village.is_capital:
+        return capital_target
+    if town_target and (village.is_town or village.id in (towns or set())):
+        return town_target
+    return village_target
 
 
 def production_multipliers(village: Village) -> dict[int, float]:
@@ -820,7 +830,8 @@ def plan_village(
         plan.steps.append(Step(
             village_id=village.id, location=village.residence.location, type=village.residence.type,
             from_level=village.residence.level, costs=costs,
-            seconds=int(village.settler_seconds * missing_settlers), gain=0.0, payback_hours=None,
+            seconds=int(settler_seconds_at(village.settler_seconds, village.residence.level) * missing_settlers),
+            gain=0.0, payback_hours=None,
             reason=f"osadnicy: {missing_settlers} do wyszkolenia w rezydencji", train=True,
         ))
         depth = 0
@@ -1027,11 +1038,13 @@ def plan_all(
     military_first: set[str] | None = None,
     granary_max: set[str] | None = None,
     settle: dict[str, tuple[int, int]] | None = None,
+    town_target: int | None = None,
+    towns: set[str] | None = None,
 ) -> list[VillagePlan]:
     return [
         plan_village(
             v,
-            target_level(v, capital_target, village_target),
+            target_level(v, capital_target, village_target, town_target, towns),
             server_time,
             main_building=main_building,
             balanced=balanced,
@@ -1436,6 +1449,8 @@ def plan_transfers(
     # First: villages whose queue would stand idle because the next master
     # builder entry lacks resources (any village, also queue-bound ones).
     for receiver in plans:
+        if receiver.next_step is not None and receiver.next_step.train:
+            continue  # waiting for settlers: their cost is shipped as the next step
         blocked = blocking_deficit(receiver)
         if blocked is None:
             continue
@@ -1560,7 +1575,8 @@ def plan_transfers(
                 free_space[r] -= amount
     receivers = sorted(
         (p for p in plans if p.next_step),
-        key=lambda p: (p.queue_bound, p.next_step.payback_hours or math.inf),
+        # Settlers (a dated goal) come first, then the fastest payback.
+        key=lambda p: (not p.next_step.train, p.queue_bound, p.next_step.payback_hours or math.inf),
     )
     for receiver in receivers:
         village = receiver.village
@@ -1860,6 +1876,7 @@ def village_from_raw(raw: dict) -> Village:
         type_levels={int(k): int(v) for k, v in (raw.get("type_levels") or {}).items()},
         unit_queue_end={int(k): float(v) for k, v in (raw.get("unit_queue_end") or {}).items()},
         protected=float(raw.get("protected") or 0),
+        is_town=bool(raw.get("is_town")),
         residence=next((b for b in buildings if b.type in (RESIDENCE, PALACE)), None),
         units_home={int(k): int(v) for k, v in (raw.get("units_home") or {}).items() if int(v) > 0},
         units_elsewhere=list(raw.get("units_elsewhere") or []),
@@ -3234,6 +3251,14 @@ RESIDENCE_BASE_SECONDS = {0: 450, 1: 600, 2: 900, 3: 1390, 4: 2290, 5: 3190, 6: 
 # Start this much earlier than the pure build and training time: resources
 # have to be gathered and shipped.
 SETTLE_TIME_MARGIN = 1.25
+# Each residence level trains settlers this much faster (like the barracks:
+# level 1 100 %, level 3 81 %, ... level 10 ~39 %).
+RESIDENCE_TRAIN_FACTOR = 0.9
+
+
+def settler_seconds_at(base_seconds: float, residence_level: int) -> float:
+    """Training time of one settler with the residence at *residence_level*."""
+    return base_seconds * RESIDENCE_TRAIN_FACTOR ** max(0, residence_level - 1)
 SETTLE_BUFFER_HOURS = 4.0
 
 
@@ -3260,7 +3285,7 @@ def settle_hours(village: Village, level: int, count: int, settler_seconds: floa
         else:
             hours += RESIDENCE_BASE_SECONDS.get(lvl, 8000) * factor / 3600
     missing = max(0, count - village.settlers)
-    return hours + missing * settler_seconds / 3600
+    return hours + missing * settler_seconds_at(settler_seconds, level) / 3600
 
 
 # Troop evasion ----------------------------------------------------------------------

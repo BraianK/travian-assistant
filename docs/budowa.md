@@ -54,6 +54,7 @@ Po dokończeniu budowy w wiosce automat nic więcej w niej nie robi w tym cyklu.
 
 ### 3.1 Cel
 - Stolica: pola do `capital_target` (14). Pozostałe wioski: do `village_target` (10).
+- Miasta: pola do `town_target` (12). Automat sam rozpoznaje miasto z gry; wioskę można też oznaczyć ręcznie (`town_villages`).
 - Wioska z listy wyłączonych jest planowana i pokazywana, ale automat w niej nie działa.
 
 ### 3.2 Czy wioska czeka na kolejkę, czy na surowce
@@ -234,6 +235,15 @@ Tryby: „zalecenia” pokazuje tabelę wysyłek, „automat” klika je na targ
   - szkolenie jest płacone tylko z tego, czego budowa nie potrzebuje teraz, czyli poza rezerwą na następny krok i odblokowanie kolejki;
   - wolne surowce dzielone są po równo między budynki;
   - automat nie szkoli partii mniejszej niż 5 jednostek.
+- **Stała rekrutacja (przed budową):**
+  - stajnia szkoli w `military_stable_percent` (100%) pełnego tempa, a koszary w `military_barracks_percent` (25%);
+  - razem nie więcej niż `military_max_percent` (50%) produkcji wioski (drewno, glina i żelazo); powyżej tego tempo jest proporcjonalnie zmniejszane;
+  - koszt na godzinę planer odejmuje od produkcji wioski, więc budowa i wysyłki liczą się z resztą;
+  - zapas na `recruitment_reserve_hours` (2 h) tego szkolenia nie idzie na budowę ani do innych wiosek;
+  - koszary przy 25% dostają partię dopiero wtedy, gdy wcześniejsze partie przeliczone na 25% tempa się wyczerpują;
+  - nadwyżka nadal trafia na wojsko jak wyżej;
+  - gdy cała sieć ma mniej zboża na plusie niż `military_crop_floor` (1500/h), stała rekrutacja się wstrzymuje i wojsko idzie tylko z nadwyżki.
+- **Dlaczego stajnia na 100%, a koszary na 25%:** Heduan szkoli się około 9 min, więc godzin bez szkolenia w stajni nie da się odrobić. Falangę (99 s) koszary nadrobią szybko, gdy pojawią się nadwyżki.
 
 ---
 
@@ -303,6 +313,8 @@ Zboże rośnie szybciej, niż jest potrzebne, a jednostki w tym świecie nie kos
 - **Kiedy startuje:** termin minus (czas budowy i szkolenia × 1,25 + 4 h na zebranie surowców). Czas obejmuje budynek główny do 5 (wymóg rezydencji), rezydencję do celu i osadników po kolei. Dla poziomów rezydencji bez tabel z gry czas jest szacowany.
 - **Plan wioski:** najpierw budynek główny do 5, potem nowa rezydencja i jej poziomy. Pola idą dopiero po nich.
 - **Szkolenie:** gdy rezydencja ma poziom docelowy, plan wioski to tylko krok „osadnicy do wyszkolenia”. Jego koszt dowożą inne wioski, a pola i budowniczy czekają. Automat szkoli tylu osadników, na ilu starcza surowców, klikaniem w rezydencji.
+- **Czas szkolenia:** każdy poziom rezydencji skraca szkolenie o 10% (poziom 10: 0,9⁹ czasu bazowego).
+- **Wstrzymanie budowy:** gdy wioska czeka na osadników, automat usuwa z budowniczego niezarezerwowane wpisy (gra uruchamiałaby je sama). Trwającej budowy nie przerywa. Transport „kolejka stanie” pomija tę wioskę, a w przebiegu „przyspiesza następny krok” wioska z osadnikami jest obsługiwana jako pierwsza.
 - **Koniec:** gdy osadnicy są w domu lub w szkoleniu, a rezydencja ma poziom docelowy, zadanie wyłącza się samo. Dzięki temu po wysłaniu osadników automat nie szkoli kolejnych.
 
 ---
