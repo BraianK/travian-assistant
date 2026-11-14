@@ -150,6 +150,7 @@ Gra liczy: poniżej 5 min za darmo, poniżej 2 h za 1 złoto, powyżej za 2 zło
 Jeśli budżet jest ustawiony, decyduje on, a nie same progi:
 
 - **Rozdział:** `plan_gold_budget` liczy dla każdej przyszłej budowy, ile godzin kolejki da jedno złoto. Budżet idzie na najlepsze z nich, a **próg** to najsłabsza budowa, która się zmieściła (np. 1,5 h na złoto).
+- **Do kiedy warto:** złoto skraca kolejkę wioski tylko do czasu, w którym i tak czekałaby na surowce. Ten czas liczony jest dla każdego surowca osobno (nadmiar zboża nie zastępuje brakującej gliny). Wioska, która sama nie wyprodukuje surowców na swoje pola, liczy na pomoc sieci, więc nie skończy wcześniej, niż cała sieć wyprodukuje wszystko (licząc też wioski, które już skończyły pola).
 - **Kiedy płaci:** dokończenie jest płatne tylko wtedy, gdy:
   - jest warte co najmniej progu,
   - na następny krok w wiosce już są surowce (inaczej przyspieszenie nic nie da),
@@ -250,6 +251,7 @@ Tryby: „zalecenia” pokazuje tabelę wysyłek, „automat” klika je na targ
 ## 11. Bohater (`hero_production_auto`)
 
 - **Rachunek:** co 10 min automat liczy dla każdego z 5 ustawień produkcji bohatera (wszystkie surowce albo jeden z czterech), po ilu godzinach produkcji całej sieci najrzadszy surowiec pokryje wszystko, co zostało do celów (pola plus planowane magazyny i wojsko).
+- **Produkcja do celu:** liczy się średnia z dzisiejszej produkcji (po rekrutacji) i produkcji przy docelowych poziomach pól. Surowiec, którego pola są dziś nisko, a urosną najbardziej (np. żelazo w Aden), nie jest uznawany za najrzadszy tylko dlatego, że dziś go mało.
 - **Ilości:** jeden surowiec daje 4 razy więcej niż jeden surowiec przy „wszystkich”. Ilości automat odczytuje z okna bohatera, teraz 1 080 albo 4 320.
 - **Kiedy zmienia:** wybiera najlepsze ustawienie i przestawia je kliknięciami (Atrybuty → Hero production → Save changes), ale tylko przy zysku co najmniej 3% i nie częściej niż co 2 h.
 - **Kiedy przestaje:** po osiągnięciu wszystkich celów.
@@ -318,6 +320,14 @@ Zboże rośnie szybciej, niż jest potrzebne, a jednostki w tym świecie nie kos
 - **Koniec:** gdy osadnicy są w domu lub w szkoleniu, a rezydencja ma poziom docelowy, zadanie wyłącza się samo. Dzięki temu po wysłaniu osadników automat nie szkoli kolejnych.
 
 ---
+
+## 11d. Prognoza zakończenia budowy
+
+Na samym dole zakładki Budowa (`completion_forecast`), przeliczana co 5 min:
+
+- **Każda wioska:** dłuższy z dwóch czasów: kolejka (trwająca budowa i wszystkie brakujące poziomy pól) oraz wyprodukowanie tego, co te poziomy jeszcze kosztują, ponad zapasy i surowce w drodze. Każdy surowiec osobno, bez handlarza NPC. Produkcja to średnia z dzisiejszej (po rekrutacji) i docelowej. Obok jest to, co ogranicza: kolejka albo konkretny surowiec.
+- **Wszystkie wioski:** najdłuższa kolejka albo czas, w którym cała sieć wyprodukuje wszystko, co zostało (transporty dzielą surowce, wioski, które skończyły, pomagają innym).
+- **Pomija** magazyny, budynek główny i inne budynki. Poziomy, których gra nie podaje z wyprzedzeniem, nie są liczone.
 
 ## 12. Mapa zależności
 

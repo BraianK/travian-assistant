@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "travian-assistant"
-version = "1.3.5"
+version = "1.3.6"
 authors = [{ name = "Dzogurt" }]
 description = "Local desktop assistant for tracking villages and resources in Travian Kingdoms"
 requires-python = ">=3.12"

@@ -5,7 +5,7 @@ import json
 import sys
 import tempfile
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import time
 from pathlib import Path
 from time import monotonic
@@ -67,6 +67,7 @@ try:
     from src.core.gettertools_client import GetterToolsSession
     from src.core.scout_automation import ScoutAutomation, read_hero_xp
     from src.core.build_automation import BuildAutomation
+    from src.core.village_builder import completion_forecast
     from src.core.scout_planner import ScoutTarget
     from src.core.tournament_square import estimate_levels as estimate_square_levels
     from src.core.attack_operations import SCOUT_UNITS
@@ -128,6 +129,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.gettertools_client import GetterToolsSession
     from core.scout_automation import ScoutAutomation, read_hero_xp
     from core.build_automation import BuildAutomation
+    from core.village_builder import completion_forecast
     from core.scout_planner import ScoutTarget
     from core.tournament_square import estimate_levels as estimate_square_levels
     from core.attack_operations import SCOUT_UNITS
@@ -501,6 +503,8 @@ _DURATION_MODE_MAX_BATCH = 10_000
 _VACATION_CHECK_INTERVAL_MS = 30 * 1000
 _KINGDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000
 _BUILD_CHECK_INTERVAL_MS = 3 * 60 * 1000
+# The build completion forecast is recalculated at most this often.
+_FORECAST_INTERVAL_SECONDS = 5 * 60
 # A build check running longer than this is considered stuck.
 _BUILD_WORKER_STALL_SECONDS = 4 * 60
 _AUTO_RECRUITMENT_MAX_ORDERS_PER_SCAN = 10
@@ -4051,6 +4055,15 @@ class VillageBuildWidget(QWidget):
         self.log_list = QListWidget()
         self.log_list.setMinimumHeight(140)
         layout.addWidget(self.log_list)
+        forecast_title = QLabel("Prognoza zakończenia budowy")
+        forecast_title.setObjectName("sectionTitle")
+        layout.addWidget(forecast_title)
+        self.forecast_status = QLabel("Prognoza pojawi się po pierwszym odczycie wiosek.")
+        self.forecast_status.setObjectName("secondaryText")
+        self.forecast_status.setWordWrap(True)
+        self.forecast_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.forecast_status)
+        self._forecast_at = 0.0
         self.set_state("Nie połączono z grą", "muted")
 
     def _emit(self, field: str, value):
@@ -4352,6 +4365,7 @@ class VillageBuildWidget(QWidget):
                 )
             parts.append(line)
         self.summary.setText(" · ".join(parts))
+        self._update_forecast(snapshot)
         self.gold_status.setText(f"Saldo złota: {snapshot.gold:,}".replace(",", " "))
         plan = snapshot.gold_plan
         if plan is None:
@@ -4367,6 +4381,49 @@ class VillageBuildWidget(QWidget):
                 f"o ~{plan.hours:.0f} h (opłaca się od {plan.threshold:.1f} h na 1 zł). "
                 + "; ".join(parts)
             )
+
+    def _update_forecast(self, snapshot):
+        """Rough finish time of the fields, recalculated every few minutes."""
+        if not snapshot.plans or snapshot.read_at - self._forecast_at < _FORECAST_INTERVAL_SECONDS:
+            return
+        self._forecast_at = snapshot.read_at
+        forecast = completion_forecast(snapshot.plans)
+        read_at = datetime.fromtimestamp(snapshot.read_at)
+
+        def when(hours):
+            if hours is None:
+                return "nieznany (brak produkcji)"
+            if hours <= 0:
+                return "gotowe"
+            return f"{read_at + timedelta(hours=hours):%d.%m %H:%M} (za {_format_hours(hours)})"
+
+        def order(plan):
+            hours = forecast.villages[plan.village.id]
+            return float("inf") if hours is None else hours
+
+        resource_names = {1: "drewno", 2: "glina", 3: "żelazo", 4: "zboże"}
+
+        def limit(resource):
+            return "kolejka" if resource is None else resource_names[resource]
+
+        total = f"Wszystkie wioski: około {when(forecast.hours)}"
+        if forecast.hours:
+            total += f", ogranicza {limit(forecast.network_limit)}"
+        lines = [total]
+        for plan in sorted(snapshot.plans, key=order, reverse=True):
+            hours = forecast.villages[plan.village.id]
+            text = f"{plan.village.name} (pola do {plan.target}): {when(hours)}"
+            if hours:
+                text += f", ogranicza {limit(forecast.limits.get(plan.village.id))}"
+            lines.append(text)
+        lines.append(
+            "Szacunek orientacyjny: kolejka i koszt pozostałych poziomów pól, każdy surowiec "
+            "osobno (bez handlarza NPC), przy średniej z dzisiejszej i docelowej produkcji "
+            "(po rekrutacji), bez magazynów i budynków. "
+            "Całość zakłada, że transporty dzielą surowce w sieci. "
+            f"Przeliczono {read_at:%H:%M}, odświeżane co {_FORECAST_INTERVAL_SECONDS // 60} min."
+        )
+        self.forecast_status.setText("\n".join(lines))
 
     def _fill_plans(self, snapshot, disabled_villages: set[str]):
         plans = snapshot.plans

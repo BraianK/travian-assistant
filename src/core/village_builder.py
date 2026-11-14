@@ -1948,10 +1948,14 @@ def plan_gold_budget(plans: list[VillagePlan], budget: int, tiers: FinishTiers) 
 
     Only queue-bound villages gain from finishing builds (elsewhere builds
     wait for resources anyway), and only until their queue is no longer the
-    bottleneck: queue time beyond production time. Every remaining field
-    level is one build; the cheapest gold per saved hour goes first.
+    bottleneck: queue time beyond production time. Production time is
+    counted resource by resource; a village that cannot pay for its fields
+    alone gets the network's help, so it cannot finish before the network
+    has produced everything. Every remaining field level is one build; the
+    cheapest gold per saved hour goes first.
     """
     candidates = []
+    network, _resource = _slowest(*_network_field_work(plans))
     for plan in plans:
         if budget <= 0 or plan.finished:
             continue
@@ -1964,20 +1968,9 @@ def plan_gold_budget(plans: list[VillagePlan], budget: int, tiers: FinishTiers) 
                     low, high = step.from_level, step.from_level + 1
                     if low in building.effects and high in building.effects and building.effects[low]:
                         factor *= building.effects[high] / building.effects[low]
-        # Production grows while the fields are built: use the average of
-        # today's and the final production for the time to produce the rest.
-        multipliers = production_multipliers(village)
-        final = 0.0
-        for field_building in village.fields:
-            level = min(plan.target, field_building.max_level)
-            effect = field_building.effects.get(level)
-            if effect is None:
-                effect = field_building.effects.get(max(field_building.effects), 0) if field_building.effects else 0
-            final += effect * multipliers[field_building.type]
-        now = sum(max(0.0, rate) for rate in village.build_production().values())
-        average = (now + max(final, now)) / 2
-        _hours, remaining_cost = remaining_field_work(village, plan.target)
-        produce = remaining_cost / average if average > 0 else math.inf
+        own, _resource = _slowest(*_field_work(plan))
+        candidates_hours = [h for h in (own, network) if h is not None]
+        produce = min(candidates_hours) if candidates_hours else math.inf
         excess = max(0.0, plan.remaining_queue_hours * factor - produce)
         for field_building in village.fields:
             for level in range(field_building.planned_level, min(plan.target, field_building.max_level)):
@@ -2107,6 +2100,127 @@ def master_replacements(
                 continue  # nearly as good: keep, no churn
         replace.append(entry)
     return list(reversed(replace))
+
+
+# Completion forecast ----------------------------------------------------------------
+
+
+@dataclass
+class CompletionForecast:
+    # Hours until every village's fields reach their target, when the
+    # network shares its resources (None: no production to finish with).
+    hours: float | None
+    villages: dict[str, float | None]  # village id -> hours on its own
+    queue_bound: dict[str, bool]  # village id -> its build queue is the limit
+    # Village id -> the resource that takes longest to produce (None: queue).
+    limits: dict[str, int | None] = field(default_factory=dict)
+    network_limit: int | None = None  # same for the whole network
+
+
+def _field_output(village: Village, target: int | None) -> dict[int, float]:
+    """Raw hourly field production per resource now (*target* None) or at *target*."""
+    multipliers = production_multipliers(village)
+    total = {r: 0.0 for r in RESOURCES}
+    for building in village.fields:
+        level = building.level if target is None else max(
+            building.level, min(target, building.max_level)
+        )
+        effect = building.effects.get(level)
+        if effect is None:
+            effect = building.effects.get(max(building.effects), 0) if building.effects else 0
+        total[building.type] += effect * multipliers[building.type]
+    return total
+
+
+def average_production(plan: VillagePlan) -> dict[int, float]:
+    """Net production per resource averaged until the fields reach the
+    target: today's (after upkeep and continuous recruitment) plus half of
+    what the remaining field levels add."""
+    village = plan.village
+    now = village.build_production()
+    if plan.finished:
+        return dict(now)
+    final = _field_output(village, plan.target)
+    current = _field_output(village, None)
+    return {r: now[r] + max(0.0, final[r] - current[r]) / 2 for r in RESOURCES}
+
+
+def _field_work(plan: VillagePlan) -> tuple[dict[int, float], dict[int, float]]:
+    """(resources still to produce for the remaining field levels beyond the
+    stock and shipments on the way, average production) of a village."""
+    village = plan.village
+    _hours, costs = _remaining(village, plan.target)
+    incoming = village.incoming_total()
+    stock = village.build_resources()
+    cost = {r: max(0.0, costs[r] - stock[r] - incoming.get(r, 0)) for r in RESOURCES}
+    return cost, average_production(plan)
+
+
+def _network_field_work(plans: list[VillagePlan]) -> tuple[dict[int, float], dict[int, float]]:
+    """The same summed over the network (finished villages only produce)."""
+    total_cost = {r: 0.0 for r in RESOURCES}
+    total_rate = {r: 0.0 for r in RESOURCES}
+    for plan in plans:
+        if plan.finished:
+            cost, rate = {r: 0.0 for r in RESOURCES}, average_production(plan)
+        else:
+            cost, rate = _field_work(plan)
+        for r in RESOURCES:
+            total_cost[r] += cost[r]
+            total_rate[r] += max(0.0, rate[r])
+    return total_cost, total_rate
+
+
+def _slowest(cost: dict[int, float], rate: dict[int, float]) -> tuple[float | None, int | None]:
+    """(hours, resource) of the resource that takes longest to produce."""
+    hours, slowest = 0.0, None
+    for r in RESOURCES:
+        if cost[r] <= 0:
+            continue
+        if rate[r] <= 0:
+            return None, r
+        if cost[r] / rate[r] > hours:
+            hours, slowest = cost[r] / rate[r], r
+    return hours, slowest
+
+
+def completion_forecast(plans: list[VillagePlan]) -> CompletionForecast:
+    """Rough time until the fields of every village reach their target.
+
+    Per village the longer of: the build queue (running build plus every
+    remaining field level) and producing what those levels still cost
+    beyond the stock and shipments on the way, resource by resource (the
+    scarcest one decides; no trading assumed). Production grows while the
+    fields go up, so the average of today's net production (after upkeep
+    and continuous recruitment) and the one at the target is used. The
+    whole network finishes at the slowest queue or when the network's
+    production has paid for everything, whichever comes later.
+    """
+    villages: dict[str, float | None] = {}
+    queue_bound: dict[str, bool] = {}
+    limits: dict[str, int | None] = {}
+    longest_queue = 0.0
+    for plan in plans:
+        village = plan.village
+        if plan.finished:
+            villages[village.id] = 0.0
+            queue_bound[village.id] = False
+            limits[village.id] = None
+            continue
+        queue_hours, _costs = _remaining(village, plan.target)
+        queue_hours += plan.queue_hours
+        produce, slowest = _slowest(*_field_work(plan))
+        villages[village.id] = None if produce is None else max(queue_hours, produce)
+        queue_bound[village.id] = produce is not None and queue_hours >= produce
+        limits[village.id] = None if queue_bound[village.id] else slowest
+        longest_queue = max(longest_queue, queue_hours)
+    produce, slowest = _slowest(*_network_field_work(plans))
+    hours = None if produce is None else max(longest_queue, produce)
+    network_limit = None if produce is None or longest_queue >= produce else slowest
+    return CompletionForecast(
+        hours=hours, villages=villages, queue_bound=queue_bound,
+        limits=limits, network_limit=network_limit,
+    )
 
 
 # Resource network: surplus, deficit and merchant capacity -------------------------
@@ -2811,11 +2925,14 @@ def hero_bottlenecks(
     plans: list[VillagePlan], current: int, amount_all: float,
 ) -> dict[int, float]:
     """For each hero setting: hours of network production the scarcest
-    resource needs to cover the remaining demand (lower is better)."""
+    resource needs to cover the remaining demand (lower is better).
+
+    Production is averaged until the targets (see :func:`average_production`):
+    a resource whose fields are still low today is not scarce for long."""
     demand = network_demand(plans)
     production = {r: 0.0 for r in RESOURCES}
     for plan in plans:
-        for r, rate in plan.village.build_production().items():
+        for r, rate in average_production(plan).items():
             production[r] += max(0.0, rate)
     # The game's production already holds the current hero setting.
     for r, amount in hero_contribution(current, amount_all).items():

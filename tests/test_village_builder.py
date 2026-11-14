@@ -1,5 +1,7 @@
 """Tests for the resource-field build planner and transfer advisor."""
 
+import pytest
+
 from src.core import village_builder as vb
 
 
@@ -1035,7 +1037,25 @@ def test_no_loan_when_neighbour_produces_slowly():
 def _hero_plan(production, cost=1000):
     field = _field(1, 1, 3, cost=cost)
     field.costs = {lvl: {1: 1000, 2: 1000, 3: 1000, 4: 500} for lvl in field.costs}
+    # Production stays as given while the field goes up.
+    field.effects = {lvl: 30 for lvl in field.effects}
     return vb.plan_village(_village([field], production=production), 10, 0)
+
+
+def test_hero_ignores_a_resource_whose_fields_are_about_to_grow():
+    # Iron is the scarcest today, but its low fields will triple it on the
+    # way to the target; clay stays flat and is the real bottleneck.
+    iron = _field(1, 3, 3, gain_per_level=10)
+    clay = _field(2, 2, 3)
+    clay.effects = {lvl: 30 for lvl in clay.effects}
+    for field in (iron, clay):
+        field.costs = {lvl: {1: 1000, 2: 1000, 3: 1000, 4: 500} for lvl in field.costs}
+    # Iron 6000 includes the hero's 4000: 2000 of its own today.
+    village = _village([iron, clay], production={1: 9000, 2: 3000, 3: 6000, 4: 3000})
+    plan = vb.plan_village(village, 10, 0)
+    best, hours = vb.choose_hero_resource([plan], current=3, amount_all=1000)
+    assert best == 2
+    assert hours[2] < hours[3]
 
 
 def test_hero_moves_off_the_abundant_resource():
@@ -1727,3 +1747,80 @@ def test_towns_build_fields_to_the_town_target():
     plain.is_town = True
     plans = vb.plan_all([plain], 14, 10, 0, town_target=12)
     assert plans[0].target == 12
+
+
+def test_completion_forecast_per_village_and_network():
+    # Levels 3 and 4 of one field: (400 + 500) × 4 resources, 2 × 10 min.
+    slow = _village([_field(1, 1, 3)], resources=0, vid="A")
+    fast = _village([_field(1, 1, 3)], resources=0, vid="B",
+                    production={1: 1000, 2: 1000, 3: 1000, 4: 1000})
+    stocked = _village([_field(1, 1, 3)], resources=100_000, vid="C")
+    done = _village([_field(1, 1, 5)], vid="D")
+    plans = [vb.VillagePlan(village=v, target=5) for v in (slow, fast, stocked)]
+    plans.append(vb.VillagePlan(village=done, target=5, finished=True))
+    forecast = vb.completion_forecast(plans)
+    # 900 of each resource. Wood grows on the way (the wood field's effect
+    # 30 → 50, scaled to the production the game reports: +33/h on
+    # average), the others stay at 100/h and decide, resource by resource.
+    assert forecast.villages["A"] == pytest.approx(900 / 100)
+    assert forecast.limits["A"] == 2  # clay, the first of the slowest
+    assert forecast.villages["B"] == pytest.approx(900 / 1000)
+    # Everything already in stock: only the build queue is left.
+    assert forecast.villages["C"] == pytest.approx(1 / 3)
+    assert forecast.queue_bound["C"] and not forecast.queue_bound["A"]
+    assert forecast.limits["C"] is None
+    assert forecast.villages["D"] == 0.0
+    # Shared resources: the network pays for both villages together, the
+    # finished village D helps with its 100/h.
+    assert forecast.hours == pytest.approx(1800 / 1300)
+    assert forecast.network_limit == 2
+
+
+def test_completion_forecast_does_not_trade_one_resource_for_another():
+    # Plenty of crop does not make up for missing clay.
+    village = _village([_field(1, 1, 3)], resources=0, vid="A",
+                       production={1: 100, 2: 10, 3: 100, 4: 5000})
+    forecast = vb.completion_forecast([vb.VillagePlan(village=village, target=5)])
+    assert forecast.villages["A"] == pytest.approx(900 / 10)
+    assert forecast.limits["A"] == 2 and not forecast.queue_bound["A"]
+
+
+def test_completion_forecast_counts_the_running_build_and_no_production():
+    queued = _village([_field(1, 1, 3)], resources=100_000, vid="A")
+    plan = vb.VillagePlan(village=queued, target=5, queue_hours=2.0)
+    assert vb.completion_forecast([plan]).villages["A"] == pytest.approx(2 + 1 / 3)
+    idle = _village([_field(1, 1, 3, gain_per_level=0)], resources=0, vid="B",
+                    production={1: 0, 2: 0, 3: 0, 4: 0})
+    forecast = vb.completion_forecast([vb.VillagePlan(village=idle, target=5)])
+    assert forecast.villages["B"] is None and forecast.hours is None
+
+
+def _long_queue_village(vid, production, resources=0):
+    fields = []
+    for i in range(1, 5):
+        f = _field(i, i, 3, cost=1000)
+        f.times = {lvl: 6 * 3600 for lvl in f.times}
+        fields.append(f)
+    return _village(fields, vid=vid, resources=resources, production=production)
+
+
+def test_gold_budget_does_not_trade_crop_for_missing_clay():
+    # Plenty of everything but clay: the queue is not the limit.
+    village = _long_queue_village("1", {1: 1e5, 2: 10, 3: 1e5, 4: 1e5})
+    plan = vb.plan_village(village, 10, 0)
+    allocation = vb.plan_gold_budget([plan], 20, vb.FinishTiers(allow_reduced=True, allow_full=True))
+    assert allocation.gold == 0
+
+
+def test_gold_budget_counts_on_the_network_for_a_poor_village():
+    # The capital cannot pay for its fields alone, but a finished village
+    # produces plenty: its long queue is worth finishing with gold.
+    capital = _long_queue_village("1", {1: 10, 2: 10, 3: 10, 4: 10})
+    helper = _village([_field(1, 1, 10)], vid="2", y=1,
+                      production={1: 1e5, 2: 1e5, 3: 1e5, 4: 1e5})
+    plans = [vb.plan_village(v, 10, 0) for v in (capital, helper)]
+    assert plans[1].finished
+    allocation = vb.plan_gold_budget(plans, 20, vb.FinishTiers(allow_reduced=True, allow_full=True))
+    assert allocation.gold_by_village.get("1", 0) > 0
+    forecast = vb.completion_forecast(plans)
+    assert forecast.network_limit is None  # the queue, not production
