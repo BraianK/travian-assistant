@@ -162,30 +162,6 @@ class TroopReadTests(unittest.TestCase):
         self.assertEqual(1, len(called))
 
 
-class PartialRecruitmentTests(unittest.TestCase):
-    def test_passes_minimum_and_share_and_validates_quantity(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                import re
-                self.expression = kwargs["expression"]
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {"result": {"value": {
-                    "status": "submitted", "request_id": request_id, "quantity": 37,
-                }}}
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        row = {"village_id": "101", "building_type": 19, "unit_type": 21, "unit": "Phalanx"}
-        outcome = session.queue_recruitment(row, 500, 3, min_quantity=1, resource_share=0.5)
-        self.assertEqual(37, outcome["quantity"])
-        self.assertIn(", 1, 0.5)", session._tab.expression)
-        self.assertIn("Math.floor(available * resourceShare / cost)", session._tab.expression)
-        with self.assertRaises(ValueError):
-            session.queue_recruitment(row, 5, 3, min_quantity=6)
-        with self.assertRaises(ValueError):
-            session.queue_recruitment(row, 5, 3, resource_share=0)
-
-
 class RecruitmentLockExpiryTests(unittest.TestCase):
     def test_unconfirmed_locks_expire_after_restart(self):
         import os

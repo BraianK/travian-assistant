@@ -138,6 +138,9 @@ class Village:
     # Hero production above its "all resources" setting (a temporary switch
     # to one resource): not counted when sizing storage.
     hero_excess: dict[int, float] = field(default_factory=dict)
+    # What the hero adds to this village's production (a flat amount, not
+    # scaled by the fields).
+    hero_bonus: dict[int, float] = field(default_factory=dict)
     is_town: bool = False  # a town: fields can go above 10 (the game's lvlMax)
     residence: Building | None = None  # residence or palace (settlers)
     units_home: dict[int, int] = field(default_factory=dict)  # unit number -> count (no hero)
@@ -277,9 +280,12 @@ def target_level(
 def production_multipliers(village: Village) -> dict[int, float]:
     """Actual production per unit of the fields' base production.
 
-    Bonuses (bonus buildings, oases, gold, hero) scale the fields' base output;
-    the game's ``production`` already contains them. Crop production is net of
-    upkeep, so crop uses the average multiplier of the other resources.
+    Bonuses (bonus buildings, oases, gold) scale the fields' base output;
+    the game's ``production`` already contains them. The hero's production
+    is a flat amount on top, so it is taken out first (otherwise the fields
+    of the hero's resource look several times as productive). Crop
+    production is net of upkeep, so crop uses the average multiplier of the
+    other resources.
     """
     multipliers = {}
     for resource in (1, 2, 3):
@@ -288,10 +294,37 @@ def production_multipliers(village: Village) -> dict[int, float]:
             for building in village.fields
             if building.type == resource
         )
-        actual = village.production.get(resource, 0)
+        actual = village.production.get(resource, 0) - village.hero_bonus.get(resource, 0)
         multipliers[resource] = actual / base if base > 0 and actual > 0 else 1.0
     multipliers[4] = sum(multipliers[r] for r in (1, 2, 3)) / 3
     return multipliers
+
+
+def hero_effect_ratio(village: Village, hero_type: int, value: float) -> float | None:
+    """How much the hero really adds per unit of its listed amount.
+
+    The game's production holds more than the hero's ``resBonusValue``
+    (bonuses apply to it as well). With the hero on wood, clay or iron, the
+    fields of the other two show the village's multiplier; what the hero's
+    resource produces beyond its fields at that multiplier is the hero's
+    real amount. None when it cannot be measured (all resources, crop, or
+    no fields to compare with).
+    """
+    if hero_type not in (1, 2, 3) or value <= 0:
+        return None
+    base = {r: 0.0 for r in RESOURCES}
+    for building in village.fields:
+        base[building.type] += building.effects.get(building.level, 0)
+    others = [
+        village.production.get(r, 0) / base[r]
+        for r in (1, 2, 3)
+        if r != hero_type and base[r] > 0 and village.production.get(r, 0) > 0
+    ]
+    if not others or base[hero_type] <= 0:
+        return None
+    multiplier = sum(others) / len(others)
+    extra = village.production.get(hero_type, 0) - base[hero_type] * multiplier
+    return min(2.0, max(0.5, extra / value))
 
 
 def _afford_simple(costs, resources, production) -> float | None:

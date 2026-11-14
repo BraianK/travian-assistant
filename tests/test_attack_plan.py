@@ -332,9 +332,27 @@ class _FakeBridge:
             for _ in range(3)
         ]
 
-    def upgrade_building(self, village_id, location, building_type):
-        self.upgrades.append((village_id, location, building_type))
+    def upgrade_building(self, village_id, location, current_level):
+        self.upgrades.append((village_id, location, current_level))
         return True
+
+
+class _FakeClicker:
+    """Click executor stand-in: records the waves of each run as fired."""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.prepared = []
+
+    def prepare(self, run):
+        self.prepared.append(run.attack.id)
+
+    def fire(self, run, latest):
+        self.bridge.fired.append((run.requests, latest))
+        return "c" * 32, {"status": "fired", "server_time": self.bridge.server_time}
+
+    def read(self, run):
+        return {"results": [{"ok": True, "error": None} for _ in run.requests]}
 
 
 class _FakeTk:
@@ -374,6 +392,7 @@ class AutomationTests(unittest.TestCase):
         automation = AttackAutomation(
             bridge, tk, lambda: config, logs.append,
             clock=lambda: bridge.server_time, timer=timer,
+            click_executor=_FakeClicker(bridge),
         )
         return automation, bridge, tk, logs, timer
 
@@ -427,7 +446,7 @@ class AutomationTests(unittest.TestCase):
     def test_pt_upgrade_policy(self):
         automation, bridge, *_ = self._automation(ARRIVAL_TS - 40000, pt_policy="upgrade")
         automation.refresh_plan()
-        self.assertEqual([("538001407", 30, 14)], bridge.upgrades)
+        self.assertEqual([("538001407", 30, 2)], bridge.upgrades)
 
     def test_hero_is_parked_when_no_hero_attack_is_close(self):
         automation, bridge, *_ = self._automation(ARRIVAL_TS - 40000, hero_evasion=True)
@@ -448,6 +467,9 @@ class AutomationTests(unittest.TestCase):
         requests = bridge.fired[-1][0]
         self.assertEqual("troops/moveTroopsHome", requests[0]["controller"])
         self.assertEqual(77, requests[0]["params"]["troopId"])
+        # Clicked from the rally point of the hero's home, where it stands.
+        self.assertEqual("538001407", requests[0]["params"]["villageId"])
+        self.assertEqual("537968639", requests[0]["params"]["locationVillageId"])
         self.assertTrue(automation.runs["a1"].hero_recall_scheduled)
 
     def test_tktools_failure_does_not_stop_due_sends(self):
@@ -574,6 +596,73 @@ class BridgeTests(unittest.TestCase):
             bridge.fire([{"controller": "player/changeVacationState", "params": {}}], 0)
 
 
+class BridgeClickTests(unittest.TestCase):
+    class Executor:
+        def __init__(self, fail_movements=()):
+            self.calls = []
+            self.fail_movements = set(fail_movements)
+
+        def send_troops(self, source, x, y, movement, units, catapults=(), spy_mission=None):
+            self.calls.append(("send", source, x, y, movement, units, catapults, spy_mission))
+            if movement in self.fail_movements:
+                raise RuntimeError("misja niedostępna")
+            return units
+
+        def recall_troops(self, village, location, units):
+            self.calls.append(("recall", village, location, units))
+            return units
+
+    def _bridge(self, executor, now=1000.0):
+        class Session:
+            _tab = object()
+
+        bridge = GameAttackBridge(Session(), clicker=lambda: executor)
+        bridge.server_time = lambda: now
+        return bridge
+
+    def test_siege_falls_back_to_attack_by_clicking(self):
+        executor = self.Executor(fail_movements={47})
+        bridge = self._bridge(executor)
+        request = GameAttackBridge.send_request("538001407", "538427428", 47, {8: 5}, (99,))
+        request["fallback"] = GameAttackBridge.send_request(
+            "538001407", "538427428", 3, {8: 5}, (99,))["params"]
+        batch, result = bridge.fire([request], 1030)
+        self.assertEqual("fired", result["status"])
+        x, y = 538427428 % 32768 - 16384, 538427428 // 32768 - 16384
+        self.assertEqual(
+            [("send", "538001407", x, y, 47, {8: 5}, (99,), None),
+             ("send", "538001407", x, y, 3, {8: 5}, (99,), None)],
+            executor.calls,
+        )
+        self.assertEqual([{"ok": True, "error": None, "fallback": True}],
+                         bridge.read_fire(batch)["results"])
+
+    def test_recall_and_spy_mission_are_clicked(self):
+        executor = self.Executor()
+        bridge = self._bridge(executor)
+        recall = GameAttackBridge.recall_request(
+            77, village_id="538001407", location_village_id="537968639")
+        spy = GameAttackBridge.send_request("538001407", "538427428", 6, {3: 2}, spy_mission="defence")
+        bridge.fire([recall, spy], 1030)
+        self.assertEqual(("recall", "538001407", "537968639", {11: 1}), executor.calls[0])
+        self.assertEqual("defence", executor.calls[1][-1])
+
+    def test_nothing_is_clicked_when_too_late(self):
+        executor = self.Executor()
+        bridge = self._bridge(executor, now=1031)
+        request = GameAttackBridge.send_request("538001407", "538427428", 4, {1: 10})
+        _batch, result = bridge.fire([request], 1030)
+        self.assertEqual("too_late", result["status"])
+        self.assertEqual([], executor.calls)
+
+    def test_recall_without_villages_fails_safely(self):
+        executor = self.Executor()
+        bridge = self._bridge(executor)
+        batch, _ = bridge.fire([GameAttackBridge.recall_request(77)], 1030)
+        self.assertFalse(bridge.read_fire(batch)["results"][0]["ok"])
+        self.assertEqual([], executor.calls)
+
+
 class AttackWidgetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -591,7 +680,7 @@ class AttackWidgetTests(unittest.TestCase):
             try:
                 tab = window.attack_tab
                 with patch.object(AppSettings, "save", return_value=None):
-                    tab.mode_buttons["clicks"].click()
+                    self.assertEqual({}, tab.mode_buttons)
                     self.assertEqual("clicks", window.settings.attacks.execution_mode)
                     tab.prepare_seconds.setValue(60)
                     self.assertEqual(60, window.settings.attacks.prepare_seconds)

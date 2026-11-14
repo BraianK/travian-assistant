@@ -603,7 +603,10 @@ class HideoutDefense:
             case.message = "Bohater nie należy do stolicy — idzie bez niego."
             return False
         if not case.hero_recalled and hero.get("support_troop_id"):
-            request = self.bridge.recall_request(int(hero["support_troop_id"]))
+            request = self.bridge.recall_request(
+                int(hero["support_troop_id"]), village_id=self.capital_id,
+                location_village_id=hero.get("support_village_id"),
+            )
             self.bridge.fire([request], now + 30)
             case.hero_recalled = True
             self._log(f"{case.hideout_name}: wycofuję bohatera do stolicy.")

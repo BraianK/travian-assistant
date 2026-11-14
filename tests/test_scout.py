@@ -82,14 +82,17 @@ class PlannerTests(unittest.TestCase):
 
 
 class FakeTimer:
-    def __init__(self):
+    def __init__(self, now=None):
         self.jobs = []
+        self.now = now  # a one-item list moved to each job's time
 
     def schedule(self, at_local, callback):
         self.jobs.append((at_local, callback))
 
     def run_all(self):
-        for _at, callback in sorted(self.jobs, key=lambda job: job[0]):
+        for at, callback in sorted(self.jobs, key=lambda job: job[0]):
+            if self.now is not None:
+                self.now[0] = max(self.now[0], at)
             callback()
         self.jobs.clear()
 
@@ -106,19 +109,29 @@ class FakeBridge:
     def check_target(self, source, target, movement):
         return {"durations": {"3": 600}}
 
-    def send_request(self, village, target, movement, units, catapults=(), spy_mission="resources"):
-        return {"controller": "troops/send", "params": {
-            "villageId": village, "destVillageId": target, "movementType": movement,
-            "units": units, "spyMission": spy_mission}}
-
-    def fire(self, requests, latest):
-        self.sent.append(requests[0]["params"])
-        return "b" * 32, {"status": "fired"}
-
     def _evaluate(self, expression, **kwargs):
         if "supply" in expression:
             return 2
         return {"xp": self.xp_values.pop(0), "level": 30}
+
+
+class FakeClicker:
+    """Prepared-tab stand-in: records each send when "Send" is clicked."""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.prepared = {}
+
+    def prepare_send(self, key, source, x, y, movement, units, spy_mission=None):
+        self.prepared[key] = {"villageId": source, "target": (x, y), "movementType": movement,
+                              "units": units, "spyMission": spy_mission}
+
+    def fire_send(self, key):
+        self.bridge.sent.append(self.prepared.pop(key))
+        return {"ok": True, "error": None}
+
+    def discard_send(self, key):
+        self.prepared.pop(key, None)
 
 
 class AutomationTests(unittest.TestCase):
@@ -127,11 +140,12 @@ class AutomationTests(unittest.TestCase):
         settings = ScoutSettings(enabled=True)
         # Two candidates (PT 10 then PT 11); XP for each: -3, 0, +2.
         bridge = FakeBridge([100, 110, 125, 125, 135, 135])
-        timer = FakeTimer()
+        timer = FakeTimer(now)
         logs = []
         found = []
         automation = ScoutAutomation(bridge, lambda: settings, logs.append,
-                                     clock=lambda: now[0], timer=timer, on_found=found.append)
+                                     clock=lambda: now[0], timer=timer, on_found=found.append,
+                                     clicker=FakeClicker(bridge))
         operation = automation.create_operation(
             attack_key="1:9", attacker_id="777", attacker_name="KunS",
             source_village_id="537001000", source=(-34, 29), unit_label="Taran",
@@ -140,12 +154,18 @@ class AutomationTests(unittest.TestCase):
             scout_village_id="101", scout_unit=3, scouts_per_send=2,
         )
         self.assertEqual(2, len(operation.candidates))
-        now[0] = operation.candidates[-1].departure - 10
-        automation.tick()
-        timer.run_all()
+        # Walk the clock through the whole operation, as the app's ticks do.
+        start = min(min(c.sends) for c in operation.candidates) - 30
+        end = max(c.departure for c in operation.candidates) + 20
+        now[0] = start
+        while now[0] < end:
+            automation.tick()
+            timer.run_all()
+            now[0] += 5
         self.assertEqual(4, len(bridge.sent))
         self.assertTrue(all(p["spyMission"] == "defence" and p["movementType"] == 6
-                            and p["units"] == {3: 2} for p in bridge.sent))
+                            and p["units"] == {3: 2} and p["target"] == (-34, 29)
+                            for p in bridge.sent))
         verdicts = [c.verdict for c in operation.candidates]
         self.assertEqual([VERDICT_HOME, VERDICT_LEFT], verdicts)
         self.assertEqual("Jessica, PT 11", operation.found)

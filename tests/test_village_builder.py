@@ -1838,3 +1838,55 @@ def test_gold_budget_counts_on_the_network_for_a_poor_village():
     assert allocation.gold_by_village.get("1", 0) > 0
     forecast = vb.completion_forecast(plans)
     assert forecast.network_limit is None  # the queue, not production
+
+
+def _hero_village(hero_on):
+    # Equal iron and clay fields (effect 30 → 100 to the target), the same
+    # 1.5 bonus; the hero adds a flat 4000 to one of them. Wood and crop
+    # are plentiful.
+    iron, clay = _field(1, 3, 3), _field(2, 2, 3)
+    production = {1: 100_000, 2: 45, 3: 45, 4: 100_000}
+    production[hero_on] += 4000
+    village = _village([iron, clay], production=production)
+    village.hero_bonus = {r: 4000 if r == hero_on else 0 for r in vb.RESOURCES}
+    return village
+
+
+def test_hero_production_does_not_inflate_the_fields_of_its_resource():
+    village = _hero_village(3)
+    multipliers = vb.production_multipliers(village)
+    assert multipliers[3] == _approx(1.5) and multipliers[2] == _approx(1.5)
+    plan = vb.plan_village(village, 10, 0)
+    average = vb.average_production(plan)
+    # Both fields grow alike; the hero's 4000 stays flat.
+    assert average[3] - village.production[3] == _approx(average[2] - village.production[2])
+
+
+def test_hero_does_not_flip_back_after_a_switch():
+    # Whatever the hero produces, the long-term choice stays the same.
+    choices = set()
+    for hero_on in (2, 3):
+        plan = vb.plan_village(_hero_village(hero_on), 10, 0)
+        choice = vb.choose_hero_resource([plan], current=hero_on, amount_all=1000)
+        choices.add(hero_on if choice is None else choice[0])
+    assert len(choices) == 1
+
+
+def test_hero_effect_ratio_measured_against_the_other_fields():
+    # Fields at 1.5; the hero lists 4000 iron but adds 5000.
+    iron, clay, wood = _field(1, 3, 3), _field(2, 2, 3), _field(3, 1, 3)
+    village = _village([iron, clay, wood], production={1: 45, 2: 45, 3: 5045, 4: 45})
+    assert vb.hero_effect_ratio(village, 3, 4000) == _approx(1.25)
+    assert vb.hero_effect_ratio(village, vb.HERO_ALL, 4000) is None
+    assert vb.hero_effect_ratio(village, 4, 4000) is None
+
+
+def test_hero_amount_from_points_while_the_model_shows_zero():
+    automation, _settings, _village_ = _army_automation()
+    on_iron = {"type": 3, "points": 68, "value": 0}
+    assert automation._hero_listed(on_iron) == 4080
+    assert automation._hero_listed({"type": 0, "points": 68, "value": 0}) == 1020
+    assert automation._hero_listed({"type": 3, "points": 68, "value": 4000}) == 4000
+    # Measured: the hero really adds a third more.
+    automation._hero_ratio = 4 / 3
+    assert automation._hero_amount(on_iron) == _approx(1360)

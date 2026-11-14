@@ -92,7 +92,7 @@ class BuildSnapshot:
 HERO_CHECK_SECONDS = 600
 HERO_SWITCH_SECONDS = 2 * 3600
 # Per-resource hero production of "all resources" per point, until read.
-HERO_ALL_PER_POINT = 1080 / 68
+HERO_ALL_PER_POINT = 15  # the game lists 1020 at 68 points (4080 on one resource)
 HERO_NAMES = {0: "wszystkie", 1: "drewno", 2: "glina", 3: "żelazo", 4: "zboże"}
 # Switches for a stalled queue: at most one per this many seconds.
 HERO_STALL_SECONDS = 10 * 60
@@ -263,6 +263,8 @@ class BuildAutomation:
         self._training_until: dict[tuple[str, int], float] = {}
         self._military_active: list[dict] = []
         self._hero_amount_all = 0.0
+        # Real hero production per unit of its listed amount (measured).
+        self._hero_ratio = 1.0
         self._hero_next_check = 0.0
         # Set while the hero produces for a stalled queue (not the long-term
         # best): it goes back as soon as the stall is over.
@@ -359,12 +361,18 @@ class BuildAutomation:
         # make the storage look too small for "production" it soon stops.
         hero = state.get("hero") or {}
         if hero.get("points") and not hero.get("dead"):
-            amount_all = self._hero_amount_all or float(hero["points"]) * HERO_ALL_PER_POINT
+            home = next((v for v in villages if v.id == str(hero.get("village_id"))), None)
+            if home is not None:
+                ratio = vb.hero_effect_ratio(home, int(hero.get("type") or 0), self._hero_listed(hero))
+                if ratio is not None:
+                    self._hero_ratio = ratio
+            amount_all = self._hero_amount(hero)
             current = vb.hero_contribution(int(hero.get("type") or 0), amount_all)
             steady = vb.hero_contribution(vb.HERO_ALL, amount_all)
             for village in villages:
                 if village.id == str(hero.get("village_id")):
                     village.hero_excess = {r: current[r] - steady[r] for r in vb.RESOURCES}
+                    village.hero_bonus = current
         self._settle = self._settle_goal(villages, settings, server_time)
         plans = vb.plan_all(
             villages,
@@ -1220,7 +1228,7 @@ class BuildAutomation:
             plan, snapshot.plans, settings.crop_bank_fill_percent / 100, settings.crop_bank_min_amount,
             snapshot.server_time, snapshot.merchant_speed, snapshot.world_speed,
             int((snapshot.hero or {}).get("type") or 0),
-            self._hero_amount_all or float((snapshot.hero or {}).get("points") or 0) * HERO_ALL_PER_POINT,
+            self._hero_amount(snapshot.hero or {}),
         )
         if not gains:
             return False
@@ -1380,9 +1388,7 @@ class BuildAutomation:
             return False
         now = time.monotonic()
         current = int(hero.get("type") or 0)
-        # Per-resource amount of "all": read from the hero window once it was
-        # opened; until then estimated from the points (1080 at 68 points).
-        amount_all = self._hero_amount_all or float(hero["points"]) * HERO_ALL_PER_POINT
+        amount_all = self._hero_amount(hero)
         # The hero's home village waits with an empty queue: produce what
         # it lacks right now (an idle queue there may be the network's end date).
         home = next((p for p in snapshot.plans if p.village.id == str(hero.get("village_id"))), None)
@@ -1430,6 +1436,27 @@ class BuildAutomation:
             self._hero_next_check = now + HERO_SWITCH_SECONDS
             return True
         return False
+
+    def _hero_amount(self, hero: dict) -> float:
+        """Per-resource amount of the "all resources" setting: from the hero
+        model (its current setting's amount), else from the hero window once
+        opened, else estimated from the points."""
+        value = self._hero_listed(hero) * self._hero_ratio
+        if int(hero.get("type") or 0) == vb.HERO_ALL:
+            return value
+        return value / vb.HERO_SINGLE_FACTOR
+
+    def _hero_listed(self, hero: dict) -> float:
+        """The hero's listed hourly amount per resource of its current
+        setting. Right after a switch the game's model holds 0 for a while:
+        then it follows from the points."""
+        value = float(hero.get("value") or 0)
+        if value > 0:
+            return value
+        per_resource = self._hero_amount_all or float(hero.get("points") or 0) * HERO_ALL_PER_POINT
+        if int(hero.get("type") or 0) == vb.HERO_ALL:
+            return per_resource
+        return per_resource * vb.HERO_SINGLE_FACTOR
 
     def _switch_hero(self, current: int, best: int, why: str) -> bool:
         now = time.monotonic()

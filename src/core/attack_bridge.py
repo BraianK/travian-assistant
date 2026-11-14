@@ -1,17 +1,17 @@
-"""Game-side actions for the attack automation (direct request mode).
+"""Game-side actions for the attack, scouting and hideout automations.
 
-Every method runs a short script in the game tab and uses the same requests
-the game client sends itself (captured from client 0.120.30):
+Reading uses the game's own models and the read-only ``troops/checkTarget``
+request (travel durations per unit type). Every action is clicked in the
+game window like a player would (see :class:`BuildClickExecutor`):
 
-* ``troops/checkTarget`` – read-only travel durations per unit type;
-* ``troops/send`` – send troops (attack 3, support 5, siege 47; unit 11 is the
-  hero; catapult target 99 means random);
-* ``troops/moveTroopsHome`` – recall the hero from a reinforcement;
-* ``building/upgrade`` – upgrade the tournament square.
+* troops are sent from the "Send troops" window (attack 3, raid 4, support 5,
+  spy 6, siege 47; unit 11 is the hero; catapult target 99 means random);
+* reinforcements (the hero) are withdrawn from the rally point's
+  "Stationed" tab;
+* the tournament square is upgraded with its level bubble.
 
-``Travian.request`` is not exclusive like ``Travian.writeRequest``, so several
-waves can leave in the same second. AngularJS only dispatches HTTP requests
-during a digest, so each script triggers one right after queuing requests.
+``send_request``/``recall_request`` only describe an action; :meth:`fire`
+performs the described actions one after another.
 """
 
 from __future__ import annotations
@@ -20,6 +20,13 @@ import json
 import re
 import time
 import uuid
+
+try:
+    from src.core.tournament_square import village_position
+except ImportError:  # pragma: no cover - packaged layout
+    from core.tournament_square import village_position
+
+MOVEMENT_SPY = 6
 
 _SERVER_CLOCK_JS = r"""
     const injector = angular.element(document.body).injector();
@@ -137,39 +144,6 @@ _CHECK_TARGET_JS = "((villageId, destVillageId, movementType) => new Promise(res
     kick();
 }))"""
 
-_FIRE_JS = "((batchId, requests, latestServerTime) => {" + _SERVER_CLOCK_JS + r"""
-    const key = "__travianAssistantSend_" + batchId;
-    const nowServer = serverNowMs() / 1000;
-    if (nowServer > latestServerTime) {
-        return {status: "too_late", server_time: nowServer};
-    }
-    const results = requests.map(() => null);
-    window[key] = {results, fired_at: nowServer};
-    const send = (request, index, params, isFallback) => {
-        Travian.request(request.controller, params, response => {
-            const error = response && response.errors
-                ? String(response.errors[0].message) : null;
-            if (error && request.fallback && !isFallback) {
-                // Typically the hero did not make it home in time: send the
-                // wave without the hero right away (lands at most 1 s later).
-                send(request, index, request.fallback, true);
-                kick();
-                return;
-            }
-            results[index] = {ok: !error, error, fallback: isFallback};
-        }, () => { results[index] = {ok: false, error: "request_failed"}; });
-    };
-    requests.forEach((request, index) => send(request, index, request.params, false));
-    kick();
-    return {status: "fired", server_time: nowServer};
-})"""
-
-_READ_FIRE_JS = r"""((batchId) => {
-    const value = window["__travianAssistantSend_" + batchId];
-    if (!value) return null;
-    return {results: value.results, fired_at: value.fired_at};
-})"""
-
 _READ_MOVEMENTS_JS = r"""((villageId) => {
     const collection = Troops.getCollection("moving", String(villageId));
     return ((collection && collection.data) || []).map(row => {
@@ -189,12 +163,21 @@ _READ_MOVEMENTS_JS = r"""((villageId) => {
 _KEEP_AWAKE_PAUSE = 15.0
 
 
-class GameAttackBridge:
-    """Thin wrapper over a connected ``TravianBrowserSession`` tab."""
+_SERVER_TIME_JS = "(() => {" + _SERVER_CLOCK_JS + "return serverNowMs() / 1000; })()"
 
-    def __init__(self, session):
+
+class GameAttackBridge:
+    """Thin wrapper over a connected ``TravianBrowserSession`` tab.
+
+    *clicker* returns the shared :class:`BuildClickExecutor` that performs
+    the actions.
+    """
+
+    def __init__(self, session, clicker=None):
         self._session = session
+        self._clicker = clicker
         self._last_wake = 0.0
+        self._fired: dict[str, dict] = {}
 
     @property
     def _tab(self):
@@ -272,33 +255,93 @@ class GameAttackBridge:
         return {"controller": "troops/send", "params": params}
 
     @staticmethod
-    def recall_request(troop_id: int, units: dict[int, int] | None = None) -> dict:
+    def recall_request(
+        troop_id: int, units: dict[int, int] | None = None, *,
+        village_id: str | None = None, location_village_id: str | None = None,
+    ) -> dict:
+        """Withdraw own troops (by default the hero) standing in another
+        village; *village_id* is their home, *location_village_id* where
+        they stand."""
         return {
             "controller": "troops/moveTroopsHome",
             "params": {
                 "troopId": int(troop_id),
                 "units": {str(k): int(v) for k, v in (units or {11: 1}).items()},
+                "villageId": str(village_id or ""),
+                "locationVillageId": str(location_village_id or ""),
             },
         }
 
+    def server_time(self) -> float:
+        value = self._evaluate(_SERVER_TIME_JS)
+        if not isinstance(value, (int, float)):
+            raise RuntimeError("Nie odczytano czasu serwera.")
+        return float(value)
+
+    def _executor(self):
+        executor = self._clicker() if callable(self._clicker) else self._clicker
+        if executor is None:
+            raise RuntimeError("Brak karty do klikania w grze.")
+        return executor
+
     def fire(self, requests: list[dict], latest_server_time: float) -> tuple[str, dict]:
-        """Send all *requests* at once unless the server clock passed *latest*."""
-        batch_id = uuid.uuid4().hex
+        """Click every described action unless the server clock passed *latest*."""
         for request in requests:
             if request.get("controller") not in ("troops/send", "troops/moveTroopsHome"):
                 raise ValueError("Unsupported request.")
-        value = self._evaluate(
-            f"{_FIRE_JS}({json.dumps(batch_id)}, {json.dumps(requests)}, "
-            f"{float(latest_server_time)})",
-        )
-        if not isinstance(value, dict) or value.get("status") not in ("fired", "too_late"):
-            raise RuntimeError("Gra nie potwierdziła wysłania.")
-        return batch_id, value
+        batch_id = uuid.uuid4().hex
+        started = self.server_time()
+        if started > latest_server_time:
+            return batch_id, {"status": "too_late", "server_time": started}
+        executor = self._executor()
+        results = []
+        for request in requests:
+            if self.server_time() > latest_server_time:
+                results.append({"ok": False, "error": "za późno"})
+                continue
+            results.append(self._click(executor, request))
+        self._fired[batch_id] = {"results": results, "fired_at": started}
+        return batch_id, {"status": "fired", "server_time": started}
+
+    @staticmethod
+    def _click(executor, request: dict) -> dict:
+        params = request["params"]
+        units = {int(k): int(v) for k, v in (params.get("units") or {}).items() if int(v) > 0}
+        try:
+            if request["controller"] == "troops/moveTroopsHome":
+                if not (params.get("villageId") and params.get("locationVillageId")):
+                    raise ValueError("Nie wiadomo, skąd wycofać wojska.")
+                executor.recall_troops(params["villageId"], params["locationVillageId"], units)
+                return {"ok": True, "error": None}
+            attempts = [(params, False)]
+            if request.get("fallback"):
+                attempts.append((request["fallback"], True))
+            error = None
+            for attempt, is_fallback in attempts:
+                position = village_position(attempt["destVillageId"])
+                if position is None:
+                    raise ValueError("Nieznane współrzędne celu.")
+                movement = int(attempt["movementType"])
+                try:
+                    executor.send_troops(
+                        str(attempt["villageId"]), position[0], position[1], movement,
+                        {int(k): int(v) for k, v in attempt["units"].items()},
+                        tuple(attempt.get("catapultTargets") or ()),
+                        attempt.get("spyMission") if movement == MOVEMENT_SPY else None,
+                    )
+                    return {"ok": True, "error": None, "fallback": is_fallback}
+                except Exception as send_error:
+                    error = send_error
+                    if getattr(send_error, "__class__", None).__name__ == "GoldGuardError":
+                        break
+            raise error
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
 
     def read_fire(self, batch_id: str) -> dict | None:
         if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
             raise ValueError("Invalid batch id.")
-        return self._evaluate(f"{_READ_FIRE_JS}({json.dumps(batch_id)})")
+        return self._fired.get(batch_id)
 
     def read_movements(self, village_id: str) -> list[dict]:
         if not str(village_id).isdigit():
@@ -306,13 +349,9 @@ class GameAttackBridge:
         value = self._evaluate(f"{_READ_MOVEMENTS_JS}({json.dumps(str(village_id))})")
         return value if isinstance(value, list) else []
 
-    def upgrade_building(self, village_id: str, location_id: int, building_type: int) -> bool:
-        value = self._evaluate(
-            "((villageId, locationId, buildingType) => {"
-            "const ok = Travian.writeRequest('building/upgrade', "
-            "{villageId, locationId, buildingType});"
-            "const s = angular.element(document.body).injector().get('$rootScope');"
-            "if (!s.$$phase) s.$apply(); return ok;})"
-            f"({int(village_id)}, {int(location_id)}, {int(building_type)})"
-        )
-        return bool(value)
+    def upgrade_building(self, village_id: str, location_id: int, current_level: int) -> bool:
+        """Click the level bubble of a building (the tournament square)."""
+        if not str(village_id).isdigit():
+            raise ValueError("Invalid village id.")
+        status = self._executor().upgrade(str(village_id), int(location_id), int(current_level), False)
+        return status == "started"

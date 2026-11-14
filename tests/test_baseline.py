@@ -1210,411 +1210,6 @@ class BaselineSmokeTests(unittest.TestCase):
             received,
         )
 
-    def test_queue_resource_milling_uses_npc_trader_request_contract(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.method = method
-                self.expression = kwargs["expression"]
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "submitted",
-                            "request_id": request_id,
-                            "target_grain": 0,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        result = session.queue_resource_milling(
-            "101",
-            {
-                "trigger_percent": 100,
-                "clay_percent": 40,
-                "iron_percent": 30,
-                "wood_percent": 30,
-            },
-            300,
-        )
-
-        self.assertEqual("Runtime.evaluate", session._tab.method)
-        self.assertIn('"premiumFeature/bookFeature"', session._tab.expression)
-        self.assertIn('"NPCTrader"', session._tab.expression)
-        self.assertIn("distributeRes", session._tab.expression)
-        self.assertIn("minimumGoldBalance + traderPrice", session._tab.expression)
-        self.assertIn("grainPercent < activeThreshold", session._tab.expression)
-        self.assertIn('storageCapacity["4"]', session._tab.expression)
-        self.assertIn("price: traderPrice", session._tab.expression)
-        self.assertIn(", 300, 5,", session._tab.expression)
-        self.assertEqual("submitted", result["status"])
-        self.assertRegex(result["request_id"], r"^[a-f0-9]{32}$")
-        self.assertEqual(0, result["target_grain"])
-
-    def test_queue_resource_milling_refills_granary_and_preserves_surplus(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.expression = kwargs["expression"]
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "submitted",
-                            "request_id": request_id,
-                            "target_grain": 100000,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        result = session.queue_resource_milling(
-            "101",
-            {
-                "mode": "refill",
-                "trigger_percent": 100,
-                "refill_trigger_percent": 5,
-                "clay_percent": 40,
-                "iron_percent": 30,
-                "wood_percent": 30,
-            },
-            300,
-        )
-
-        self.assertIn('"refill"', session._tab.expression)
-        self.assertIn("grainPercent > activeThreshold", session._tab.expression)
-        self.assertIn("Math.min(Math.floor(granaryCapacity), total)", session._tab.expression)
-        self.assertIn("const remainder = total - targetGrain", session._tab.expression)
-        self.assertEqual(100000, result["target_grain"])
-
-    def test_queue_resource_milling_rejects_non_100_percent_split(self):
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = object()
-
-        with self.assertRaisesRegex(ValueError, "distribution"):
-            session.queue_resource_milling(
-                "101",
-                {
-                    "trigger_percent": 100,
-                    "clay_percent": 40,
-                    "iron_percent": 30,
-                    "wood_percent": 20,
-                },
-                300,
-            )
-
-    def test_reads_confirmed_resource_milling_response(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.method = method
-                self.expression = kwargs["expression"]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "confirmed",
-                            "resources": {
-                                "wood": 30000,
-                                "clay": 40000,
-                                "iron": 30000,
-                                "grain": 2000,
-                            },
-                            "grain_capacity": 100000,
-                            "target_grain": 0,
-                            "gold": 300,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        result = session.read_resource_milling_response(
-            "a" * 32,
-            "empty",
-            90,
-            0,
-        )
-
-        self.assertIn(
-            "__travianAssistantMillingResponse_",
-            session._tab.expression,
-        )
-        self.assertIn("triggerPercent", session._tab.expression)
-        self.assertIn(
-            "amounts[3] / capacity * 100 < triggerPercent",
-            session._tab.expression,
-        )
-        self.assertEqual("confirmed", result["status"])
-        self.assertEqual(2000, result["resources"]["grain"])
-        self.assertEqual(100000, result["grain_capacity"])
-        self.assertEqual(300, result["gold"])
-
-    def test_reads_confirmed_granary_refill_response(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.expression = kwargs["expression"]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "confirmed",
-                            "resources": {
-                                "wood": 10000,
-                                "clay": 10000,
-                                "iron": 10000,
-                                "grain": 100000,
-                            },
-                            "grain_capacity": 100000,
-                            "target_grain": 100000,
-                            "gold": 300,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        result = session.read_resource_milling_response(
-            "b" * 32,
-            "refill",
-            5,
-            100000,
-        )
-
-        self.assertIn('mode === "empty"', session._tab.expression)
-        self.assertIn("amounts[3] >= targetGrain - 1", session._tab.expression)
-        self.assertEqual("confirmed", result["status"])
-        self.assertEqual(100000, result["resources"]["grain"])
-
-    def test_queue_recruitment_uses_live_checked_game_request(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.method = method
-                self.expression = kwargs["expression"]
-                self.arguments = kwargs
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "submitted",
-                            "request_id": request_id,
-                            "quantity": 5,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        outcome = session.queue_recruitment(
-            {
-                "village_id": "101",
-                "building_type": 19,
-                "unit_type": 21,
-                "unit": "Phalanx",
-            },
-            5,
-            3,
-        )
-
-        self.assertEqual("Runtime.evaluate", session._tab.method)
-        self.assertTrue(session._tab.arguments["returnByValue"])
-        self.assertIn("queue.data.buildingTypes", session._tab.expression)
-        self.assertIn("insufficient_resources", session._tab.expression)
-        self.assertIn("village.getResources()", session._tab.expression)
-        self.assertIn('"building/recruitUnits"', session._tab.expression)
-        self.assertIn("Travian.writeRequest", session._tab.expression)
-        self.assertIn('"101"', session._tab.expression)
-        self.assertIn("19, [19], 21, 5, 3", session._tab.expression)
-        self.assertIn("count > queueThreshold", session._tab.expression)
-        self.assertIn("quantity >= minQuantity", session._tab.expression)
-        self.assertIn(", 5, 1.0)", session._tab.expression)
-        self.assertIn("response.cache", session._tab.expression)
-        self.assertIn("UnitQueue:${villageId}", session._tab.expression)
-        self.assertEqual("submitted", outcome["status"])
-        self.assertRegex(outcome["request_id"], r"^[a-f0-9]{32}$")
-        self.assertEqual("Phalanx", outcome["unit"])
-
-    def test_queue_recruitment_accepts_detected_unit_ids_from_other_tribes(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.expression = kwargs["expression"]
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {
-                    "result": {
-                        "value": {
-                            "status": "submitted",
-                            "request_id": request_id,
-                            "quantity": 5,
-                        }
-                    }
-                }
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        outcome = session.queue_recruitment(
-            {
-                "village_id": "303",
-                "building_type": 20,
-                "building_types": [20],
-                "unit_type": 34,
-                "unit": "Sopdu Explorer",
-            },
-            5,
-            1,
-        )
-
-        self.assertIn("20, [20], 34, 5, 1", session._tab.expression)
-        self.assertEqual("Sopdu Explorer", outcome["unit"])
-        self.assertEqual("submitted", outcome["status"])
-
-    def test_reads_async_recruitment_response_status(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.method = method
-                self.expression = kwargs["expression"]
-                return {"result": {"value": {"status": "confirmed", "count": 6}}}
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        result = session.read_recruitment_order_response("a" * 32, 1)
-
-        self.assertEqual("Runtime.evaluate", session._tab.method)
-        self.assertIn(
-            "__travianAssistantRecruitmentResponse_",
-            session._tab.expression,
-        )
-        self.assertIn("response.count > queueThreshold", session._tab.expression)
-        self.assertEqual({"status": "confirmed", "count": 6}, result)
-
-    def test_confirmed_automatic_recruitment_updates_queue_and_clears_pending(self):
-        class FakeSession:
-            def read_recruitment_order_response(
-                self,
-                request_id,
-                queue_threshold,
-            ):
-                self.request_id = request_id
-                self.queue_threshold = queue_threshold
-                return {"status": "confirmed", "count": 6}
-
-            def stop_incoming_attack_listener(self):
-                pass
-
-            def disconnect(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = DatabaseManager(str(Path(tmpdir) / "confirmed-order.db"))
-            db.init()
-            settings = AppSettings()
-            key = "101:21"
-            settings.recruitment.pending_orders.add(key)
-            window = MainWindow(
-                settings,
-                AccountManager(AccountRepository(db)),
-                VillageTracker(VillageRepository(db)),
-            )
-            window.browser_session = FakeSession()
-            window._pending_recruitment_responses[key] = (0, 1)
-            row = {
-                "village_id": "101",
-                "village": "Testonia",
-                "building": "Koszary",
-                "unit": "Phalanx",
-                "building_type": 19,
-                "unit_type": 21,
-                "count": 0,
-                "other_count": 0,
-            }
-            window.dashboard_tab._recruitment_queue_rows = [row]
-
-            try:
-                with patch.object(AppSettings, "save", return_value=None):
-                    window._verify_automatic_recruitment_response(
-                        key,
-                        "a" * 32,
-                        row,
-                    )
-
-                self.assertNotIn(key, settings.recruitment.pending_orders)
-                self.assertNotIn(key, window._pending_recruitment_responses)
-                self.assertEqual(
-                    6,
-                    window.dashboard_tab._recruitment_queue_counts[
-                        ("101", "Phalanx")
-                    ][0],
-                )
-                self.assertIn(
-                    "Potwierdzono",
-                    window.recruitment_tab.recruitment_queue_status.text(),
-                )
-            finally:
-                window.close()
-                db.close()
-
-    def test_unconfirmed_recruitment_response_without_count_is_reported(self):
-        class FakeSession:
-            def read_recruitment_order_response(
-                self,
-                request_id,
-                queue_threshold,
-            ):
-                return {"status": "unconfirmed"}
-
-            def stop_incoming_attack_listener(self):
-                pass
-
-            def disconnect(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = DatabaseManager(str(Path(tmpdir) / "missing-count-order.db"))
-            db.init()
-            settings = AppSettings()
-            key = "101:24"
-            settings.recruitment.pending_orders.add(key)
-            window = MainWindow(
-                settings,
-                AccountManager(AccountRepository(db)),
-                VillageTracker(VillageRepository(db)),
-            )
-            window.browser_session = FakeSession()
-            window._pending_recruitment_responses[key] = (0, 1)
-            row = {
-                "village_id": "101",
-                "village": "Giran",
-                "unit": "Theutates Thunder",
-            }
-
-            try:
-                with patch.object(AppSettings, "save", return_value=None):
-                    window._verify_automatic_recruitment_response(
-                        key,
-                        "b" * 32,
-                        row,
-                    )
-
-                self.assertIn(key, settings.recruitment.pending_orders)
-                self.assertIn(
-                    "brak danych",
-                    window.recruitment_tab.recruitment_queue_status.text(),
-                )
-            finally:
-                window.close()
-                db.close()
-
-    def test_queue_recruitment_rejects_mismatched_unit_and_building(self):
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = object()
-
-        with self.assertRaisesRegex(ValueError, "Invalid automatic"):
-            session.queue_recruitment(
-                {
-                    "village_id": "101",
-                    "building_type": 999,
-                    "unit_type": 21,
-                },
-                5,
-            )
-
     def test_auto_recruitment_only_queues_low_target_queue(self):
         class FakeSession:
             def __init__(self):
@@ -2067,20 +1662,13 @@ class BaselineSmokeTests(unittest.TestCase):
                     "gold": self.gold,
                 }]
 
-            def queue_resource_milling(
-                self,
-                village_id,
-                settings,
-                minimum_gold_balance,
-            ):
+            # Clicker stand-in (the app's shared click executor).
+            def npc_mill(self, village_id, plan, max_price, minimum_gold):
                 self.milling_requests.append(
-                    (village_id, settings, minimum_gold_balance)
+                    (village_id, plan, minimum_gold, max_price)
                 )
-                return {
-                    "status": "submitted",
-                    "request_id": "c" * 32,
-                    "target_grain": 0,
-                }
+                before = [40000, 40000, 40000, 5000]
+                return {"spent": max_price, "before": before, "after": plan(before)}
 
             def stop_incoming_attack_listener(self):
                 pass
@@ -2102,6 +1690,8 @@ class BaselineSmokeTests(unittest.TestCase):
             )
             fake_session = FakeSession()
             window.browser_session = fake_session
+            window._click_executor = lambda: fake_session
+            window._run_click_job = lambda target, name: target()
             window.dashboard_tab._live_state = {
                 "villages": [{"id": "101", "name": "Testonia"}],
             }
@@ -2127,10 +1717,13 @@ class BaselineSmokeTests(unittest.TestCase):
                         fake_session.milling_requests[0][2],
                     ),
                 )
-                self.assertIn(
+                self.assertEqual(5, fake_session.milling_requests[0][3])
+                # Confirmed by the clicker: the village is free again.
+                self.assertNotIn(
                     "101",
                     settings.resource_milling.pending_villages,
                 )
+                self.assertIn("Potwierdzono", window.milling_tab.status.text())
             finally:
                 window.close()
                 db.close()
@@ -2158,20 +1751,13 @@ class BaselineSmokeTests(unittest.TestCase):
                     "gold": 305,
                 }]
 
-            def queue_resource_milling(
-                self,
-                village_id,
-                settings,
-                minimum_gold_balance,
-            ):
+            # Clicker stand-in (the app's shared click executor).
+            def npc_mill(self, village_id, plan, max_price, minimum_gold):
                 self.milling_requests.append(
-                    (village_id, settings, minimum_gold_balance)
+                    (village_id, plan, minimum_gold, max_price)
                 )
-                return {
-                    "status": "submitted",
-                    "request_id": "d" * 32,
-                    "target_grain": 100000,
-                }
+                before = [40000, 40000, 40000, 5000]
+                return {"spent": max_price, "before": before, "after": plan(before)}
 
             def stop_incoming_attack_listener(self):
                 pass
@@ -2193,6 +1779,8 @@ class BaselineSmokeTests(unittest.TestCase):
             )
             fake_session = FakeSession()
             window.browser_session = fake_session
+            window._click_executor = lambda: fake_session
+            window._run_click_job = lambda target, name: target()
             window.dashboard_tab._live_state = {
                 "villages": [{"id": "101", "name": "Testonia"}],
             }
@@ -2203,15 +1791,14 @@ class BaselineSmokeTests(unittest.TestCase):
                     self.qt_app.processEvents()
 
                 self.assertEqual(1, len(fake_session.milling_requests))
-                village_id, request_settings, reserve = (
+                village_id, plan, reserve, _price = (
                     fake_session.milling_requests[0]
                 )
                 self.assertEqual("101", village_id)
-                self.assertEqual("refill", request_settings["mode"])
-                self.assertEqual(
-                    5,
-                    request_settings["refill_trigger_percent"],
-                )
+                # Refill: the granary (100 000) is filled from the rest.
+                split = plan([40000, 40000, 40000, 5000])
+                self.assertEqual(100000, split[3])
+                self.assertEqual(125000, sum(split))
                 self.assertEqual(300, reserve)
                 self.assertTrue(
                     window.milling_tab.village_controls["101"][
@@ -2224,7 +1811,7 @@ class BaselineSmokeTests(unittest.TestCase):
                         "refill_trigger_percent"
                     ].value(),
                 )
-                self.assertIn(
+                self.assertNotIn(
                     "101",
                     settings.resource_milling.pending_refill_villages,
                 )

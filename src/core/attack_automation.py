@@ -106,6 +106,8 @@ STATUS_LABELS = {
 }
 
 AIM_FRACTION = 0.5
+# Time the clicked withdrawal of the hero takes (rally point, list, Withdraw).
+HERO_RECALL_CLICK_SECONDS = 30
 VERIFY_DELAY_SECONDS = 3.0
 PREVIEW_TTL_SECONDS = 600
 
@@ -408,7 +410,7 @@ class AttackAutomation:
                 continue
             self._pt_attempts[village_id] = time.monotonic()
             try:
-                accepted = self.bridge.upgrade_building(village_id, int(location), 14)
+                accepted = self.bridge.upgrade_building(village_id, int(location), current)
             except Exception as error:
                 self._log(f"Rozbudowa placu turniejowego ({village['name']}) nieudana: {error}")
                 continue
@@ -541,8 +543,7 @@ class AttackAutomation:
             f"{datetime.fromtimestamp(departure):%H:%M:%S} (czas serwera)."
             + (f" Uwagi: {run.message}" if notes else "")
         )
-        mode = self.settings.execution_mode
-        if mode == "clicks" and self.click_executor is not None:
+        if self.click_executor is not None:
             try:
                 self.click_executor.prepare(run)
             except Exception as error:
@@ -555,10 +556,9 @@ class AttackAutomation:
             if run.status != STATUS_PREPARED:
                 return
             try:
-                if self.settings.execution_mode == "clicks" and self.click_executor is not None:
-                    batch_id, result = self.click_executor.fire(run, latest)
-                else:
-                    batch_id, result = self.bridge.fire(run.requests, latest)
+                if self.click_executor is None:
+                    raise RuntimeError("brak klikania w grze")
+                batch_id, result = self.click_executor.fire(run, latest)
             except Exception as error:
                 run.status = STATUS_FAILED
                 run.message = f"Błąd wysyłki: {error}"
@@ -577,10 +577,7 @@ class AttackAutomation:
     def _verify(self, run: AttackRun) -> None:
         attack = run.attack
         try:
-            if self.settings.execution_mode == "clicks" and self.click_executor is not None:
-                fire = self.click_executor.read(run)
-            else:
-                fire = self.bridge.read_fire(run.batch_id)
+            fire = self.click_executor.read(run) if self.click_executor is not None else None
             movements = self.bridge.read_movements(attack.source_village_id)
         except Exception as error:
             run.message = f"Weryfikacja: {error}"
@@ -701,7 +698,8 @@ class AttackAutomation:
                 self.hero_status_text = f"Bohater stoi w {village_name}; brak ataków z bohaterem."
                 return
             recall_at = hero_recall_time(
-                next_run.departure, one_way, self.settings.hero_return_margin_seconds,
+                next_run.departure, one_way,
+                self.settings.hero_return_margin_seconds + self._hero_click_lead(),
             )
             self.hero_status_text = (
                 f"Bohater w {village_name}; wycofanie o "
@@ -709,25 +707,40 @@ class AttackAutomation:
             )
             if not next_run.hero_recall_scheduled and recall_at - now <= 30:
                 next_run.hero_recall_scheduled = True
-                request = self.bridge.recall_request(hero["support_troop_id"])
-                aim = recall_at + AIM_FRACTION - self.rtt_ms / 2000.0
+                request = self.bridge.recall_request(
+                    hero["support_troop_id"],
+                    village_id=home, location_village_id=hero["support_village_id"],
+                )
                 latest = recall_at + 3
                 self._timer.schedule(
-                    self.to_local(max(aim, now + 0.05)),
+                    self.to_local(max(recall_at, now + 0.05)),
                     lambda: self._fire_hero(request, latest, "Wycofano bohatera"),
                 )
             return
 
         if hero.get("status") == 0 and context["villages"].get(home, {}).get("hero_home"):
-            next_departure = next_run.departure if next_run else None
+            next_departure = (
+                next_run.departure - self._hero_click_lead() if next_run else None
+            )
             if can_park_hero(now, next_departure, one_way):
                 request = self.bridge.send_request(home, parking, MOVEMENT_SUPPORT, {HERO: 1})
-                self._fire_hero(request, now + 30, f"Bohater wysłany na postój do {village_name}")
-                self._hero_action_after = time.monotonic() + 30
+                # Clicking takes a while: off the automation's tick.
+                self._timer.schedule(
+                    self.to_local(now + 0.05),
+                    lambda: self._fire_hero(
+                        request, now + 60, f"Bohater wysłany na postój do {village_name}",
+                    ),
+                )
+                self._hero_action_after = time.monotonic() + 90
             else:
                 self.hero_status_text = "Bohater czeka w domu na najbliższy atak."
             return
         self.hero_status_text = "Bohater w drodze."
+
+    def _hero_click_lead(self) -> int:
+        """Seconds the hero must be home before a wave leaves: its send window
+        is prepared ``prepare_seconds`` ahead, after the clicked recall."""
+        return int(self.settings.prepare_seconds) + HERO_RECALL_CLICK_SECONDS
 
     def _fire_hero(self, request: dict, latest: float, success: str) -> None:
         try:

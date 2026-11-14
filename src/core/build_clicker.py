@@ -235,6 +235,8 @@ READ_BUILD_STATE_JS = r"""(() => {
         hero: heroData ? {
             village_id: String(heroData.villageId), type: Number(heroData.resBonusType),
             points: Number(heroData.resBonusPoints) || 0, dead: !!heroData.notAlive,
+            // Hourly amount per resource of the current setting.
+            value: Number(heroData.resBonusValue) || 0,
         } : null,
         gold: Number(Travian.Player.data.gold) || 0,
         gold_confirmation: Number(
@@ -448,6 +450,11 @@ _TARGET_AT_POINT_JS = r"""((selector, index, x, y, accept) => {
     return {ok: false, hit: hit.tagName + "." + String(hit.className).slice(0, 60)
         + (clickable ? " [" + clickable.slice(0, 60) + "]" : "")};
 })"""
+
+
+# Player.vacationState values.
+VACATION_INACTIVE = 0
+VACATION_ACTIVATING = 1
 
 
 class BuildClickExecutor:
@@ -833,16 +840,23 @@ class BuildClickExecutor:
         return f"traded:{spent}"
 
     # -- troops ---------------------------------------------------------------------
-    def _send_troops(self, source_id, target_x, target_y, movement_type, units) -> dict:
+    def _send_troops(
+        self, source_id, target_x, target_y, movement_type, units,
+        catapult_targets=(), spy_mission=None,
+    ) -> dict:
         """Send own troops from the rally point window, like a player: pick
         the mission, type the units, check the confirmation, press send."""
         units = {int(nr): int(count) for nr, count in units.items() if int(count) > 0}
-        if not units:
+        if not units or not str(source_id).isdigit():
             raise ValueError("No units to send.")
         lane = self._ensure_lane()
         lane.wake()
         self._close_windows(lane)
-        lane.prepare(str(source_id), int(target_x), int(target_y), int(movement_type), units, ())
+        self._select_village(lane, str(source_id))
+        lane.prepare(
+            str(source_id), int(target_x), int(target_y), int(movement_type), units,
+            tuple(int(t) for t in catapult_targets), spy_mission,
+        )
         lane.fire()
         try:
             lane.wait_for(
@@ -950,26 +964,53 @@ class BuildClickExecutor:
             return self._recall_troops(village_id, location_village_id, units)
 
     @_exclusive
-    def send_troops(self, source_id, target_x, target_y, movement_type, units) -> dict:
+    def send_troops(
+        self, source_id, target_x, target_y, movement_type, units,
+        catapult_targets=(), spy_mission=None,
+    ) -> dict:
         lane = self._ensure_lane()
         with self._gold_guard(lane, 0, "wysyłka wojsk"):
-            return self._send_troops(source_id, target_x, target_y, movement_type, units)
+            return self._send_troops(
+                source_id, target_x, target_y, movement_type, units,
+                catapult_targets, spy_mission,
+            )
 
     # -- NPC merchant in the marketplace ---------------------------------------------
     def _npc_convert(
         self, village_id: str, marketplace_location: int, gains: dict[int, int], max_price: int,
     ) -> dict:
         """Turn crop into wood, clay and iron in the marketplace's "NPC merchant"
-        tab, like a player: type the crop, lock it, type the wood, lock it, type
-        the clay (iron takes the rest), check the form, press Convert."""
-        if not str(village_id).isdigit():
-            raise ValueError("Invalid village id.")
-        village_id = str(village_id)
-        location = int(marketplace_location)
+        tab, like a player (see :meth:`_npc_exchange`)."""
         gains = {r: max(0, int(gains.get(r, 0))) for r in (1, 2, 3)}
         total = sum(gains.values())
         if total <= 0:
             raise ValueError("Nothing to convert.")
+
+        def plan(current: list[int]) -> list[int]:
+            crop = current[3] - total
+            if crop < 0:
+                raise ClickModeError("Za mało zboża do wymiany.")
+            return [current[0] + gains[1], current[1] + gains[2], current[2] + gains[3], crop]
+
+        outcome = self._npc_exchange(village_id, marketplace_location, plan, max_price)
+        before, after = outcome["before"], outcome["after"]
+        return {
+            "spent": outcome["spent"],
+            "gains": {1: after[0] - before[0], 2: after[1] - before[1], 3: after[2] - before[2]},
+            "crop": before[3] - after[3],
+        }
+
+    def _npc_exchange(self, village_id: str, marketplace_location: int, plan, max_price: int) -> dict:
+        """Redistribute the stock in the marketplace's "NPC merchant" tab, like
+        a player: type the crop, lock it, type the wood, lock it, type the clay
+        (iron takes the rest), check the form, press Convert.
+
+        *plan* gets the form's current amounts [wood, clay, iron, crop] and
+        returns the wanted ones (same total)."""
+        if not str(village_id).isdigit():
+            raise ValueError("Invalid village id.")
+        village_id = str(village_id)
+        location = int(marketplace_location)
         window = ".modalWrapper.building"
         lane = self._ensure_lane()
         lane.wake()
@@ -1005,17 +1046,20 @@ class BuildClickExecutor:
         if len(current) != 4:
             self._close_windows(lane)
             raise ClickModeError("Nie odczytano stanu surowców w formularzu handlarza.")
-        crop = current[3] - total
-        if crop < 0:
+        try:
+            expected = [int(v) for v in plan(current)]
+        except Exception:
             self._close_windows(lane)
-            raise ClickModeError("Za mało zboża do wymiany.")
-        expected = [current[0] + gains[1], current[1] + gains[2], current[2] + gains[3], crop]
+            raise
+        if len(expected) != 4 or min(expected) < 0 or abs(sum(expected) - sum(current)) > 3:
+            self._close_windows(lane)
+            raise ClickModeError(f"Niepoprawny podział surowców ({expected}) — przerwano.")
         lock = f"{form} .lockSymbol"
         locked = (
             f"(i => !document.querySelectorAll('{form} .lockButtonContainer')[i]"
             ".classList.contains('open'))"
         )
-        self._type_at(lane, inputs, 3, str(crop))
+        self._type_at(lane, inputs, 3, str(expected[3]))
         time.sleep(0.6)
         self._click(lane, lock, 3)
         time.sleep(0.5)
@@ -1044,24 +1088,48 @@ class BuildClickExecutor:
         if lane.evaluate(f"document.querySelector(\"{button}\").classList.contains('disabled')"):
             self._close_windows(lane)
             raise ClickModeError("Przycisk wymiany jest nieaktywny.")
+        # Watch the resource that changes most, to see the game took the trade.
+        watch = max(range(4), key=lambda i: abs(typed[i] - current[i]))
+        delta = typed[watch] - current[watch]
+        bound = current[watch] + 0.8 * delta
         gold_before = self._gold(lane)
         self._click(lane, button)
         self._confirm_gold(lane, "NPCTrader", max_price)
         try:
             lane.wait_for(
-                "Number(Village.get(" + json.dumps(village_id) + ").getResources()[4]) <= "
-                + str(current[3] - 0.8 * total),
+                "Number(Village.get(" + json.dumps(village_id) + f").getResources()[{watch + 1}]) "
+                + ("<= " if delta < 0 else ">= ") + str(bound),
                 timeout=10,
             )
         except ClickModeError:
             self._close_windows(lane)
             raise ClickModeError("Gra nie potwierdziła wymiany u handlarza.") from None
         self._close_windows(lane)
-        return {
-            "spent": gold_before - self._gold(lane),
-            "gains": {1: typed[0] - current[0], 2: typed[1] - current[1], 3: typed[2] - current[2]},
-            "crop": current[3] - typed[3],
-        }
+        return {"spent": gold_before - self._gold(lane), "before": current, "after": typed}
+
+    def _marketplace(self, lane: _Lane, village_id: str) -> int:
+        location = lane.evaluate(
+            "((id) => { const d = ((Building.getCollection(id) || {}).data || []).map(r => r.data)"
+            ".find(d => Number(d.buildingType) === 17 && Number(d.lvl) > 0);"
+            " return d ? Number(d.locationId) : null; })"
+            f"({json.dumps(str(village_id))})"
+        )
+        if not location:
+            raise ClickModeError("Wioska nie ma targowiska.")
+        return int(location)
+
+    @_exclusive
+    def npc_mill(self, village_id: str, plan, max_price: int, minimum_gold: int) -> dict:
+        """Mill a village's stock at the NPC merchant by clicking.
+
+        *plan* maps the current [wood, clay, iron, crop] to the wanted split;
+        nothing is clicked when gold would drop under *minimum_gold*."""
+        lane = self._ensure_lane()
+        if self._gold(lane) < int(minimum_gold) + int(max_price):
+            raise ClickModeError("Saldo złota nie pozwala zachować rezerwy po wymianie.")
+        location = self._marketplace(lane, str(village_id))
+        with self._gold_guard(lane, int(max_price), "mielenie u handlarza NPC"):
+            return self._npc_exchange(str(village_id), location, plan, max_price)
 
     @_exclusive
     def npc_convert(self, village_id, marketplace_location, gains, max_price) -> dict:
@@ -1820,3 +1888,83 @@ class BuildClickExecutor:
         lane = self._ensure_lane()
         with self._gold_guard(lane, 0, "nowy budynek"):
             return self._construct(village_id, location, building_type)
+
+    # -- vacation mode -------------------------------------------------------------
+    def _vacation_state(self, lane: _Lane) -> dict:
+        return lane.evaluate(
+            "(() => { const d = Travian.Player.data; return {state: Number(d.vacationState),"
+            " start: Number(d.vacationStateStart) || 0, used: Number(d.usedVacationDays) || 0}; })()"
+        ) or {}
+
+    def _change_vacation(self, days: int | None) -> dict:
+        """Plan vacation mode for *days* or cancel a planned one (``None``),
+        like a player: Settings -> Game -> duration list -> Confirm."""
+        lane = self._ensure_lane()
+        lane.wake()
+        self._close_windows(lane)
+        state = self._vacation_state(lane)
+        wanted_from, wanted_to = (VACATION_INACTIVE, VACATION_ACTIVATING) if days else (
+            VACATION_ACTIVATING, VACATION_INACTIVE)
+        if state.get("state") != wanted_from:
+            raise ClickModeError("Stan trybu urlopowego w grze nie pozwala na tę zmianę.")
+        self._click(lane, ".headerButton[clickable*=\"'profileTab': 'settings'\"]", accept="openWindow('profile'")
+        window = ".modalWrapper.profile"
+        try:
+            lane.wait_for(f"!!document.querySelector('{window} .naviTabGameplay')", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Okno ustawień się nie otworzyło.") from None
+        if not lane.evaluate(
+            f"document.querySelector('{window} .naviTabGameplay').classList.contains('active')"
+        ):
+            self._click(lane, f"{window} .naviTabGameplay")
+        button = f"{window} button[clickable='changeVacationState()']"
+        try:
+            lane.wait_for(f"!!document.querySelector(\"{button}\")", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Nie znaleziono ustawień trybu urlopowego.") from None
+        time.sleep(0.5)
+        if days:
+            head = f"{window} [data='vacationDaysDropdown'] .dropdownHead"
+            if not lane.rect(head):
+                self._close_windows(lane)
+                raise ClickModeError("Gra nie pozwala zaplanować urlopu (brak wolnych dni).")
+            self._click(lane, head)
+            option = f".dropdownBody .dropDownItem{int(days) - 1}"
+            visible = (
+                f"[...document.querySelectorAll('{option}')]"
+                ".some(e => e.getBoundingClientRect().width > 0)"
+            )
+            try:
+                lane.wait_for(visible, timeout=4)
+            except ClickModeError:
+                self._close_windows(lane)
+                raise ClickModeError(f"Nie można wybrać {days} dni urlopu.") from None
+            self._click(lane, option)
+            time.sleep(0.5)
+            shown = lane.evaluate(
+                f"(document.querySelector(\"{head} .selectedItem\") || {{}}).innerText || ''"
+            ) or ""
+            if str(int(days)) not in shown.split():
+                self._close_windows(lane)
+                raise ClickModeError(f"Lista pokazuje „{shown}” zamiast {days} dni — przerwano.")
+        elif not lane.evaluate(f"document.querySelector(\"{button}\").classList.contains('cancel')"):
+            self._close_windows(lane)
+            raise ClickModeError("Przycisk nie anuluje urlopu — przerwano.")
+        self._click(lane, button)
+        try:
+            lane.wait_for(f"Number(Travian.Player.data.vacationState) === {wanted_to}", timeout=10)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie potwierdziła zmiany trybu urlopowego.") from None
+        self._close_windows(lane)
+        return self._vacation_state(lane)
+
+    @_exclusive
+    def change_vacation(self, days: int | None) -> dict:
+        if days is not None and not (isinstance(days, int) and 1 <= days <= 14):
+            raise ValueError("Invalid vacation length.")
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "tryb urlopowy"):
+            return self._change_vacation(days)

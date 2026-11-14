@@ -148,40 +148,6 @@ class VacationPlannerTests(unittest.TestCase):
             VacationSettings(decision_minutes_before=1)
 
 
-class VacationSessionTests(unittest.TestCase):
-    def test_change_request_uses_captured_api_and_guards_state(self):
-        class FakeTab:
-            def call_method(self, method, **kwargs):
-                self.expression = kwargs["expression"]
-                request_id = re.findall(r'"([a-f0-9]{32})"', self.expression)[-1]
-                return {"result": {"value": {
-                    "status": "submitted",
-                    "request_id": request_id,
-                    "state": {
-                        "player_id": "199",
-                        "vacation_state": 0,
-                        "start": 0,
-                        "end": 0,
-                        "used_days": 0,
-                        "server_time": SERVER_NOW,
-                    },
-                }}}
-
-        session = TravianBrowserSession("127.0.0.1", 9222)
-        session._tab = FakeTab()
-        outcome = session.change_vacation_state(1, 60)
-        self.assertEqual("submitted", outcome["status"])
-        self.assertIn('"player/changeVacationState"', session._tab.expression)
-        self.assertIn("days !== null ? {days} : {}", session._tab.expression)
-        self.assertIn('status: "too_late"', session._tab.expression)
-        self.assertIn("(1, 60, ", session._tab.expression)
-
-        session.change_vacation_state(None, 60)
-        self.assertIn("(null, 60, ", session._tab.expression)
-        with self.assertRaises(ValueError):
-            session.change_vacation_state(0)
-
-
 class _FakeVacationSession:
     def __init__(self, state, attacks):
         self.state = state
@@ -194,20 +160,11 @@ class _FakeVacationSession:
     def read_incoming_attacks(self, villages):
         return self.attacks
 
-    def change_vacation_state(self, days, safety):
+    # The clicker stand-in shares the fake game state.
+    def change_vacation(self, days):
         self.changes.append(days)
-        return {
-            "status": "submitted",
-            "request_id": "c" * 32,
-            "state": self.read_vacation_state(),
-        }
-
-    def read_vacation_response(self, request_id, planned):
-        if planned:
-            self.state = _planned(86400)
-        else:
-            self.state = dict(IDLE)
-        return {"status": "confirmed", "error": None, **self.state}
+        self.state = _planned(86400) if days else dict(IDLE)
+        return {"state": self.state["vacation_state"], "start": self.state["start"]}
 
     def stop_incoming_attack_listener(self):
         pass
@@ -232,6 +189,8 @@ class VacationWindowTests(unittest.TestCase):
             VillageTracker(VillageRepository(db)),
         )
         window.browser_session = session
+        window._click_executor = lambda: session
+        window._run_click_job = lambda target, name: target()
         window.dashboard_tab._live_state = {
             "villages": [{"id": "101", "name": "Testonia"}],
         }
@@ -248,7 +207,6 @@ class VacationWindowTests(unittest.TestCase):
                     fake_datetime.fromtimestamp = datetime.fromtimestamp
                     window._check_vacation()
                     self.assertEqual([None], session.changes)
-                    window._verify_vacation_change()
                 self.assertEqual(0, session.state["vacation_state"])
                 self.assertIn(
                     "anulowane",
@@ -291,7 +249,6 @@ class VacationWindowTests(unittest.TestCase):
                     fake_date.today.return_value = NOW.date()
                     window._check_vacation()
                     self.assertEqual([1], session.changes)
-                    window._verify_vacation_change()
                 self.assertEqual(
                     NOW.date().isoformat(),
                     window.settings.vacation.last_plan_date,

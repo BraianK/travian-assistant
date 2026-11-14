@@ -68,6 +68,8 @@ try:
     from src.core.scout_automation import ScoutAutomation, read_hero_xp
     from src.core.build_automation import BuildAutomation
     from src.core.village_builder import completion_forecast
+    from src.core.npc_milling import milling_plan
+    from src.core.build_clicker import GoldGuardError
     from src.core.scout_planner import ScoutTarget
     from src.core.tournament_square import estimate_levels as estimate_square_levels
     from src.core.attack_operations import SCOUT_UNITS
@@ -130,6 +132,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.scout_automation import ScoutAutomation, read_hero_xp
     from core.build_automation import BuildAutomation
     from core.village_builder import completion_forecast
+    from core.npc_milling import milling_plan
+    from core.build_clicker import GoldGuardError
     from core.scout_planner import ScoutTarget
     from core.tournament_square import estimate_levels as estimate_square_levels
     from core.attack_operations import SCOUT_UNITS
@@ -2803,33 +2807,9 @@ class AttackPlanWidget(QWidget):
             return row
 
         self.mode_buttons: dict[str, QPushButton] = {}
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(0)
-        mode_label = QLabel("Sposób wysyłki:")
-        mode_row.addWidget(mode_label)
-        mode_row.addSpacing(8)
-        for mode, text, object_name in (
-            ("requests", "Polecenia gry", "segmentLeft"),
-            ("clicks", "Klikanie w przeglądarce", "segmentRight"),
-        ):
-            button = QPushButton(text)
-            button.setObjectName(object_name)
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            bold_font = QFont(button.font())
-            bold_font.setBold(True)
-            button.setMinimumWidth(QFontMetrics(bold_font).horizontalAdvance(text) + 34)
-            button.clicked.connect(
-                lambda _checked=False, value=mode: self._choose_mode(value)
-            )
-            mode_row.addWidget(button)
-            self.mode_buttons[mode] = button
-        mode_row.addStretch()
-        settings_layout.addLayout(mode_row)
         mode_hint = QLabel(
-            "Polecenia gry: najdokładniej, wszystkie fale w tej samej sekundzie. "
-            "Klikanie: aplikacja otwiera osobną kartę gry, wypełnia okna wysyłki "
-            "i klika „Wyślij” w docelowej sekundzie."
+            "Wysyłka klikaniem: aplikacja otwiera osobną kartę gry dla każdej fali, "
+            "wypełnia okno wysyłki i klika „Wyślij” w docelowej sekundzie."
         )
         mode_hint.setObjectName("footnote")
         mode_hint.setWordWrap(True)
@@ -6179,6 +6159,8 @@ class MainWindow(QMainWindow):
     build_log_message = Signal(str)
     build_snapshot_ready = Signal(object)
     recruitment_click_done = Signal(str, object, object)
+    milling_click_done = Signal(str, object, object)
+    vacation_click_done = Signal(object, object)
     
     def __init__(self, settings: AppSettings, account_mgr: AccountManager, 
                  village_tracker: VillageTracker,
@@ -6218,7 +6200,7 @@ class MainWindow(QMainWindow):
         # Immutable copy of the live incoming attacks for the build worker thread.
         self._build_threats: tuple[dict, ...] = ()
         self._dismissed_incoming_attack_ids: set[str] = set()
-        self._vacation_pending_request: tuple[str, bool, int] | None = None
+        self._vacation_pending_request: tuple[bool, bool] | None = None
         self._vacation_retry_after = 0.0
         self._vacation_last_logged: tuple | None = None
         
@@ -6299,6 +6281,8 @@ class MainWindow(QMainWindow):
         self.kingdom_timer.setInterval(_KINGDOM_REFRESH_INTERVAL_MS)
         self.kingdom_timer.timeout.connect(self._refresh_kingdom)
         self.recruitment_click_done.connect(self._on_recruitment_click_done)
+        self.milling_click_done.connect(self._on_milling_click_done)
+        self.vacation_click_done.connect(self._on_vacation_click_done)
         self.build_automation = None
         self._build_worker = None
         self._build_worker_started = 0.0
@@ -7839,62 +7823,6 @@ class MainWindow(QMainWindow):
             self._auto_recruitment_active = False
             return
 
-        status = result["status"]
-        if status == "submitted":
-            request_id = result["request_id"]
-            # (verification attempts, minimum queue count proving acceptance)
-            self._pending_recruitment_responses[key] = (0, row["count"] + 1)
-            self.recruitment_tab.recruitment_queue_status.setText(
-                f"Wysłano zlecenie: {int(result.get('quantity') or batch_size)} "
-                f"× {row['unit']} w wiosce {row['village']}. Sprawdzam "
-                "odpowiedź serwera…"
-            )
-            QTimer.singleShot(
-                1500,
-                lambda: self._verify_automatic_recruitment_response(
-                    key,
-                    request_id,
-                    row,
-                ),
-            )
-            QTimer.singleShot(
-                _AUTO_RECRUITMENT_ORDER_INTERVAL_MS,
-                self._run_next_automatic_recruitment,
-            )
-            return
-
-        self.settings.recruitment.pending_orders.discard(key)
-        self._save_recruitment_settings()
-        self._update_recruitment_queues(
-            self.dashboard_tab._recruitment_queue_rows,
-            self.settings.recruitment.pending_orders,
-        )
-        if status == "request_busy":
-            self.recruitment_tab.recruitment_queue_status.setText(
-                "Gra przetwarza już inne zlecenie. Automatyczne uzupełnianie "
-                "zatrzymano; kolejki zostaną ponownie sprawdzone przy "
-                "następnym odczycie."
-            )
-            self._auto_recruitment_candidates.clear()
-            self._auto_recruitment_active = False
-            return
-
-        messages = {
-            "queue_not_low": "kolejka wzrosła przed wysłaniem",
-            "building_missing": "brak odpowiednich koszar lub stajni",
-            "insufficient_resources": (
-                "za mało surowców nawet na jedną jednostkę"
-                if self.settings.recruitment.strategy_for(row["village_id"])
-                == "duration"
-                else "za mało surowców na całą partię"
-            ),
-        }
-        self.recruitment_tab.recruitment_queue_status.setText(
-            f"Nie dodano {row['unit']} w wiosce {row['village']}: "
-            f"{messages.get(status, 'warunki gry nie pozwalają na rekrutację')}."
-        )
-        QTimer.singleShot(0, self._run_next_automatic_recruitment)
-
     def _click_executor(self):
         """The background-tab clicker shared with the building automation."""
         automation = self.build_automation
@@ -7953,99 +7881,6 @@ class MainWindow(QMainWindow):
             )
         QTimer.singleShot(_AUTO_RECRUITMENT_ORDER_INTERVAL_MS, self._run_next_automatic_recruitment)
 
-    def _verify_automatic_recruitment_response(
-        self,
-        key: str,
-        request_id: str,
-        row: dict,
-    ):
-        if self.browser_session is None or key not in self._pending_recruitment_responses:
-            return
-
-        attempts, minimum_count = self._pending_recruitment_responses[key]
-        try:
-            result = self.browser_session.read_recruitment_order_response(
-                request_id,
-                max(0, minimum_count - 1),
-            )
-        except Exception as error:
-            logger.exception("Could not verify automatic recruitment response")
-            self.recruitment_tab.recruitment_queue_status.setText(
-                f"Nie udało się potwierdzić zlecenia dla {row['unit']} "
-                f"w wiosce {row['village']}: {error}. Zlecenie pozostaje "
-                "zablokowane, aby uniknąć duplikatu; sprawdź kolejkę w grze."
-            )
-            self._pending_recruitment_responses.pop(key, None)
-            return
-
-        if result["status"] == "pending":
-            attempts += 1
-            if attempts < 3:
-                self._pending_recruitment_responses[key] = (
-                    attempts,
-                    minimum_count,
-                )
-                QTimer.singleShot(
-                    1500,
-                    lambda: self._verify_automatic_recruitment_response(
-                        key,
-                        request_id,
-                        row,
-                    ),
-                )
-                return
-
-            self._pending_recruitment_responses.pop(key, None)
-            self.recruitment_tab.recruitment_queue_status.setText(
-                f"Gra nie zwróciła odpowiedzi na zlecenie {row['unit']} "
-                f"w wiosce {row['village']}. Nie ponawiam go automatycznie; "
-                "sprawdź kolejkę w grze."
-            )
-            return
-
-        self._pending_recruitment_responses.pop(key, None)
-        if result["status"] == "confirmed":
-            self.settings.recruitment.pending_orders.discard(key)
-            if not self._save_recruitment_settings():
-                self.settings.recruitment.pending_orders.add(key)
-                return
-
-            rows = [
-                {
-                    **queue,
-                    "count": result["count"],
-                }
-                if queue["village_id"] == row["village_id"]
-                and str(
-                    queue.get(
-                        "unit_id",
-                        queue.get("unit_type", queue["unit"]),
-                    )
-                ) == str(
-                    row.get("unit_id", row.get("unit_type", row["unit"]))
-                )
-                else queue
-                for queue in self.dashboard_tab._recruitment_queue_rows
-            ]
-            self._update_recruitment_queues(
-                rows,
-                self.settings.recruitment.pending_orders,
-            )
-            self.recruitment_tab.recruitment_queue_status.setText(
-                f"Potwierdzono: {result['count']} × {row['unit']} "
-                f"w wiosce {row['village']}."
-            )
-            return
-
-        self.recruitment_tab.recruitment_queue_status.setText(
-            f"Serwer odpowiedział, ale kolejka {row['unit']} w wiosce "
-            f"{row['village']} nie potwierdziła partii "
-            f"(stan: {result.get('count') if result.get('count') is not None else 'brak danych'}). "
-            "Zlecenie pozostaje zablokowane, aby uniknąć duplikatu. "
-            "Sprawdź kolejkę w grze."
-        )
-
-    # Attack plan automation -------------------------------------------------
     def _game_server_name(self) -> str:
         if self.settings.attacks.server_name:
             return self.settings.attacks.server_name
@@ -8062,7 +7897,7 @@ class MainWindow(QMainWindow):
             self.settings.attacks.server_name = server_name
             self._save_recruitment_settings()
             self.attack_tab.load_settings(self.settings.attacks)
-        bridge = GameAttackBridge(self.browser_session)
+        bridge = GameAttackBridge(self.browser_session, clicker=self._click_executor)
         tktools = TkToolsSession(self.browser_session._cdp_url)
         self.attack_automation = AttackAutomation(
             bridge,
@@ -8081,10 +7916,11 @@ class MainWindow(QMainWindow):
         if self.browser_session is None:
             return
         self.scout_automation = ScoutAutomation(
-            GameAttackBridge(self.browser_session),
+            GameAttackBridge(self.browser_session, clicker=self._click_executor),
             lambda: self.settings.scout,
             self.scout_log_message.emit,
             on_found=self.scout_found.emit,
+            clicker=ClickAttackExecutor(self.browser_session),
         )
         self.scout_timer.start()
         self.scout_tab.set_state("Połączono z grą", "active")
@@ -8766,7 +8602,7 @@ class MainWindow(QMainWindow):
         if self.browser_session is None:
             return
         self.hideout_defense = HideoutDefense(
-            GameAttackBridge(self.browser_session),
+            GameAttackBridge(self.browser_session, clicker=self._click_executor),
             lambda: self.settings.hideout_defense,
             self.hideout_log_message.emit,
             self.hideout_handled.emit,
@@ -9026,11 +8862,6 @@ class MainWindow(QMainWindow):
             setattr(self.settings.attacks, field, previous)
             self.attack_tab.load_settings(self.settings.attacks)
             return
-        if field == "execution_mode":
-            self.attack_tab.add_log(
-                "Tryb wysyłki: "
-                + ("klikanie w przeglądarce." if value == "clicks" else "polecenia gry.")
-            )
 
     # Vacation safeguard --------------------------------------------------------
     def _set_vacation_enabled(self, enabled: bool):
@@ -9149,38 +8980,69 @@ class MainWindow(QMainWindow):
     def _send_vacation_change(self, days: int | None, manual: bool = False):
         planned = days is not None
         try:
-            outcome = self.browser_session.change_vacation_state(
-                days,
-                CANCEL_SAFETY_SECONDS,
-            )
+            state = self.browser_session.read_vacation_state()
         except Exception as error:
-            logger.exception("Vacation change failed")
+            logger.exception("Vacation state read failed")
             self._vacation_retry_after = monotonic() + (300 if planned else 45)
-            self.vacation_tab.add_log(f"Błąd wysyłania do gry: {error}")
+            self.vacation_tab.add_log(f"Nie odczytano stanu wakacji: {error}")
             return
-
-        status = outcome["status"]
-        if status != "submitted":
-            messages = {
-                "not_idle": "wakacje są już zaplanowane lub aktywne",
-                "not_planned": "nie ma zaplanowanych wakacji do anulowania",
-                "too_late": "za mało czasu do aktywacji, by bezpiecznie anulować",
-                "request_busy": "gra przetwarza inne zlecenie",
-            }
+        status = None
+        if planned and state["vacation_state"] != 0:
+            status = "wakacje są już zaplanowane lub aktywne"
+        elif not planned and state["vacation_state"] != 1:
+            status = "nie ma zaplanowanych wakacji do anulowania"
+        elif not planned and state["start"] - state["server_time"] <= CANCEL_SAFETY_SECONDS:
+            status = "za mało czasu do aktywacji, by bezpiecznie anulować"
+        if status:
             self._vacation_retry_after = monotonic() + 45
             self.vacation_tab.add_log(
-                f"Nie wysłano ({'planowanie' if planned else 'anulowanie'}): "
-                f"{messages[status]}."
+                f"Nie wysłano ({'planowanie' if planned else 'anulowanie'}): {status}."
             )
-            self.vacation_tab.set_state(outcome["state"], None)
+            self.vacation_tab.set_state(state, None)
             return
 
-        self._vacation_pending_request = (outcome["request_id"], planned, 0)
+        executor = self._click_executor()
+        self._vacation_pending_request = (planned, manual)
+
+        def run():
+            # Clicked like a player: Settings -> Game -> duration -> Confirm.
+            try:
+                outcome = executor.change_vacation(days)
+            except Exception as click_error:
+                logger.exception("Clicked vacation change failed")
+                outcome = click_error
+            self.vacation_click_done.emit(planned, outcome)
+
         self.vacation_tab.add_log(
-            ("Wysłano planowanie wakacji" if planned else "Wysłano anulowanie wakacji")
-            + (" (ręcznie)." if manual else ".")
+            ("Planuję wakacje w grze (klikając)" if planned else "Anuluję wakacje w grze (klikając)")
+            + (" — ręcznie." if manual else ".")
         )
-        QTimer.singleShot(1500, self._verify_vacation_change)
+        self._run_click_job(run, "vacation-click")
+
+    def _on_vacation_click_done(self, planned: bool, outcome):
+        """Result of a clicked vacation change (main thread)."""
+        self._vacation_pending_request = None
+        if isinstance(outcome, Exception):
+            self._vacation_retry_after = monotonic() + (300 if planned else 45)
+            self.vacation_tab.add_log(
+                f"Gra nie potwierdziła {'planowania' if planned else 'anulowania'}: "
+                f"{outcome} Ponowię przy kolejnej kontroli."
+            )
+        elif planned:
+            self.settings.vacation.last_plan_date = date.today().isoformat()
+            self._save_recruitment_settings()
+            start = float(outcome.get("start") or 0)
+            self.vacation_tab.add_log(
+                "Gra potwierdziła: wakacje zaplanowane"
+                + (f" na {datetime.fromtimestamp(start):%d.%m %H:%M:%S}." if start else ".")
+            )
+            self._vacation_retry_after = 0.0
+        else:
+            self.vacation_tab.add_log(
+                "Gra potwierdziła: wakacje anulowane, dzień wakacji zwrócony."
+            )
+            self._vacation_retry_after = 0.0
+        QTimer.singleShot(500, self._check_vacation)
 
     def _next_own_attack_departure(self) -> float | None:
         """Server time of the next attack the attack automation will send."""
@@ -9192,62 +9054,6 @@ class MainWindow(QMainWindow):
             if run.status in ("waiting", "prepared")
         ]
         return min(departures) if departures else None
-
-    def _verify_vacation_change(self):
-        if self._vacation_pending_request is None or self.browser_session is None:
-            self._vacation_pending_request = None
-            return
-        request_id, planned, attempts = self._vacation_pending_request
-        try:
-            result = self.browser_session.read_vacation_response(request_id, planned)
-        except Exception as error:
-            logger.exception("Could not verify vacation change")
-            result = {"status": "unconfirmed", "error": str(error)}
-
-        if result["status"] == "pending" and attempts < 5:
-            self._vacation_pending_request = (request_id, planned, attempts + 1)
-            QTimer.singleShot(1500, self._verify_vacation_change)
-            return
-
-        if result["status"] == "unconfirmed" and not result.get("error"):
-            # The game's answer does not always carry the player data; check
-            # the live state instead of assuming the change failed.
-            try:
-                state = self.browser_session.read_vacation_state()
-                changed = (
-                    state["vacation_state"] == 1 and state["start"] > 0
-                    if planned else state["vacation_state"] == 0
-                )
-                if changed:
-                    result = {**result, **state, "status": "confirmed"}
-            except Exception as error:
-                logger.warning("Could not re-read vacation state: %s", error)
-
-        self._vacation_pending_request = None
-        if result["status"] == "confirmed":
-            if planned:
-                self.settings.vacation.last_plan_date = date.today().isoformat()
-                self._save_recruitment_settings()
-                self.vacation_tab.add_log(
-                    "Gra potwierdziła: wakacje zaplanowane na "
-                    f"{datetime.fromtimestamp(result['start']):%d.%m %H:%M:%S}."
-                )
-            else:
-                self.vacation_tab.add_log(
-                    "Gra potwierdziła: wakacje anulowane, dzień wakacji zwrócony."
-                )
-            self._vacation_retry_after = 0.0
-        else:
-            reason = result.get("error") or (
-                "brak odpowiedzi gry" if result["status"] == "pending"
-                else "stan gracza się nie zmienił"
-            )
-            self._vacation_retry_after = monotonic() + (300 if planned else 45)
-            self.vacation_tab.add_log(
-                f"Gra nie potwierdziła {'planowania' if planned else 'anulowania'}: "
-                f"{reason}. Ponowię przy kolejnej kontroli."
-            )
-        QTimer.singleShot(500, self._check_vacation)
 
     def _plan_vacation_manually(self):
         if self.browser_session is None or self._vacation_pending_request is not None:
@@ -9481,195 +9287,90 @@ class MainWindow(QMainWindow):
             return
         self.milling_tab.clear_pending_btn.setEnabled(True)
 
-        try:
-            result = self.browser_session.queue_resource_milling(
-                village_id,
-                {
-                    **village_settings.model_dump(),
-                    "mode": mode,
-                },
-                self.settings.resource_milling.minimum_gold_balance,
+        executor = self._click_executor()
+        settings_dump = village_settings.model_dump()
+        capacity = float(row["capacities"]["grain"])
+
+        def plan(current):
+            return milling_plan(
+                current, capacity, mode,
+                settings_dump["wood_percent"], settings_dump["clay_percent"],
+                settings_dump["iron_percent"],
             )
-        except Exception as error:
-            logger.exception("NPC trader exchange outcome is uncertain")
+
+        reserve = self.settings.resource_milling.minimum_gold_balance
+
+        def run():
+            # Clicked like a player: marketplace, NPC merchant, split, Convert.
+            try:
+                outcome = executor.npc_mill(village_id, plan, NPC_TRADER_PRICE, reserve)
+            except Exception as click_error:
+                logger.exception("Clicked NPC milling failed")
+                outcome = click_error
+            self.milling_click_done.emit(village_id, row, outcome)
+
+        self.milling_tab.status.setText(
+            f"Mielę w grze (klikając u handlarza NPC): {row['village']}…"
+        )
+        self._run_click_job(run, "mill-click")
+
+    def _run_click_job(self, target, name: str) -> None:
+        """Run a clicking action off the UI thread (tests run it inline)."""
+        threading.Thread(target=target, daemon=True, name=name).start()
+
+    def _on_milling_click_done(self, village_id: str, row: dict, outcome):
+        """Result of a clicked NPC milling (main thread)."""
+        mode = row["mode"]
+        village_name = row["village"]
+        if isinstance(outcome, Exception):
             self._milling_candidates.clear()
             self._milling_order_active = False
-            self.milling_tab.status.setText(
-                f"Nie udało się potwierdzić wymiany w wiosce "
-                f"{row['village']}: {error}. Blokuję ponowienie, aby "
-                "uniknąć podwójnego kosztu złota; sprawdź stan w grze."
+            text = str(outcome)
+            uncertain = isinstance(outcome, GoldGuardError) or "potwierdziła" in text
+            if not uncertain:
+                # Nothing was bought: the next check may try again.
+                self.settings.resource_milling.pending_villages.discard(village_id)
+                self.settings.resource_milling.pending_refill_villages.discard(village_id)
+                self._save_recruitment_settings()
+            self.milling_tab.clear_pending_btn.setEnabled(
+                bool(self.settings.resource_milling.pending_villages)
             )
-            return
-
-        status = result["status"]
-        if status == "submitted":
-            request_id = result["request_id"]
-            self._pending_milling_responses[village_id] = 0
             self.milling_tab.status.setText(
-                f"Wysłano wymianę NPC dla {row['village']} za "
-                f"{NPC_TRADER_PRICE} złota. Sprawdzam odpowiedź gry…"
-            )
-            QTimer.singleShot(
-                1500,
-                lambda: self._verify_resource_milling_response(
-                    village_id,
-                    request_id,
-                    row["village"],
-                    mode,
-                    (
-                        row["settings"]["refill_trigger_percent"]
-                        if mode == "refill"
-                        else row["settings"]["trigger_percent"]
-                    ),
-                    result["target_grain"],
-                ),
+                f"Nie wykonano wymiany w wiosce {village_name}: {text}"
+                + (
+                    " Blokuję ponowienie, aby uniknąć podwójnego kosztu złota; "
+                    "sprawdź stan w grze." if uncertain else ""
+                )
             )
             return
 
         self.settings.resource_milling.pending_villages.discard(village_id)
-        self.settings.resource_milling.pending_refill_villages.discard(
-            village_id
-        )
-        self._save_recruitment_settings()
+        self.settings.resource_milling.pending_refill_villages.discard(village_id)
+        if not self._save_recruitment_settings():
+            self.settings.resource_milling.pending_villages.add(village_id)
+            if mode == "refill":
+                self.settings.resource_milling.pending_refill_villages.add(village_id)
+            self._milling_candidates.clear()
+            self._milling_order_active = False
+            return
         self.milling_tab.clear_pending_btn.setEnabled(
             bool(self.settings.resource_milling.pending_villages)
         )
-        messages = {
-            "below_gold_reserve": (
-                "saldo jest mniejsze niż rezerwa plus koszt 5 złota"
-            ),
-            "below_threshold": "zboże spadło poniżej ustawionego progu",
-            "nothing_to_mill": "brak surowców do rozdzielenia",
-            "request_busy": "gra przetwarza już inne zlecenie",
-        }
+        wood, clay, iron, grain = outcome["after"]
+        capacity = float(row["capacities"]["grain"]) or 1.0
+        gold = row.get("gold")
+        if gold is not None:
+            gold = int(gold) - int(outcome.get("spent") or 0)
+            self.milling_tab.set_gold_balance(gold)
         self.milling_tab.status.setText(
-            f"Nie wykonano wymiany w wiosce {row['village']}: "
-            f"{messages.get(status, 'warunki gry nie pozwalają na wymianę')}."
+            f"Potwierdzono {'uzupełnianie' if mode == 'refill' else 'opróżnianie'} "
+            f"spichlerza w wiosce {village_name}: "
+            f"zboże {grain / capacity * 100:.1f}% pojemności "
+            f"({grain:,.0f}), glina {clay:,.0f}, żelazo {iron:,.0f}, "
+            f"drewno {wood:,.0f}. Saldo po wymianie: "
+            f"{gold if gold is not None else 'brak danych'} złota."
         )
-        if status == "below_gold_reserve" or status == "request_busy":
-            self._milling_candidates.clear()
-            self._milling_order_active = False
-            return
-        QTimer.singleShot(0, self._run_next_resource_milling)
-
-    def _verify_resource_milling_response(
-        self,
-        village_id: str,
-        request_id: str,
-        village_name: str,
-        mode: str,
-        trigger_percent: int,
-        target_grain: int,
-    ):
-        if (
-            self.browser_session is None
-            or village_id not in self._pending_milling_responses
-        ):
-            return
-        try:
-            result = self.browser_session.read_resource_milling_response(
-                request_id,
-                mode,
-                trigger_percent,
-                target_grain,
-            )
-        except Exception as error:
-            logger.exception("Could not verify NPC trader response")
-            self._pending_milling_responses.pop(village_id, None)
-            self._milling_candidates.clear()
-            self._milling_order_active = False
-            self.milling_tab.status.setText(
-                f"Nie udało się potwierdzić wymiany w wiosce {village_name}: "
-                f"{error}. Blokada pozostaje, by uniknąć ponownego kosztu."
-            )
-            return
-
-        if result["status"] == "pending":
-            attempts = self._pending_milling_responses[village_id] + 1
-            if attempts < 3:
-                self._pending_milling_responses[village_id] = attempts
-                QTimer.singleShot(
-                    1500,
-                    lambda: self._verify_resource_milling_response(
-                        village_id,
-                        request_id,
-                        village_name,
-                        mode,
-                        trigger_percent,
-                        target_grain,
-                    ),
-                )
-                return
-            self._pending_milling_responses.pop(village_id, None)
-            self._milling_candidates.clear()
-            self._milling_order_active = False
-            self.milling_tab.status.setText(
-                f"Gra nie potwierdziła wymiany w wiosce {village_name}. "
-                "Nie ponawiam jej, aby uniknąć ponownego kosztu 5 złota; "
-                "sprawdź zapasy i złoto."
-            )
-            return
-
-        self._pending_milling_responses.pop(village_id, None)
-        if result["status"] == "confirmed":
-            self.settings.resource_milling.pending_villages.discard(village_id)
-            self.settings.resource_milling.pending_refill_villages.discard(
-                village_id
-            )
-            if not self._save_recruitment_settings():
-                self.settings.resource_milling.pending_villages.add(village_id)
-                if mode == "refill":
-                    self.settings.resource_milling.pending_refill_villages.add(
-                        village_id
-                    )
-                self._milling_candidates.clear()
-                self._milling_order_active = False
-                return
-            self.milling_tab.clear_pending_btn.setEnabled(
-                bool(self.settings.resource_milling.pending_villages)
-            )
-            self.milling_tab.set_gold_balance(
-                int(result["gold"])
-                if result.get("gold") is not None
-                else None
-            )
-            resources = result["resources"]
-            grain_percent = (
-                resources["grain"] / result["grain_capacity"] * 100
-            )
-            self.milling_tab.status.setText(
-                f"Potwierdzono {'uzupełnianie' if mode == 'refill' else 'opróżnianie'} "
-                f"spichlerza w wiosce {village_name}: "
-                f"zboże {grain_percent:.1f}% pojemności "
-                f"({resources['grain']:,.0f}), glina {resources['clay']:,.0f}, "
-                f"żelazo {resources['iron']:,.0f}, "
-                f"drewno {resources['wood']:,.0f}. "
-                f"Saldo po wymianie: "
-                f"{result.get('gold') if result.get('gold') is not None else 'brak danych'} złota."
-            )
-            QTimer.singleShot(
-                _NPC_TRADER_ORDER_INTERVAL_MS,
-                self._run_next_resource_milling,
-            )
-            return
-
-        self._milling_candidates.clear()
-        self._milling_order_active = False
-        self._pending_milling_responses.pop(village_id, None)
-        if mode == "refill":
-            reason = (
-                f"zboże nie osiągnęło oczekiwanych {target_grain:,.0f} "
-                "po wymianie"
-            )
-        else:
-            reason = (
-                f"zboże nie spadło poniżej progu {trigger_percent}%"
-            )
-        self.milling_tab.status.setText(
-            f"Serwer odpowiedział, ale {reason} w wiosce {village_name}. "
-            "Blokada pozostaje, aby uniknąć ponownego kosztu. "
-            "Sprawdź zapasy w grze."
-        )
+        QTimer.singleShot(_NPC_TRADER_ORDER_INTERVAL_MS, self._run_next_resource_milling)
 
     def _check_recruitment_queues(self):
         """Check target troop queues in every village without changing the game view."""

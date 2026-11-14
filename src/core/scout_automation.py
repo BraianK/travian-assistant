@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import threading
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -45,9 +46,11 @@ except ModuleNotFoundError:  # pragma: no cover - script fallback
     )
 
 # Aim requests at the middle of the target second (as the attack automation).
-AIM_FRACTION = 0.45
+# Scout sends click "Send" at a random point of this part of the second.
+AIM_RANGE = (0.10, 0.80)
 XP_READ_DELAY = 0.6
-SCHEDULE_AHEAD_SECONDS = 20.0
+# Preparing a send (own tab, window, units, confirmation) takes ~10 s.
+SCHEDULE_AHEAD_SECONDS = 45.0
 LATE_XP_CHECK_SECONDS = 30
 
 READ_HERO_XP_JS = r"""((playerId) => new Promise(resolve => {
@@ -118,8 +121,12 @@ class ScoutAutomation:
         clock: Callable[[], float] = time.time,
         timer: PreciseTimer | None = None,
         on_found: Callable[[dict], None] | None = None,
+        clicker=None,
     ):
         self.bridge = bridge
+        # ClickAttackExecutor: every send is prepared in its own game tab
+        # and its "Send" button clicked in the planned second.
+        self.clicker = clicker
         self._on_found = on_found or (lambda _result: None)
         self._settings = settings_getter
         self._log = log
@@ -266,8 +273,9 @@ class ScoutAutomation:
                     key = ("send", index, send_index)
                     if key not in operation.scheduled and send_at - now <= SCHEDULE_AHEAD_SECONDS:
                         operation.scheduled.add(key)
+                        # Prepare right away, click "Send" in the planned second.
                         self._timer.schedule(
-                            self.to_local(send_at + AIM_FRACTION),
+                            self.to_local(max(now, send_at - SCHEDULE_AHEAD_SECONDS)),
                             lambda op=operation, c=candidate, i=send_index: self._send(op, c, i),
                         )
                 for offset in XP_READ_OFFSETS:
@@ -291,15 +299,38 @@ class ScoutAutomation:
     def _send(self, operation: ScoutOperation, candidate: Candidate, index: int) -> None:
         if operation.status != "aktywna":
             return
-        request = self.bridge.send_request(
-            operation.scout_village_id, operation.source_village_id, MOVEMENT_SPY,
-            {operation.scout_unit: operation.scouts_per_send}, spy_mission="defence",
-        )
         send_at = candidate.sends[index]
+        key = f"scout-{operation.id}-{id(candidate)}-{index}"
+        if self.clicker is None:
+            candidate.send_status[index] = "błąd: brak klikania w grze"
+            return
         try:
-            _batch, result = self.bridge.fire([request], send_at + 0.95)
+            self.clicker.prepare_send(
+                key, operation.scout_village_id, operation.source[0], operation.source[1],
+                MOVEMENT_SPY, {operation.scout_unit: operation.scouts_per_send},
+                spy_mission="defence",
+            )
+        except Exception as error:
+            candidate.send_status[index] = f"błąd: {error}"
+            return
+        # A random moment inside the planned second, like a player's click;
+        # the margins leave room for the click and the network on both sides.
+        fire_at = self.to_local(send_at + random.uniform(*AIM_RANGE))
+        while True:
+            remaining = fire_at - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining - 0.02, 0.5) if remaining > 0.03 else 0.0005)
+        if operation.status != "aktywna" or self.server_now() > send_at + 0.95:
+            self.clicker.discard_send(key)
             candidate.send_status[index] = (
-                "wysłany" if result.get("status") == "fired" else "za późno"
+                "za późno" if operation.status == "aktywna" else "anulowany"
+            )
+            return
+        try:
+            result = self.clicker.fire_send(key)
+            candidate.send_status[index] = (
+                "wysłany" if result.get("ok") else f"błąd: {result.get('error')}"
             )
         except Exception as error:
             candidate.send_status[index] = f"błąd: {error}"

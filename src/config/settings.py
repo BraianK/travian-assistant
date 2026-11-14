@@ -228,7 +228,8 @@ class AttackSettings(BaseModel):
     """Automatic execution of TK-Tools attack plans."""
 
     enabled: bool = False
-    execution_mode: Literal["requests", "clicks"] = "requests"
+    # Kept for older settings files; actions are always clicked now.
+    execution_mode: Literal["clicks"] = "clicks"
     server_name: str = Field(default="", max_length=40)
     refresh_minutes: int = Field(default=3, ge=1, le=60)
     prepare_seconds: int = Field(default=45, ge=15, le=300)
@@ -242,6 +243,11 @@ class AttackSettings(BaseModel):
     hero_evasion: bool = False
     hero_parking_village_id: str | None = None
     hero_return_margin_seconds: int = Field(default=1, ge=1, le=60)
+
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def always_clicks(cls, _value) -> str:
+        return "clicks"
 
     @field_validator("fake_tier2_at", "fake_tier3_at")
     @classmethod
@@ -500,7 +506,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.6")
+    version: str = Field(default="1.3.7")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)

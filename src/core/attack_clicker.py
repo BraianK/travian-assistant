@@ -47,6 +47,9 @@ _RECT_JS = r"""((selector, index) => {
 })"""
 
 _WINDOW = ".modalWrapper.sendTroops"
+HERO = 11
+# Keys of the scouting dropdown on the confirmation screen.
+SPY_MISSIONS = {"resources": 0, "defence": 1}
 
 
 class ClickModeError(RuntimeError):
@@ -171,6 +174,7 @@ class _Lane:
         movement_type: int,
         units: dict[int, int],
         catapult_targets: tuple[int, ...],
+        spy_mission: str | None = None,
     ) -> None:
         self.wake()
         # Make the source village active so the window sends from it.
@@ -216,6 +220,8 @@ class _Lane:
         self.wait_for(f"!!document.querySelector('{_WINDOW} button.sendTroops')")
         if catapult_targets:
             self._choose_catapult_targets(catapult_targets)
+        if spy_mission:
+            self._choose_spy_mission(spy_mission)
         self._verify_confirmation(units)
 
     def _choose_catapult_targets(self, targets: tuple[int, ...]) -> None:
@@ -238,6 +244,24 @@ class _Lane:
                 raise ClickModeError(f"Brak opcji celu katapult {target}.")
             self.click(option)
             time.sleep(0.3)
+
+    def _choose_spy_mission(self, mission: str) -> None:
+        """Pick what the scouts look at (resources = key 0, defence = key 1)."""
+        key = SPY_MISSIONS.get(mission)
+        if key is None:
+            raise ValueError("Invalid spy mission.")
+        head = f"{_WINDOW} [data='spyTarget'] .dropdownHead"
+        if not self.rect(head):
+            if key == 0:
+                return  # the game scouts resources by default
+            raise ClickModeError("Nie znaleziono wyboru celu zwiadu — nie wysyłam.")
+        self.click(head)
+        time.sleep(0.35)
+        option = f".dropdownBody .dropDownItem{key}"
+        if not self.rect(option):
+            raise ClickModeError("Brak opcji celu zwiadu — nie wysyłam.")
+        self.click(option)
+        time.sleep(0.3)
 
     def _verify_confirmation(self, units: dict[int, int]) -> None:
         shown = self.evaluate(
@@ -309,14 +333,19 @@ class ClickAttackExecutor:
                 lane = _Lane(browser, url)
                 lanes.append(lane)
                 lane.open()
-                lane.prepare(
-                    attack.source_village_id,
-                    int(attack.target_x),
-                    int(attack.target_y),
+                args = (
+                    attack.source_village_id, int(attack.target_x), int(attack.target_y),
                     send.movement_type,
-                    send.units,
-                    send.catapult_targets,
                 )
+                try:
+                    lane.prepare(*args, send.units, send.catapult_targets)
+                except ClickModeError:
+                    if not send.units.get(HERO):
+                        raise
+                    # The hero did not make it home: the wave goes without it.
+                    logger.warning("Hero unavailable, preparing the wave without it")
+                    without = {unit: count for unit, count in send.units.items() if unit != HERO}
+                    lane.prepare(*args, without, send.catapult_targets)
         except Exception:
             for lane in lanes:
                 lane.close()
@@ -347,6 +376,46 @@ class ClickAttackExecutor:
             results.append(lane.result)
             lane.close()
         return {"results": results}
+
+    # -- single prepared sends (scouting) ---------------------------------------
+    def prepare_send(
+        self, key: str, source_village_id: str, target_x: int, target_y: int,
+        movement_type: int, units: dict[int, int], spy_mission: str | None = None,
+    ) -> None:
+        """Open a tab with one send ready on its confirmation screen."""
+        browser, url = self._browser_and_url()
+        lane = _Lane(browser, url)
+        try:
+            lane.open()
+            lane.prepare(
+                str(source_village_id), int(target_x), int(target_y), int(movement_type),
+                {int(k): int(v) for k, v in units.items()}, (), spy_mission,
+            )
+        except Exception:
+            lane.close()
+            raise
+        self.discard_send(key)
+        self._lanes[key] = [lane]
+
+    def fire_send(self, key: str) -> dict:
+        """Press "Send" in a prepared tab, read the outcome and close it."""
+        lanes = self._lanes.pop(key, None)
+        if not lanes:
+            raise ClickModeError("Wysyłka nie została przygotowana.")
+        lane = lanes[0]
+        try:
+            lane.fire()
+            try:
+                lane.wait_for(f"!document.querySelector('{_WINDOW} button.sendTroops')", timeout=6)
+            except ClickModeError:
+                pass
+            return lane.read()
+        finally:
+            lane.close()
+
+    def discard_send(self, key: str) -> None:
+        for lane in self._lanes.pop(key, None) or []:
+            lane.close()
 
     def close(self) -> None:
         for lanes in self._lanes.values():
