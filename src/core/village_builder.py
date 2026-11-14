@@ -1444,7 +1444,12 @@ def plan_transfers(
     merchants_left = {plan.village.id: plan.village.merchants_free for plan in plans}
     # What each village physically still has after the shipments planned here.
     stock_left = {plan.village.id: dict(plan.village.build_resources()) for plan in plans}
-    blocked_ids = {plan.village.id for plan in plans if blocking_deficit(plan) is not None}
+    # village id -> what its own next master builder entry still lacks.
+    blocked_missing = {}
+    for plan in plans:
+        deficit = blocking_deficit(plan)
+        if deficit is not None:
+            blocked_missing[plan.village.id] = deficit[1]
     transfers: list[Transfer] = []
     # First: villages whose queue would stand idle because the next master
     # builder entry lacks resources (any village, also queue-bound ones).
@@ -1460,6 +1465,11 @@ def plan_transfers(
         rates = village.build_production()
         if all(missing[r] <= max(0.0, rates[r]) * UNBLOCK_IGNORE_HOURS for r in RESOURCES):
             continue
+        if sum(max(0.0, value) for value in missing.values()) < UNBLOCK_MIN_SHIPMENT:
+            # A tiny deficit (a young village, cheap levels): no trip would
+            # ever be worth it, so it is shipped for the next planned steps too.
+            ahead = _need(receiver)
+            missing = {r: max(missing[r], ahead[r]) for r in RESOURCES}
         free_space = {
             r: max(0.0, village.capacity.get(r, 0) - village.resources.get(r, 0)
                    - village.incoming_total().get(r, 0))
@@ -1524,17 +1534,18 @@ def plan_transfers(
             if sum(max(0.0, value) for value in missing.values()) <= 0:
                 break
             donor = donor_plan.village
-            if (
-                donor.id in blocked_ids
-                or merchants_left[donor.id] <= 0
-                or donor.merchant_carry <= 0
-            ):
+            if merchants_left[donor.id] <= 0 or donor.merchant_carry <= 0:
                 continue
             speed = merchant_fields_per_hour(donor.tribe, merchant_speed, world_speed)
             if speed <= 0:
                 continue
+            # A donor whose own queue waits lends only what that wait does not need.
+            own_missing = blocked_missing.get(donor.id) or {}
+            lendable = {
+                r: 0.0 if own_missing.get(r, 0) > 0 else stock_left[donor.id][r] for r in RESOURCES
+            }
             loan = _loan(
-                missing, rates, donor.build_production(), stock_left[donor.id], free_space,
+                missing, rates, donor.build_production(), lendable, free_space,
                 merchants_left[donor.id] * donor.merchant_carry,
                 distance(donor, village) / speed, needed_in,
             )
@@ -2544,10 +2555,16 @@ def stalled_master_entry(plan: VillagePlan) -> tuple[QueueEntry, float] | None:
     if stall < MASTER_STALL_CANCEL_HOURS:
         return None
     stock = village.build_resources()
+    # Only what the automation would really start instead: other entries the
+    # game accepted, or one of the next few planned upgrades (a new building
+    # may still lack requirements the game checks).
     others = [
         costs for other, costs, _hours in master_entry_costs(village)
         if other is not entry and not other.paid
-    ] + [step.costs for step in plan.steps if step.location != entry.location]
+    ] + [
+        step.costs for step in plan.steps[:IDLE_ALTERNATIVE_DEPTH]
+        if step.location != entry.location and not step.construct and not step.train
+    ]
     if not any(all(costs.get(r, 0) <= stock[r] for r in RESOURCES) for costs in others):
         return None
     return entry, stall
@@ -3327,6 +3344,9 @@ def raid_lead_seconds(
 IDLE_ALTERNATIVE_HOURS = 0.25
 # Only this many planned steps are looked at for an alternative.
 IDLE_ALTERNATIVE_DEPTH = 4
+# Master builder entries given up for an alternative come back to the top of
+# the plan and push it down: an idle queue looks this much deeper for it.
+IDLE_ALTERNATIVE_SLACK = 4
 
 
 def affordable_alternative(plan: VillagePlan) -> Step | None:
@@ -3343,7 +3363,7 @@ def affordable_alternative(plan: VillagePlan) -> Step | None:
     stock = plan.village.build_resources()
     queue = QUEUE_RESOURCES if step.is_field else QUEUE_VILLAGE
     seen = {step.location}
-    for other in plan.steps[1:IDLE_ALTERNATIVE_DEPTH]:
+    for other in plan.steps[1:IDLE_ALTERNATIVE_DEPTH + IDLE_ALTERNATIVE_SLACK]:
         if other.location in seen or other.train:
             seen.add(other.location)
             continue

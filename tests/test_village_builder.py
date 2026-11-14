@@ -872,6 +872,24 @@ def test_tiny_unblock_shortage_is_not_shipped():
     assert not any("kolejka stanie" in t.reason for t in vb.plan_transfers(plans, {3: 24}, 1))
 
 
+def test_young_village_small_shortage_shipped_for_next_steps():
+    warehouse = _storage(24, 10, 9)
+    warehouse.costs = {lvl: {1: 0, 2: 250, 3: 0, 4: 0} for lvl in warehouse.costs}
+    field = _field(1, 1, 3, cost=400)
+    receiver = _village([field], [warehouse], resources=100, vid="1",
+                        production={1: 100, 2: 100, 3: 100, 4: 100}, free=0)
+    receiver.free_slots = {1: 0, 2: 0, 4: 0}
+    receiver.queue = [vb.QueueEntry(4, 24, 10, 0, id="w", paid=False)]
+    donor = _village([_slow_field(1, 1, 3)], resources=50_000, vid="2", y=1,
+                     production={1: 1e4, 2: 1e4, 3: 1e4, 4: 1e4}, merchants=10, carry=2000)
+    plans = [vb.plan_village(v, 10, 0) for v in (receiver, donor)]
+    missing = vb.blocking_deficit(plans[0])[1]
+    assert sum(missing.values()) < vb.UNBLOCK_MIN_SHIPMENT  # 150 clay: 1.5 h at 100/h
+    shipped = [t for t in vb.plan_transfers(plans, {3: 24}, 1)
+               if t.target_id == "1" and "u budowniczego" in t.reason]
+    assert shipped and sum(t.total for t in shipped) >= vb.UNBLOCK_MIN_SHIPMENT
+
+
 def test_build_reserve_includes_next_unreserved_master_entry():
     warehouse = _storage(24, 10, 9)
     warehouse.costs = {lvl: {1: 100, 2: 200, 3: 300, 4: 0} for lvl in warehouse.costs}
@@ -981,6 +999,30 @@ def test_neighbour_lends_reserve_it_makes_back_quickly():
     loan = next(t for t in transfers if "pożyczka" in t.reason)
     assert loan.source_id == "2" and loan.target_id == "1"
     assert loan.resources == {2: 2500}
+
+
+def _waiting_donor(missing_type):
+    # The donor's own master builder entry waits for one resource.
+    donor = _reserved_donor(clay_rate=10_000)
+    warehouse = _storage(24, 10, 9)
+    warehouse.costs = {lvl: {r: (9000 if r == missing_type else 0) for r in vb.RESOURCES}
+                       for lvl in warehouse.costs}
+    village = donor.village
+    village.storages = [warehouse]
+    village.free_slots = {1: 0, 2: 0, 4: 0}
+    village.queue = [vb.QueueEntry(4, 24, 10, 0, id="d", paid=False)]
+    plan = vb.plan_village(village, 10, 0)
+    assert vb.blocking_deficit(plan) is not None
+    return plan
+
+
+def test_waiting_neighbour_lends_what_its_own_wait_does_not_need():
+    receiver = _stalled_receiver()  # lacks clay
+    transfers = vb.plan_transfers([receiver, _waiting_donor(missing_type=1)], {3: 24}, 1)
+    assert any("pożyczka" in t.reason and t.resources.get(2) for t in transfers)  # waits for wood
+    receiver = _stalled_receiver()
+    transfers = vb.plan_transfers([receiver, _waiting_donor(missing_type=2)], {3: 24}, 1)
+    assert not any("pożyczka" in t.reason for t in transfers)  # waits for clay itself
 
 
 def test_no_loan_when_neighbour_produces_slowly():
@@ -1417,6 +1459,49 @@ def test_stalled_master_entry_gives_way_to_what_can_start():
     assert vb.stalled_master_entry(vb.plan_village(village, 10, 0)) is None
 
 
+def test_stalled_master_entry_kept_when_only_a_new_building_is_cheap():
+    warehouse = _storage(24, 10, 10)
+    warehouse.costs = {lvl: {1: 9000, 2: 9000, 3: 9000, 4: 0} for lvl in warehouse.costs}
+    village = _village([], [warehouse], resources=5000, free=0,
+                       production={1: 1000, 2: 1000, 3: 1000, 4: 1000})
+    village.free_slots = {1: 1, 2: 1, 4: 3}
+    village.queue = [vb.QueueEntry(4, 24, 10, 0, id="w", paid=False)]
+    plan = vb.plan_village(village, 10, 0)
+    cheap = vb.Step(village.id, 30, 5, 0, {1: 100, 2: 100, 3: 100, 4: 0}, 60, 1.0, None, "", construct=True)
+    plan.steps = [plan.steps[0], cheap] if plan.steps else [cheap]
+    # The new building may lack requirements: the entry is not given up for it.
+    assert vb.stalled_master_entry(plan) is None
+
+
+class _SendExecutor:
+    def __init__(self):
+        self.sent = []
+
+    def send_resources(self, source_id, location, target_name, x, y, resources):
+        self.sent.append((source_id, dict(resources)))
+        return dict(resources)
+
+
+def test_village_holding_stock_after_giving_up_an_entry_sends_nothing():
+    import time
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation, BuildSnapshot
+
+    source = _village([], vid="1", merchants=5, carry=1000)
+    source.marketplace = _storage(30, 17, 3)
+    target = _village([], vid="2", y=5)
+    plans = [vb.plan_village(v, 10, 0) for v in (source, target)]
+    transfer = vb.Transfer("1", "V1", "2", "V2", {4: 2000}, 2, 0.5, 0.0, 0.0, None, "nadwyżka")
+    executor = _SendExecutor()
+    automation = BuildAutomation(None, lambda: BuildSettings(enabled=True), lambda _t: None, executor=executor)
+    automation._backoff["hold:1"] = time.monotonic() + 300
+    assert not automation._send(BuildSnapshot(plans=plans, transfers=[transfer]), BuildSettings(enabled=True))
+    assert executor.sent == []
+    automation._backoff.clear()
+    assert automation._send(BuildSnapshot(plans=plans, transfers=[transfer]), BuildSettings(enabled=True))
+    assert executor.sent == [("1", {4: 2000})]
+
+
 def test_storage_not_sized_for_a_temporary_hero_switch():
     village = _village([_field(1, 1, 3)], [_storage(24, 10, 10)], capacity=70_000,
                        production={1: 3500, 2: 8800, 3: 3400, 4: 5000})
@@ -1608,6 +1693,25 @@ def test_idle_queue_takes_an_affordable_later_step():
     assert vb.affordable_alternative(plan).location == 2
     plan.afford_hours = 0.1  # a few minutes: just wait
     assert vb.affordable_alternative(plan) is None
+
+
+def test_idle_alternative_found_below_entries_given_up_for_it():
+    # Given-up master entries return to the top of the plan: the cheap step
+    # that justified it sits 5th now and must still be found.
+    fields = []
+    for location in range(1, 6):
+        field = _field(location, 1, 3)
+        field.costs = {lvl: {r: 50_000 for r in vb.RESOURCES} for lvl in field.costs}
+        fields.append(field)
+    cheap = _field(9, 4, 7)
+    cheap.costs = {lvl: {1: 2633, 2: 3162, 3: 2987, 4: 0} for lvl in cheap.costs}
+    village = _village(fields + [cheap], resources=5000)
+    plan = vb.plan_village(village, 10, 0)
+    expensive = [s for s in plan.steps if s.location != 9]
+    plan.steps = [expensive[0], expensive[1], expensive[2], expensive[3]] + [
+        next(s for s in plan.steps if s.location == 9)]
+    plan.afford_hours = 1.4
+    assert vb.affordable_alternative(plan).location == 9
 
 
 def test_towns_build_fields_to_the_town_target():

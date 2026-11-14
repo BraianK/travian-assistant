@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 FAILURE_BACKOFF_SECONDS = 600
 # Outdated read (the game already shows a newer level): retry soon.
 STALE_BACKOFF_SECONDS = 30
+# After a stalled master entry was given up for a step payable now, the
+# village sends nothing away for this long, so that step can still start.
+STALL_HOLD_SECONDS = 300
 # Let the game models catch up after a finished build before re-planning.
 SETTLE_SECONDS = 4.0
 # Pause between two clicked actions (a player does not click instantly).
@@ -812,6 +815,7 @@ class BuildAutomation:
                         logger.info("Village build action: %s cancel stalled master %s", village.name, entry.id)
                         self._executor.cancel_master(village.id, entry.id)
                         self._recent_master.setdefault(village.id, {})[("cancelled", entry.location)] = time.monotonic()
+                        self._backoff["hold:" + village.id] = time.monotonic() + STALL_HOLD_SECONDS
                         acted = True
                         self._log(
                             f"{village.name}: z kolejki budowniczego usunięto {name} — brakuje na niego "
@@ -985,6 +989,8 @@ class BuildAutomation:
                 or transfer.source_id in settings.disabled_villages
                 or self._sent_at.get(transfer.source_id, -1e9) + TRANSFER_COOLDOWN_SECONDS > now
                 or self._backoff.get("send:" + transfer.source_id, 0) > now
+                # An entry was just given up for a step it can pay now: keep the stock for it.
+                or self._backoff.get("hold:" + transfer.source_id, 0) > now
             ):
                 continue
             if self.abandoned:

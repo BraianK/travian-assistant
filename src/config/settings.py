@@ -500,7 +500,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.4")
+    version: str = Field(default="1.3.5")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
