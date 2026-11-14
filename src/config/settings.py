@@ -414,6 +414,9 @@ class BuildSettings(BaseModel):
     bonus_buildings: bool = True
     # Point the hero's resource production at the scarcest resource (clicked).
     hero_production_auto: bool = True
+    # Dead hero: its home village saves (and the others ship) the revive
+    # cost before building anything else; the revive is clicked when it is there.
+    hero_revive: bool = False
     # Before an incoming attack lands: spend or send away what could be looted.
     raid_protection: bool = True
     raid_lead_minutes: int = Field(default=10, ge=2, le=60)
@@ -506,7 +509,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.7")
+    version: str = Field(default="1.3.8")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)

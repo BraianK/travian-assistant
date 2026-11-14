@@ -862,6 +862,29 @@ def test_military_steps_alternate_when_village_has_spare():
     assert [s.type for s in plan.steps] == [19]
 
 
+def test_missing_barracks_or_stable_is_built_for_the_army():
+    config = {
+        19: {"costs": {"1": 210, "2": 140, "3": 260, "4": 120}, "time": 2000, "supply": 4,
+             "requirements": [{"type": 1, "building": 15, "level": 3}]},
+        20: {"costs": {"1": 260, "2": 140, "3": 220, "4": 100}, "time": 2200, "supply": 5,
+             "requirements": [{"type": 1, "building": 22, "level": 5}]},
+    }
+    village = _village([_field(1, 1, 3, cost=10)])
+    village.empty_slots = [25, 26]
+    village.type_levels = {15: 5}
+    plan = vb.plan_village(village, 3, 0, military={19: 20, 20: 20}, construct_config=config, depth=3)
+    built = [s for s in plan.steps if s.construct]
+    # Barracks go up; the stable waits for the academy it requires.
+    assert [(s.type, s.location) for s in built] == [(19, 25)]
+    assert "koszary" in built[0].reason
+    village.type_levels = {15: 5, 22: 5}
+    plan = vb.plan_village(village, 3, 0, military={19: 20, 20: 20}, construct_config=config, depth=3)
+    assert sorted((s.type, s.location) for s in plan.steps if s.construct) == [(19, 25), (20, 26)]
+    # Nothing new without a chosen unit for that building.
+    plan = vb.plan_village(village, 3, 0, military={19: 20}, construct_config=config, depth=3)
+    assert [s.type for s in plan.steps if s.construct] == [19]
+
+
 def test_donor_keeps_cost_of_its_waiting_master_entry():
     warehouse = _storage(24, 10, 9)
     warehouse.costs = {lvl: {1: 0, 2: 5000, 3: 0, 4: 0} for lvl in warehouse.costs}
@@ -1592,6 +1615,95 @@ def test_settlers_served_first_by_transfers():
              vb.plan_village(settle, 10, 0, settle_level=10, settle_count=3)]
     transfers = vb.plan_transfers(plans, {3: 24}, 1)
     assert transfers and transfers[0].target_id == "5" and transfers[0].merchants == 5
+
+
+REVIVE_COSTS = {1: 5923, 2: 10788, 3: 7192, 4: 0}
+
+
+def test_dead_hero_revive_holds_the_home_village():
+    village = _village([_field(1, 1, 3, cost=10)], vid="5")
+    plan = vb.plan_village(village, 10, 0, revive_costs=REVIVE_COSTS, revive_seconds=11170)
+    assert len(plan.steps) == 1
+    step = plan.steps[0]
+    assert step.revive and step.train and step.costs == REVIVE_COSTS
+    assert step.name == "Wskrzeszenie bohatera"
+    assert vb.master_next_step(village, 10, 0, 4, revive_costs=REVIVE_COSTS) is None
+    plans = vb.plan_all([village, _village([_field(1, 1, 3)], vid="6")], 14, 10, 0,
+                        revive=("5", REVIVE_COSTS, 11170))
+    assert plans[0].steps[0].revive and not any(s.revive for s in plans[1].steps)
+
+
+def test_dead_hero_revive_served_first_by_transfers():
+    home = _village([_field(1, 1, 3, cost=10)], resources=0, vid="5")
+    other = _village([_field(1, 1, 3, cost=1000)], resources=0, vid="1", x=0, y=12)
+    donor = _village([_field(1, 1, 9, max_level=10)], resources=50_000, vid="2", x=0, y=24,
+                     merchants=5, carry=2000)
+    plans = [vb.plan_village(other, 10, 0), vb.plan_village(donor, 10, 0),
+             vb.plan_village(home, 10, 0, revive_costs=REVIVE_COSTS)]
+    transfers = vb.plan_transfers(plans, {3: 24}, 1)
+    assert transfers and transfers[0].target_id == "5"
+
+
+class _ReviveExecutor:
+    def __init__(self):
+        self.revived = []
+        self.upgrades = 0
+
+    def revive_hero(self, village_id):
+        self.revived.append(village_id)
+        return "reviving"
+
+    def upgrade(self, *args):
+        self.upgrades += 1
+        return "started"
+
+    def close(self):
+        pass
+
+
+def _revive_automation(resources):
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation, BuildSnapshot
+
+    settings = BuildSettings(enabled=True, hero_revive=True)
+    executor = _ReviveExecutor()
+    logs = []
+    automation = BuildAutomation(None, lambda: settings, logs.append, executor=executor)
+    village = _village([_field(1, 1, 3, cost=10)], vid="5", resources=resources)
+    village.name = "Giran"
+    hero = {"village_id": "5", "status": 7, "revive_costs": {"1": 5923, "2": 10788, "3": 7192, "4": 0},
+            "revive_seconds": 11170}
+    automation._revive = automation._revive_goal([village], settings, hero)
+    plan = vb.plan_village(village, 10, 0, revive_costs=automation._revive[1])
+    return automation, executor, BuildSnapshot(plans=[plan], gold=100), settings, logs
+
+
+def test_revive_clicked_only_with_the_full_cost_and_nothing_built_meanwhile():
+    automation, executor, snapshot, settings, logs = _revive_automation(resources=8_000)
+    assert any("bohater nie żyje" in line for line in logs)
+    automation._act(snapshot, settings)
+    assert not automation._revive_hero(snapshot)
+    assert executor.upgrades == 0 and executor.revived == []
+
+    automation, executor, snapshot, settings, logs = _revive_automation(resources=20_000)
+    assert automation._revive_hero(snapshot)
+    assert executor.revived == ["5"]
+    assert any("wskrzeszany" in line for line in logs)
+
+
+def test_revive_goal_needs_the_option_and_a_dead_hero():
+    from src.config.settings import BuildSettings
+    from src.core.build_automation import BuildAutomation
+
+    village = _village([_field(1, 1, 3)], vid="5")
+    hero = {"village_id": "5", "status": 7, "revive_costs": {"1": 1, "2": 1, "3": 1, "4": 0}}
+    off = BuildSettings(hero_revive=False)
+    automation = BuildAutomation(None, lambda: off, lambda _t: None, executor=object())
+    assert automation._revive_goal([village], off, hero) is None
+    on = BuildSettings(hero_revive=True)
+    assert automation._revive_goal([village], on, hero)[0] == "5"
+    assert automation._revive_goal([village], on, dict(hero, status=8)) is None  # already reviving
+    assert automation._revive_goal([village], on, dict(hero, status=0)) is None
 
 
 HAEDUAN = {"costs": {"1": 300, "2": 380, "3": 440, "4": 0}}

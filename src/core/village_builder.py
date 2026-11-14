@@ -192,7 +192,8 @@ class Step:
     reason: str
     raw_gain: float = 0.0  # production gain per hour of its resource
     construct: bool = False  # a new building on an empty site
-    train: bool = False  # not a building: units to train (settlers)
+    train: bool = False  # not a building: units to train (settlers) or the hero to revive
+    revive: bool = False  # the dead hero is revived here (train is set too)
     upkeep: float = 0.0  # crop eaten by a new building (construct only)
 
     @property
@@ -201,6 +202,8 @@ class Step:
 
     @property
     def name(self) -> str:
+        if self.revive:
+            return "Wskrzeszenie bohatera"
         if self.is_field:
             return FIELD_NAMES[self.type]
         return BUILDING_NAMES.get(self.type, f"Budynek {self.type}")
@@ -581,8 +584,14 @@ def plan_village(
     granary_max: bool = False,
     settle_level: int = 0,
     settle_count: int = 0,
+    revive_costs: dict[int, float] | None = None,
+    revive_seconds: float = 0.0,
 ) -> VillagePlan:
     """Order the next field, storage, bonus and main building upgrades.
+
+    With *revive_costs* the dead hero is revived here first: the plan holds
+    only that step (nothing else is built) and the other villages ship in
+    its cost, like for settlers.
 
     With *settle_level* the village prepares *settle_count* settlers first:
     main building up to the residence's requirement, a residence up to that
@@ -851,6 +860,34 @@ def plan_village(
                 payback_hours=None,
                 reason=f"wojsko: do poziomu {target} (szybsze szkolenie)",
             )
+        # A chosen barracks or stable the village does not have yet: build it.
+        own = {b.type for b in village.military}
+        for building_type, name in ((19, "koszary"), (20, "stajnia")):
+            if not (military or {}).get(building_type) or building_type in own:
+                continue
+            info = (construct_config or {}).get(building_type)
+            if (
+                info is None
+                or building_type in planned_types
+                or not requirements_met(village, info.get("requirements"), levels)
+            ):
+                continue
+            sites = free_sites(village, taken_slots)
+            if not sites:
+                continue
+            return Step(
+                village_id=village.id,
+                location=sites[0],
+                type=building_type,
+                from_level=0,
+                costs=_config_costs(info),
+                seconds=int(float(info.get("time") or 0) or NEW_BUILDING_HOURS * 3600),
+                gain=0.0,
+                payback_hours=None,
+                reason=f"wojsko: nowa {name}" if building_type == 20 else "wojsko: nowe koszary",
+                construct=True,
+                upkeep=float(info.get("supply") or 0),
+            )
         return None
 
     missing_settlers = max(0, settle_count - village.settlers) if settle_level else 0
@@ -866,6 +903,14 @@ def plan_village(
             seconds=int(settler_seconds_at(village.settler_seconds, village.residence.level) * missing_settlers),
             gain=0.0, payback_hours=None,
             reason=f"osadnicy: {missing_settlers} do wyszkolenia w rezydencji", train=True,
+        ))
+        depth = 0
+    elif revive_costs:
+        plan.steps.append(Step(
+            village_id=village.id, location=0, type=0, from_level=0,
+            costs={r: int(math.ceil(float(revive_costs.get(r, 0) or 0))) for r in RESOURCES},
+            seconds=int(revive_seconds), gain=0.0, payback_hours=None,
+            reason="bohater nie żyje: surowce najpierw na wskrzeszenie", train=True, revive=True,
         ))
         depth = 0
     for _ in range(depth):
@@ -902,7 +947,11 @@ def plan_village(
         military_choice = military_step() if military else None
         if military_choice is not None and (not options or (military_first and not last_military)):
             plan.steps.append(military_choice)
-            levels[military_choice.location] += 1
+            if military_choice.construct:
+                taken_slots.add(military_choice.location)
+                planned_types.add(military_choice.type)
+            else:
+                levels[military_choice.location] += 1
             production[4] = production.get(4, 0) - _upkeep(village, military_choice)
             last_military = True
             continue
@@ -1073,7 +1122,10 @@ def plan_all(
     settle: dict[str, tuple[int, int]] | None = None,
     town_target: int | None = None,
     towns: set[str] | None = None,
+    revive: tuple[str, dict[int, float], float] | None = None,
 ) -> list[VillagePlan]:
+    """Plan every village; *revive* is (hero home village id, revive
+    costs, revive seconds) while the dead hero is to be revived first."""
     return [
         plan_village(
             v,
@@ -1089,6 +1141,8 @@ def plan_all(
             granary_max=v.id in (granary_max or set()),
             settle_level=(settle or {}).get(v.id, (0, 0))[0],
             settle_count=(settle or {}).get(v.id, (0, 0))[1],
+            revive_costs=revive[1] if revive and revive[0] == v.id else None,
+            revive_seconds=revive[2] if revive and revive[0] == v.id else 0.0,
         )
         for v in villages
     ]
@@ -1488,7 +1542,7 @@ def plan_transfers(
     # builder entry lacks resources (any village, also queue-bound ones).
     for receiver in plans:
         if receiver.next_step is not None and receiver.next_step.train:
-            continue  # waiting for settlers: their cost is shipped as the next step
+            continue  # settlers / hero revive: their cost is shipped as the next step
         blocked = blocking_deficit(receiver)
         if blocked is None:
             continue
@@ -1619,7 +1673,7 @@ def plan_transfers(
                 free_space[r] -= amount
     receivers = sorted(
         (p for p in plans if p.next_step),
-        # Settlers (a dated goal) come first, then the fastest payback.
+        # Settlers (a dated goal) and the hero revive come first, then the fastest payback.
         key=lambda p: (not p.next_step.train, p.queue_bound, p.next_step.payback_hours or math.inf),
     )
     for receiver in receivers:

@@ -3519,6 +3519,20 @@ class VillageBuildWidget(QWidget):
             lambda checked: self._emit("hero_production_auto", checked)
         )
         status_layout.addWidget(self.hero_checkbox)
+        self.revive_checkbox = QCheckBox(
+            "Gdy bohater zginie, najpierw zbieraj surowce na jego wskrzeszenie"
+        )
+        self.revive_checkbox.setToolTip(
+            "Gdy bohater nie żyje, jego wioska domowa niczego nie buduje ani nie szkoli, "
+            "dopóki nie uzbiera kosztu wskrzeszenia (koszt podaje gra; z czasem maleje). "
+            "Pozostałe wioski dowożą brakujące surowce kupcami. Gdy wszystko jest na miejscu, "
+            "automat klika w oknie bohatera „Wskrześ” w wiosce domowej (dom bohatera się nie zmienia). "
+            "Nie używa złota ani handlarza NPC."
+        )
+        self.revive_checkbox.toggled.connect(
+            lambda checked: self._emit("hero_revive", checked)
+        )
+        status_layout.addWidget(self.revive_checkbox)
         raid_row = QHBoxLayout()
         self.raid_checkbox = QCheckBox("Przed nadchodzącym atakiem zabezpieczaj surowce na")
         self.raid_checkbox.setToolTip(
@@ -3953,7 +3967,9 @@ class VillageBuildWidget(QWidget):
             "Wioski w podanej kolejności rozbudowują koszary i stajnię do docelowego "
             "poziomu i stale szkolą wybrane jednostki z nadwyżki (koszt następnej "
             "budowy zostaje). Kolejna wioska zaczyna, gdy poprzednia szkoli bez przerwy. "
-            "Kolejność 0 = wioska wyłączona."
+            "Kolejność 0 = wioska wyłączona. Lista obejmuje wszystkie wioski konta, a "
+            "jednostki — plemię zalogowanego gracza; brakujące koszary lub stajnię "
+            "automat najpierw zbuduje."
         )
         military_hint.setObjectName("footnote")
         military_hint.setWordWrap(True)
@@ -4112,6 +4128,7 @@ class VillageBuildWidget(QWidget):
             self.balance_checkbox.setChecked(settings.balance_resources)
             self.bonus_checkbox.setChecked(settings.bonus_buildings)
             self.hero_checkbox.setChecked(settings.hero_production_auto)
+            self.revive_checkbox.setChecked(settings.hero_revive)
             self.raid_checkbox.setChecked(settings.raid_protection)
             self.raid_minutes.setValue(settings.raid_lead_minutes)
             self.evade_checkbox.setChecked(settings.troop_evasion)
@@ -4200,22 +4217,25 @@ class VillageBuildWidget(QWidget):
             self._loading = False
 
     def update_military(self, snapshot, entries: list[dict], unit_names: dict[int, str]):
-        """One row per village with barracks or stable: order, units, level."""
+        """One row per village of the account: order, units of the account's
+        tribe, target level. A missing barracks or stable is built first."""
+        barracks = tuple(
+            unit for unit, info in sorted(snapshot.troops.items())
+            if 19 in info["building_types"]
+        )
+        stable = tuple(
+            unit for unit, info in sorted(snapshot.troops.items())
+            if 20 in info["building_types"]
+        )
         rows = []
         for plan in snapshot.plans:
             village = plan.village
-            buildings = village.recruit_buildings
-            if not buildings & {19, 20, 29, 30}:
-                continue
-            barracks = tuple(
-                unit for unit, info in sorted(snapshot.troops.items())
-                if 19 in info["building_types"] and buildings & {19, 29}
+            levels = {b.type: b.level for b in village.military}
+            state = " · ".join(
+                f"{name} {levels[building]}" if levels.get(building) else f"{name}: brak"
+                for building, name in ((19, "koszary"), (20, "stajnia"))
             )
-            stable = tuple(
-                unit for unit, info in sorted(snapshot.troops.items())
-                if 20 in info["building_types"] and buildings & {20, 30}
-            )
-            rows.append((village.id, village.name, barracks, stable))
+            rows.append((village.id, village.name, barracks, stable, state))
         signature = tuple(rows)
         if signature != self._military_signature:
             self._military_signature = signature
@@ -4225,12 +4245,12 @@ class VillageBuildWidget(QWidget):
                     item.widget().deleteLater()
             self._military_controls.clear()
             for column, caption in enumerate(
-                ("Kolejność", "Wioska", "Koszary", "Stajnia", "Do poziomu")
+                ("Kolejność", "Wioska", "Koszary", "Stajnia", "Do poziomu", "W wiosce")
             ):
                 label = QLabel(caption.upper())
                 label.setObjectName("columnHeader")
                 self.military_grid.addWidget(label, 0, column)
-            for row, (village_id, name, barracks, stable) in enumerate(rows, start=1):
+            for row, (village_id, name, barracks, stable, state) in enumerate(rows, start=1):
                 order = QSpinBox()
                 order.setRange(0, len(rows))
                 order.setSpecialValueText("wył.")
@@ -4248,13 +4268,20 @@ class VillageBuildWidget(QWidget):
                 level = QSpinBox()
                 level.setRange(1, 20)
                 self.military_grid.addWidget(level, row, 4)
+                state_label = QLabel(state)
+                state_label.setObjectName("footnote")
+                state_label.setToolTip(
+                    "Brakujące koszary lub stajnię automat zbuduje, gdy wybierzesz dla nich "
+                    "jednostkę i gra pozwoli je postawić (wymagania, wolne miejsce)."
+                )
+                self.military_grid.addWidget(state_label, row, 5)
                 controls = {"order": order, "units": combos, "level": level}
                 self._military_controls[village_id] = controls
                 order.valueChanged.connect(lambda _v: self._emit_military())
                 level.valueChanged.connect(lambda _v: self._emit_military())
                 for combo in combos.values():
                     combo.currentIndexChanged.connect(lambda _i: self._emit_military())
-            self.military_grid.setColumnStretch(5, 1)
+            self.military_grid.setColumnStretch(6, 1)
         self._loading = True
         try:
             by_id = {str(e.get("village_id")): (index, e) for index, e in enumerate(entries or [])}
@@ -4450,6 +4477,7 @@ class VillageBuildWidget(QWidget):
                 cost_text = payback_text = ready_text = ""
             else:
                 next_text = (
+                    f"{step.name} — {step.reason}" if step.revive else
                     f"{step.name} {step.from_level}→{step.from_level + 1}"
                     f" (miejsce {step.location}) — {step.reason}"
                 )
@@ -4527,7 +4555,7 @@ class VillageBuildWidget(QWidget):
                 _format_hours(transfer.wait_before_hours),
                 _format_hours(transfer.wait_after_hours),
                 f"{transfer.reason}; następny krok: "
-                f"{step.name} {step.from_level}→{step.from_level + 1}",
+                + (step.name if step.revive else f"{step.name} {step.from_level}→{step.from_level + 1}"),
             )
             for column, value in enumerate(values):
                 self.transfer_table.setItem(row, column, QTableWidgetItem(value))

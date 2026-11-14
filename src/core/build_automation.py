@@ -27,13 +27,13 @@ try:
     from src.core import village_builder as vb
     from src.core.attack_clicker import ClickModeError
     from src.core.build_clicker import (
-        BuildClickExecutor, GoldGuardError, StaleStateError, read_build_state,
+        HERO_STATUS_DEAD, BuildClickExecutor, GoldGuardError, StaleStateError, read_build_state,
     )
 except ModuleNotFoundError:  # pragma: no cover - script fallback
     from core import village_builder as vb
     from core.attack_clicker import ClickModeError
     from core.build_clicker import (
-        BuildClickExecutor, GoldGuardError, StaleStateError, read_build_state,
+        HERO_STATUS_DEAD, BuildClickExecutor, GoldGuardError, StaleStateError, read_build_state,
     )
 
 logger = logging.getLogger(__name__)
@@ -244,6 +244,9 @@ class BuildAutomation:
         self._first_steps: dict[str, list] = {}
         # Settlers goal: village id -> (residence level, settlers) while active.
         self._settle: dict[str, tuple[int, int]] = {}
+        # Dead hero to revive first: (home village id, costs, seconds).
+        self._revive: tuple[str, dict[int, float], float] | None = None
+        self._revive_noted = False
         self._settle_noted: str = ""
         self._bank_gold_noted = False
         # village id -> {"wood"|"clay"|"iron"|"grain": cost per hour or None}
@@ -374,6 +377,7 @@ class BuildAutomation:
                     village.hero_excess = {r: current[r] - steady[r] for r in vb.RESOURCES}
                     village.hero_bonus = current
         self._settle = self._settle_goal(villages, settings, server_time)
+        self._revive = self._revive_goal(villages, settings, hero)
         plans = vb.plan_all(
             villages,
             settings.capital_target,
@@ -391,6 +395,7 @@ class BuildAutomation:
             settle=self._settle,
             town_target=settings.town_target,
             towns=set(settings.town_villages),
+            revive=self._revive,
         )
         merchant_speed = {}
         for key, value in (state.get("merchant_speed") or {}).items():
@@ -653,6 +658,8 @@ class BuildAutomation:
                 snapshot = self.refresh()
         if not self.halted and self._settle and self._train_settlers(snapshot, settings):
             acted = True
+        if not self.halted and self._revive and self._revive_hero(snapshot):
+            acted = True
         if not self.halted and settings.crop_bank and self._mill(snapshot, settings):
             acted = True
             time.sleep(SETTLE_SECONDS)
@@ -731,13 +738,14 @@ class BuildAutomation:
                             time.sleep(CLICK_PAUSE_SECONDS)
                         if self.abandoned:
                             return acted
-                        logger.info("Village build action: %s cancel master %s (settlers)", village.name, entry.id)
+                        logger.info("Village build action: %s cancel master %s (waiting step)", village.name, entry.id)
                         self._executor.cancel_master(village.id, entry.id)
                         self._recent_master.setdefault(village.id, {})[("cancelled", entry.location)] = time.monotonic()
                         acted = True
                         self._log(
                             f"{village.name}: z kolejki budowniczego usunięto {name} — "
-                            f"wioska czeka na osadników, surowce idą na nich."
+                            + ("surowce idą na wskrzeszenie bohatera." if plan.next_step.revive
+                               else "wioska czeka na osadników, surowce idą na nich.")
                         )
                         continue
                 if settings.master_builder_slots > 0 and not waiting_settlers:
@@ -889,8 +897,8 @@ class BuildAutomation:
                             + f" ({step.reason})."
                         )
                     continue
-                if step is None:
-                    continue
+                if step is None or step.train:
+                    continue  # settlers / hero revive have their own action
                 ready_now = plan.ready_now
                 if not ready_now and plan.queue_free and not step.train:
                     # The queue would stand idle for a while: a later planned
@@ -1167,6 +1175,52 @@ class BuildAutomation:
                     f"(~{need:.1f} h budowy i szkolenia + zapas)."
                 )
         return {village.id: (level, count)} if server_time >= start else {}
+
+    # -- hero revive ---------------------------------------------------------------
+    def _revive_goal(self, villages, settings, hero: dict) -> tuple[str, dict[int, float], float] | None:
+        """While the hero is dead and the option is on: its home village saves
+        the revive cost first (the hero is revived there, keeping its home)."""
+        dead = int(hero.get("status") or 0) == HERO_STATUS_DEAD and bool(hero.get("revive_costs"))
+        home = next((v for v in villages if v.id == str(hero.get("village_id"))), None)
+        if not (settings.hero_revive and dead and home is not None):
+            self._revive_noted = False
+            return None
+        costs = {int(k): float(v or 0) for k, v in hero["revive_costs"].items() if int(k) in vb.RESOURCES}
+        if not self._revive_noted:
+            self._revive_noted = True
+            self._log(
+                f"{home.name}: bohater nie żyje — surowce najpierw na wskrzeszenie ("
+                + " / ".join(f"{costs.get(r, 0):,.0f}" for r in vb.RESOURCES)
+                + "), inne wioski je dowiozą."
+            )
+        return home.id, costs, float(hero.get("revive_seconds") or 0)
+
+    def _revive_hero(self, snapshot: BuildSnapshot) -> bool:
+        """The revive cost is in the home village: click Revive."""
+        village_id, costs, _seconds = self._revive
+        plan = next((p for p in snapshot.plans if p.village.id == village_id), None)
+        if plan is None or self.abandoned:
+            return False
+        village = plan.village
+        if self._backoff.get("revive:" + village_id, 0) > time.monotonic():
+            return False
+        if any(village.resources.get(r, 0) < costs.get(r, 0) for r in vb.RESOURCES):
+            return False
+        logger.info("Village build action: %s revive hero", village.name)
+        try:
+            result = self._executor.revive_hero(village_id)
+        except GoldGuardError as error:
+            self.halted = str(error)
+            self._log(f"{village.name}: STOP — {error}")
+            return False
+        except Exception as error:
+            self._backoff["revive:" + village_id] = time.monotonic() + FAILURE_BACKOFF_SECONDS
+            self._log(f"{village.name}: wskrzeszenie bohatera nie powiodło się — {error}")
+            return False
+        if result == "reviving":
+            self._log(f"{village.name}: bohater wskrzeszany (gotowy za ~{_seconds / 3600:.1f} h).")
+            return True
+        return False
 
     def _train_settlers(self, snapshot: BuildSnapshot, settings) -> bool:
         """Residence ready: train the missing settlers (as many as affordable)."""
@@ -1575,6 +1629,8 @@ class BuildAutomation:
             plan = plans.get(str(entry.get("village_id")))
             if plan is None or plan.village.id in settings.disabled_villages:
                 continue
+            if plan.next_step is not None and plan.next_step.revive:
+                continue  # the hero revive is paid first
             village = plan.village
             if self._backoff.get("train:" + village.id, 0) > time.monotonic():
                 continue

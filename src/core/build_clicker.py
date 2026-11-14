@@ -235,6 +235,10 @@ READ_BUILD_STATE_JS = r"""(() => {
         hero: heroData ? {
             village_id: String(heroData.villageId), type: Number(heroData.resBonusType),
             points: Number(heroData.resBonusPoints) || 0, dead: !!heroData.notAlive,
+            // 7 dead (can be revived), 8 reviving.
+            status: Number(heroData.status) || 0,
+            revive_costs: heroData.reviveCosts || null,
+            revive_seconds: Number(heroData.reviveDuration) || 0,
             // Hourly amount per resource of the current setting.
             value: Number(heroData.resBonusValue) || 0,
         } : null,
@@ -244,10 +248,10 @@ READ_BUILD_STATE_JS = r"""(() => {
         ) || 0,
         finish_config: (Travian.Config.PremiumFeatures || {}).finishNow || null,
         npc_price: Number(((Travian.Config.PremiumFeatures || {}).NPCTrader || {}).price) || 0,
-        // Base data of buildings that may be constructed (bonus, storage, marketplace).
+        // Base data of buildings that may be constructed (bonus, storage, marketplace, army).
         building_config: (() => {
             const out = {};
-            for (const t of [5, 6, 7, 8, 9, 10, 11, 17, 25]) {
+            for (const t of [5, 6, 7, 8, 9, 10, 11, 17, 19, 20, 25]) {
                 const c = (Travian.Config.buildingConfig || {})[t];
                 if (!c) continue;
                 out[t] = {
@@ -453,6 +457,8 @@ _TARGET_AT_POINT_JS = r"""((selector, index, x, y, accept) => {
 
 
 # Player.vacationState values.
+HERO_STATUS_DEAD = 7
+HERO_STATUS_REVIVING = 8
 VACATION_INACTIVE = 0
 VACATION_ACTIVATING = 1
 
@@ -1388,6 +1394,46 @@ class BuildClickExecutor:
             raise ClickModeError("Gra nie zapisała produkcji bohatera.") from None
         self._close_windows(lane)
         return {"all": amounts[0] if amounts else 0, "single": max(amounts[1:], default=0)}
+
+    def _revive_hero(self, village_id: str) -> str:
+        """Revive the dead hero in *village_id* (its home village) from the
+        hero window, like a player. The gold NPC button next to it is never
+        used. Returns "reviving" or "not_dead"; raises when the game does
+        not take it."""
+        lane = self._ensure_lane()
+        lane.wake()
+        status_js = "Number(Hero.get(Travian.Player.data.playerId).data.status)"
+        if lane.evaluate(status_js) != HERO_STATUS_DEAD:
+            return "not_dead"
+        self._close_windows(lane)
+        self._select_village(lane, str(village_id))
+        self._click(lane, "a.heroLink.attributesLink")
+        button = ".modalWrapper .heroRevive button[clickable='revive()']"
+        try:
+            lane.wait_for(f"!!document.querySelector(\"{button}\")", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("W oknie bohatera nie ma przycisku wskrzeszenia.") from None
+        time.sleep(0.5)
+        if lane.evaluate(f"document.querySelector(\"{button}\").classList.contains('disabled')"):
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie pozwala jeszcze wskrzesić bohatera (brak surowców w wiosce).")
+        lane.evaluate(f"document.querySelector(\"{button}\").scrollIntoView({{block: 'center'}})")
+        time.sleep(0.4)
+        self._click(lane, button)
+        try:
+            lane.wait_for(f"{status_js} === {HERO_STATUS_REVIVING}", timeout=10)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie potwierdziła wskrzeszenia bohatera.") from None
+        self._close_windows(lane)
+        return "reviving"
+
+    @_exclusive
+    def revive_hero(self, village_id: str) -> str:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "wskrzeszenie bohatera"):
+            return self._revive_hero(village_id)
 
     @_exclusive
     def set_hero_production(self, choice: int) -> dict:
