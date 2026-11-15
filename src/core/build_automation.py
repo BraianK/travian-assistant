@@ -467,6 +467,18 @@ class BuildAutomation:
                     village, self._construct_config,
                     "nowe targowisko: wioska ma nadwyżkę, a nie może jej wysłać",
                 )
+                info = self._construct_config.get(vb.MARKETPLACE)
+                if step is None and info is not None and not village.type_levels.get(vb.MARKETPLACE):
+                    # Its requirements (main building 3) come first.
+                    step = vb.requirement_step(
+                        village, info.get("requirements"),
+                        "pod targowisko: wioska ma nadwyżkę, a nie może jej wysłać",
+                    )
+                    if step is not None:  # moved to the front if already planned
+                        plan.steps[:] = [
+                            s for s in plan.steps
+                            if not (s.location == step.location and s.from_level == step.from_level)
+                        ]
                 if step is not None and not any(s.construct and s.type == vb.MARKETPLACE for s in plan.steps):
                     plan.steps.insert(0, step)
                     first_steps.setdefault(village.id, []).insert(0, step)

@@ -2356,6 +2356,14 @@ def master_replacements(
     # (e.g. the warehouse) would stay in front of them.
     keep_window = window + (0 if plan_options.get("granary_max") else MASTER_REPLAN_SLACK)
     first = plan_options.pop("first_steps", None) or []
+    # Steps put in front (marketplace and its main building) that are not
+    # lined up yet and find the master builder full: no slack, they take
+    # the place of the weakest unreserved entry.
+    lined_up = {entry.location for entry in unpaid}
+    if len(unpaid) + paid_master >= slots and any(
+        step.location not in lined_up for step in first
+    ):
+        keep_window = window
     plan = plan_village(free, target, server_time, depth=max(keep_window + 1, 2), **plan_options)
     plan.steps = list(first) + plan.steps
     if plan.steps and plan.steps[0].train:
@@ -3181,6 +3189,36 @@ def marketplace_construction(village: Village, config: dict[int, dict], reason: 
         construct=True,
     )
 
+
+def requirement_step(village: Village, requirements: list[dict], reason: str) -> Step | None:
+    """The next level of an existing building that a new building still needs
+    (e.g. main building 1→2 for a marketplace), queued levels included."""
+    by_type = {}
+    for building in village.buildings():
+        if building.type not in by_type or building.planned_level > by_type[building.type].planned_level:
+            by_type[building.type] = building
+    for requirement in requirements or []:
+        kind, level = requirement.get("building"), requirement.get("level")
+        if not kind or level is None:
+            continue
+        building = by_type.get(int(kind))
+        if building is None:
+            continue  # not standing yet: the planner's constructions handle that
+        current = building.planned_level
+        if current >= int(level) or current >= building.max_level or current not in building.costs:
+            continue
+        return Step(
+            village_id=village.id,
+            location=building.location,
+            type=building.type,
+            from_level=current,
+            costs={r: int(building.costs[current].get(r, 0)) for r in RESOURCES},
+            seconds=int(building.times.get(current, 0)),
+            gain=0.0,
+            payback_hours=None,
+            reason=reason,
+        )
+    return None
 
 
 def build_reserve(plan: VillagePlan) -> dict[int, float]:

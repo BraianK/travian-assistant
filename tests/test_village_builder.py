@@ -2096,3 +2096,33 @@ def test_hero_amount_from_points_while_the_model_shows_zero():
     # Measured: the hero really adds a third more.
     automation._hero_ratio = 4 / 3
     assert automation._hero_amount(on_iron) == _approx(1360)
+
+
+def test_marketplace_requirement_upgrades_the_main_building_first():
+    village = _village([_field(1, 4, 5)])
+    village.main_building = _main_building(level=1)
+    requirements = [{"building": vb.MAIN_BUILDING, "level": 3}, {"building": None, "level": None}]
+    step = vb.requirement_step(village, requirements, "pod targowisko")
+    assert (step.type, step.from_level, step.location) == (vb.MAIN_BUILDING, 1, 26)
+    # A level already queued counts: the next one is planned.
+    village.main_building.queued = 1
+    assert vb.requirement_step(village, requirements, "x").from_level == 2
+    village.main_building.queued = 2
+    assert vb.requirement_step(village, requirements, "x") is None
+
+
+def test_front_step_takes_the_place_of_the_weakest_entry_in_a_full_master_queue():
+    fields = [_field(i, i, 3, cost=10 * i) for i in range(1, 4)]
+    for field in fields:
+        field.queued = 1
+    village = _village(fields, free=0)
+    village.main_building = _main_building(level=1)
+    village.queue = [vb.QueueEntry(4, i, i, 0, id=str(i), paid=False) for i in range(1, 4)]
+    front = vb.requirement_step(village, [{"building": vb.MAIN_BUILDING, "level": 3}], "pod targowisko")
+    # Without a front step all three fields stay.
+    assert vb.master_replacements(village, 10, 0, slots=3) == []
+    # The main building for the marketplace pushes out the weakest one.
+    replace = vb.master_replacements(village, 10, 0, slots=3, first_steps=[front])
+    assert replace and replace[0].id == "3" and "1" not in [e.id for e in replace]  # latest first
+    # A free master builder place: nothing is cancelled for it.
+    assert vb.master_replacements(village, 10, 0, slots=4, first_steps=[front]) == []
