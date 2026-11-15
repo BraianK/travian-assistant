@@ -151,6 +151,8 @@ class Village:
     settler_unit: int = 0
     settler_costs: dict[int, float] = field(default_factory=dict)
     settler_seconds: float = 0.0
+    # Every building of the village (any type), for the start plan.
+    all_buildings: list[Building] = field(default_factory=list)
 
     def build_production(self) -> dict[int, float]:
         """Production left for building after continuous recruitment."""
@@ -195,6 +197,7 @@ class Step:
     train: bool = False  # not a building: units to train (settlers) or the hero to revive
     revive: bool = False  # the dead hero is revived here (train is set too)
     upkeep: float = 0.0  # crop eaten by a new building (construct only)
+    quest_bonus: float = 0.0  # part of a quest reward this level earns (resources)
 
     @property
     def is_field(self) -> bool:
@@ -569,6 +572,10 @@ def _produce_hours(cost: float, production: dict[int, float]) -> float:
     return cost / rate if rate > 0 else math.inf
 
 
+# A quest reward counts against a level's lasting gain over at least this long.
+QUEST_HORIZON_HOURS = 24.0
+
+
 def plan_village(
     village: Village,
     target: int,
@@ -586,8 +593,18 @@ def plan_village(
     settle_count: int = 0,
     revive_costs: dict[int, float] | None = None,
     revive_seconds: float = 0.0,
+    storage_goal: dict[int, float] | None = None,
+    quest_fields: dict[int, list[tuple[int, float, str]]] | None = None,
 ) -> VillagePlan:
     """Order the next field, storage, bonus and main building upgrades.
+
+    *quest_fields* maps a field's location to quests it counts for:
+    [(quest level, share of its cost the reward pays, quest name)]. Its
+    levels below the quest level look that much cheaper (so the fields that
+    finish a quest come first) and may go beyond *target*.
+
+    With *storage_goal* ({1: warehouse, 4: granary capacity}) the storage
+    goes up to it first (a quest reward bigger than the storage waits for it).
 
     With *revive_costs* the dead hero is revived here first: the plan holds
     only that step (nothing else is built) and the other villages ship in
@@ -647,15 +664,23 @@ def plan_village(
         steps = []
         for building in village.fields:
             level = levels[building.location]
-            limit = min(target, building.max_level)
+            quests_here = (quest_fields or {}).get(building.location) or []
+            limit = min(max([target] + [q[0] for q in quests_here]), building.max_level)
             if level >= limit or not building.can_plan(level):
                 continue
             # A field already in the queue cannot be clicked again right now.
             if building.location in queued_locations and not plan.steps:
                 continue
-            steps.append(_field_step(
-                village, building, level, multipliers, time_factor, weights=weights,
-            ))
+            step = _field_step(village, building, level, multipliers, time_factor, weights=weights)
+            paid = [q for q in quests_here if level < q[0]]
+            if paid:
+                share = min(1.0, sum(q[1] for q in paid))
+                if step.payback_hours is not None:
+                    # (never 0: the ranking reads a zero payback as missing)
+                    step.payback_hours = max(step.payback_hours * (1.0 - share), 1e-6)
+                step.quest_bonus = share * step.total_cost
+                step.reason = f"zadanie „{paid[0][2]}” (nagroda pokrywa {share:.0%} kosztu)"
+            steps.append(step)
         if bonus_buildings and construct_config:
             steps.extend(construction_steps(
                 village, construct_config, production, multipliers, weights, levels, taken_slots,
@@ -764,6 +789,21 @@ def plan_village(
         return best
 
     last_military = False
+
+    def reward_storage_step() -> Step | None:
+        for resource in (1, 4):
+            target = (storage_goal or {}).get(resource)
+            if not target or capacity[resource] >= target:
+                continue
+            step = storage_step(resource, int(target))
+            if step is None:
+                continue
+            step.reason = (
+                f"{'spichlerz' if resource == 4 else 'magazyn'} pod nagrodę za zadanie "
+                f"(cel {target:,.0f}, teraz {capacity[resource]:,.0f})".replace(",", " ")
+            )
+            return step
+        return None
 
     def settle_step() -> Step | None:
         """Settlers: main building to the residence's minimum, a residence,
@@ -933,6 +973,21 @@ def plan_village(
             levels[settle.location] += 1
             production[4] = production.get(4, 0) - _upkeep(village, settle)
             continue
+        goal = reward_storage_step()
+        if goal is not None:
+            plan.steps.append(goal)
+            if goal.construct:
+                taken_slots.add(goal.location)
+                planned_types.add(goal.type)
+                production[4] = production.get(4, 0) - _upkeep(village, goal)
+                continue
+            building = _building(village, goal.location)
+            levels[goal.location] += 1
+            capacity[4 if goal.type in GRANARY_TYPES else 1] += _effect_delta(
+                building, goal.from_level, goal.from_level + 1,
+            )
+            production[4] = production.get(4, 0) - _upkeep(village, goal)
+            continue
         # Crop bank first: granaries (and the warehouse for the milled crop)
         # before anything else until they are at their maximum.
         bank = bank_step()
@@ -987,8 +1042,13 @@ def plan_village(
         if plan.queue_bound:
             # Resources are in surplus, build time is scarce: the most
             # production per hour of queue first.
+            # A quest reward is earned once; a level's gain lasts the rest of
+            # the plan: compare both over that horizon.
+            horizon = max(QUEST_HORIZON_HOURS, queue_left)
+
             def per_queue_hour(s: Step) -> float:
-                return s.gain / max(s.seconds / 3600, 1 / 60) if s.gain > 0 else 0.0
+                value = max(0.0, s.gain) + s.quest_bonus / horizon
+                return value / max(s.seconds / 3600, 1 / 60)
 
             ranked = sorted(options, key=lambda s: (-per_queue_hour(s), s.total_cost))
             best = ranked[0]
@@ -1123,6 +1183,8 @@ def plan_all(
     town_target: int | None = None,
     towns: set[str] | None = None,
     revive: tuple[str, dict[int, float], float] | None = None,
+    storage_goals: dict[str, dict[int, float]] | None = None,
+    quest_fields: dict[str, dict[int, list[tuple[int, float, str]]]] | None = None,
 ) -> list[VillagePlan]:
     """Plan every village; *revive* is (hero home village id, revive
     costs, revive seconds) while the dead hero is to be revived first."""
@@ -1143,9 +1205,166 @@ def plan_all(
             settle_count=(settle or {}).get(v.id, (0, 0))[1],
             revive_costs=revive[1] if revive and revive[0] == v.id else None,
             revive_seconds=revive[2] if revive and revive[0] == v.id else 0.0,
+            storage_goal=(storage_goals or {}).get(v.id),
+            quest_fields=(quest_fields or {}).get(v.id),
         )
         for v in villages
     ]
+
+
+def quest_field_shares(
+    villages: list[Village], quests: list, targets: dict[str, int],
+) -> dict[str, dict[int, list[tuple[int, float, str]]]]:
+    """Which fields finish the field quests soonest and how much of their
+    cost each reward pays.
+
+    *quests* are :class:`quests.FieldQuest`. For each, the villages that are
+    cheapest to complete are picked (as many as still missing) and every
+    missing level there gets the share reward / total cost (at most all of
+    it). Levels beyond a village's *target* only count when the reward pays
+    for all of them.
+    """
+    out: dict[str, dict[int, list[tuple[int, float, str]]]] = {}
+    for quest in quests:
+        complete, options = 0, []
+        for village in villages:
+            fields = [b for b in village.fields if b.type in quest.types]
+            if not fields or any(b.max_level < quest.level for b in fields):
+                continue
+            cost, beyond, missing = 0.0, False, []
+            for building in fields:
+                start = building.planned_level
+                if start >= quest.level:
+                    continue
+                missing.append(building.location)
+                for level in range(start, quest.level):
+                    if level not in building.costs:
+                        break
+                    cost += sum(building.costs[level].get(r, 0) for r in RESOURCES)
+                if quest.level > targets.get(village.id, 0):
+                    beyond = True
+            if not missing:
+                complete += 1
+                continue
+            options.append((cost, beyond, village.id, missing))
+        needed = quest.villages - complete
+        if needed <= 0 or len(options) < needed:
+            continue
+        options.sort(key=lambda o: o[0])
+        chosen = options[:needed]
+        total = sum(o[0] for o in chosen)
+        share = min(1.0, quest.reward / total) if total > 0 else 1.0
+        if any(o[1] for o in chosen) and share < 1.0:
+            continue  # levels beyond the targets only when the reward pays them all
+        for _cost, _beyond, village_id, missing in chosen:
+            mine = out.setdefault(village_id, {})
+            for location in missing:
+                mine.setdefault(location, []).append((quest.level, share, quest.label))
+    return out
+
+
+# Quest rewards bigger than the storage ------------------------------------------
+
+def _storage_capacity(village: Village, resource: int) -> float:
+    """Capacity including the queued storage levels."""
+    capacity = float(village.capacity.get(resource, 0))
+    for building in _storage_for(village, resource):
+        if building.queued:
+            capacity += _effect_delta(building, building.level, building.planned_level)
+    return capacity
+
+
+def _storage_upgrades(village: Village, resource: int, up_to: float) -> list[tuple[float, int, float]]:
+    """Cheapest-per-capacity storage levels, one by one, until *up_to*:
+    [(capacity after the level, its total cost, its build seconds)]."""
+    levels = {b.location: b.planned_level for b in _storage_for(village, resource)}
+    capacity = _storage_capacity(village, resource)
+    out = []
+    while capacity < up_to:
+        best = None
+        for building in _storage_for(village, resource):
+            level = levels[building.location]
+            if level >= building.max_level or level not in building.costs:
+                continue
+            delta = _effect_delta(building, level, level + 1)
+            cost = sum(int(building.costs[level].get(r, 0)) for r in RESOURCES)
+            if delta <= 0:
+                continue
+            if best is None or cost / delta < best[0]:
+                best = (cost / delta, building.location, delta, cost, float(building.times.get(level, 0)))
+        if best is None:
+            break
+        _ratio, location, delta, cost, seconds = best
+        levels[location] += 1
+        capacity += delta
+        out.append((capacity, cost, seconds))
+    return out
+
+
+def queue_hour_value(plan: VillagePlan) -> float:
+    """What one hour of the building queue is worth (resource-equivalent):
+    in a queue-bound village every planned step comes that much later and
+    loses its production gain for that hour; otherwise the queue would wait
+    for resources anyway."""
+    if not plan.queue_bound:
+        return 0.0
+    return sum(max(0.0, step.gain) for step in plan.steps)
+
+
+def _kept(reward: dict[int, int], resources: tuple[int, ...], capacity: float) -> float:
+    return sum(min(float(reward.get(r, 0)), capacity) for r in resources)
+
+
+def reward_storage_goal(
+    villages: list[Village], reward: dict[int, int], excluded: set[str] | None = None,
+    hour_values: dict[str, float] | None = None,
+) -> tuple[str, dict[int, float], float, float, float] | None:
+    """Storage levels worth building for a resource reward no storage holds.
+
+    The levels must keep more of the reward than they cost: their resources
+    plus their build time, valued with *hour_values* (village id -> what an
+    hour of its queue is worth, see :func:`queue_hour_value`). Returns
+    (village id, {1: warehouse, 4: granary capacity goal}, resources kept
+    extra, resource cost, queue hours) for the village where that pays most;
+    None when nothing pays (or some storage already holds the whole reward).
+    """
+    groups = ((1, (1, 2, 3)), (4, (4,)))
+    candidates = [v for v in villages if v.id not in (excluded or set())]
+    if not candidates or sum(reward.values()) <= 0:
+        return None
+    for village in candidates:
+        if all(
+            _storage_capacity(village, key) >= max(float(reward.get(r, 0)) for r in members)
+            for key, members in groups
+        ):
+            return None  # it fits somewhere once the storage has room
+    best, best_value = None, 0.0
+    for village in candidates:
+        hour_value = (hour_values or {}).get(village.id, 0.0)
+        goal, kept_extra, spent, hours = {}, 0.0, 0.0, 0.0
+        for key, members in groups:
+            need = max(float(reward.get(r, 0)) for r in members)
+            start = _storage_capacity(village, key)
+            if need <= start:
+                continue
+            base = _kept(reward, members, start)
+            cost_so_far, hours_so_far, best_net, best_step = 0.0, 0.0, 0.0, None
+            for capacity, cost, seconds in _storage_upgrades(village, key, need):
+                cost_so_far += cost
+                hours_so_far += seconds / 3600
+                kept = _kept(reward, members, capacity) - base
+                net = kept - cost_so_far - hours_so_far * hour_value
+                if net > best_net:
+                    best_net, best_step = net, (capacity, kept, cost_so_far, hours_so_far)
+            if best_step is not None:
+                goal[key] = best_step[0]
+                kept_extra += best_step[1]
+                spent += best_step[2]
+                hours += best_step[3]
+        value = kept_extra - spent - hours * hour_value
+        if goal and value > best_value:
+            best, best_value = (village.id, goal, kept_extra, spent, hours), value
+    return best
 
 
 # Gold: instant finish ------------------------------------------------------------
@@ -1985,6 +2204,7 @@ def village_from_raw(raw: dict) -> Village:
             int(k): float(v) for k, v in ((raw.get("settlers") or {}).get("costs") or {}).items()
         },
         settler_seconds=float((raw.get("settlers") or {}).get("seconds") or 0),
+        all_buildings=buildings,
     )
 
 

@@ -43,7 +43,6 @@ READ_BUILD_STATE_JS = r"""(() => {
     const serverTime = Number(rootScope.currentServerTime) || Date.now() / 1000;
     const options = [...document.querySelectorAll(".villageListDropDown .dropdownOption")];
     const ids = options.map(o => (o.className.match(/\bdropDownItem(\d+)\b/) || [])[1]).filter(Boolean);
-    const keep = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 17, 19, 20, 21, 25, 26, 29, 30, 38, 39]);
     const villages = [];
     // Resources on their way to own villages: raid loot, merchants.
     const incoming = {};
@@ -91,7 +90,7 @@ READ_BUILD_STATE_JS = r"""(() => {
         const buildings = [];
         for (const row of collection.data || []) {
             const d = row.data || {};
-            if (!keep.has(Number(d.buildingType))) continue;
+            if (!(Number(d.buildingType) > 0)) continue;
             buildings.push({
                 locationId: Number(d.locationId), buildingType: Number(d.buildingType),
                 lvl: Number(d.lvl), lvlMax: Number(d.lvlMax),
@@ -242,6 +241,18 @@ READ_BUILD_STATE_JS = r"""(() => {
             // Hourly amount per resource of the current setting.
             value: Number(heroData.resBonusValue) || 0,
         } : null,
+        quests: (() => {
+            try {
+                const all = [...(Quest.getCollection().data || []), ...(Quest.getCollection(QuestGiver.DAILY).data || [])];
+                return all.map(q => {
+                    const d = q.data, txt = Travian.txt || {};
+                    const name = txt["QuestHeader_" + d.id] || txt["QuestHeader_" + d.id + "_" + Travian.Player.data.tribeId] || "";
+                    return {id: Number(d.id), status: Number(d.status), rewards: d.rewards || {}, name: name};
+                });
+            } catch (e) { return []; }
+        })(),
+        daily_exchanged: Number(Travian.Player.data.dailyQuestsExchanged) || 0,
+        daily_exchange_max: Number(Travian.Config.maxDailyQuestsExchanged) || 0,
         gold: Number(Travian.Player.data.gold) || 0,
         gold_confirmation: Number(
             (Settings.get(Travian.Player.data.playerId).data || {}).premiumConfirmation
@@ -251,7 +262,7 @@ READ_BUILD_STATE_JS = r"""(() => {
         // Base data of buildings that may be constructed (bonus, storage, marketplace, army).
         building_config: (() => {
             const out = {};
-            for (const t of [5, 6, 7, 8, 9, 10, 11, 17, 19, 20, 25]) {
+            for (const t of Object.keys(Travian.Config.buildingConfig || {}).map(Number)) {
                 const c = (Travian.Config.buildingConfig || {})[t];
                 if (!c) continue;
                 out[t] = {
@@ -1428,6 +1439,165 @@ class BuildClickExecutor:
             raise ClickModeError("Gra nie potwierdziła wskrzeszenia bohatera.") from None
         self._close_windows(lane)
         return "reviving"
+
+    # -- quest book ----------------------------------------------------------------
+    _QUEST_STATUS_JS = (
+        "(id => { const all = [...(Quest.getCollection().data || []),"
+        " ...(Quest.getCollection(QuestGiver.DAILY).data || [])];"
+        " const q = all.find(q => Number(q.data.id) === id); return q ? Number(q.data.status) : 0; })"
+    )
+    _REWARD_BUTTONS_JS = (
+        "[...document.querySelectorAll(\".modalWrapper button[clickable='collectReward()']\")]"
+        ".filter(b => b.getBoundingClientRect().width > 0)"
+    )
+
+    def _quest_status(self, lane: _Lane, quest_id: int) -> int:
+        return int(lane.evaluate(f"{self._QUEST_STATUS_JS}({int(quest_id)})") or 0)
+
+    def _open_quest(self, lane: _Lane, quest_id: int, daily: bool) -> None:
+        """Open the quest book on the quest (selecting it activates a new one)."""
+        self._close_windows(lane)
+        self._click(lane, "[clickable=\"openWindow('questBook', {'npcId': 0})\"]")
+        tab = "DailyQuests" if daily else "OpenQuests"
+        tab_selector = f".modalWrapper [clickable=\"selectTab('{tab}')\"]"
+        try:
+            lane.wait_for(f"!!document.querySelector(`{tab_selector}`)", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Księga zadań się nie otworzyła.") from None
+        if daily:
+            self._click(lane, tab_selector)
+            time.sleep(1.0)
+        kind = "selectDailyQuest" if daily else "selectQuest"
+        item = f".modalWrapper [clickable='{kind}({int(quest_id)})']"
+        next_page = ".modalWrapper .nextPage.clickable:not(.disabled)"
+        for _page in range(8):
+            if lane.evaluate(f"!!document.querySelector(`{item}`)"):
+                break
+            if daily or not lane.evaluate(f"!!document.querySelector('{next_page}')"):
+                self._close_windows(lane)
+                raise ClickModeError(f"Nie ma zadania {quest_id} w księdze.")
+            self._click(lane, next_page)
+            time.sleep(0.8)
+        self._click(lane, item)
+        time.sleep(1.5)
+
+    def _collect_quest(self, quest_id: int, village_id: str, daily: bool) -> str:
+        """Collect a finished quest's reward in *village_id*."""
+        lane = self._ensure_lane()
+        lane.wake()
+        if self._quest_status(lane, quest_id) != 4:
+            return "not_done"
+        self._close_windows(lane)
+        self._select_village(lane, str(village_id))
+        if lane.evaluate(_SELECTED_JS) != str(village_id):
+            raise ClickModeError("Nie wybrano wioski na nagrodę.")
+        self._open_quest(lane, quest_id, daily)
+        buttons = self._REWARD_BUTTONS_JS
+        try:
+            lane.wait_for(f"{buttons}.length > 0", timeout=6)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Nie ma przycisku odbioru nagrody.") from None
+        time.sleep(1.0)  # the game checks meanwhile whether it can be collected here
+        if lane.evaluate(f"{buttons}.every(b => b.classList.contains('disabled'))"):
+            error = lane.evaluate(
+                f"(({buttons})[0] || null) ? ({buttons})[0].getAttribute('tooltip-content') || '' : ''"
+            )
+            self._close_windows(lane)
+            raise ClickModeError(
+                f"Gra nie pozwala odebrać nagrody tutaj: {error or 'bez podania przyczyny'}."
+            )
+        index = lane.evaluate(
+            "[...document.querySelectorAll(\".modalWrapper button[clickable='collectReward()']\")]"
+            ".findIndex(b => b.getBoundingClientRect().width > 0 && !b.classList.contains('disabled'))"
+        )
+        self._click(lane, ".modalWrapper button[clickable='collectReward()']", int(index))
+        try:
+            lane.wait_for(f"{self._QUEST_STATUS_JS}({int(quest_id)}) !== 4", timeout=10)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie potwierdziła odbioru nagrody.") from None
+        time.sleep(0.5)
+        self._close_windows(lane)
+        return "collected"
+
+    def _activate_quest(self, quest_id: int, daily: bool) -> str:
+        lane = self._ensure_lane()
+        lane.wake()
+        if self._quest_status(lane, quest_id) != 2:
+            return "not_new"
+        self._open_quest(lane, quest_id, daily)
+        try:
+            lane.wait_for(f"{self._QUEST_STATUS_JS}({int(quest_id)}) !== 2", timeout=8)
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie aktywowała zadania.") from None
+        self._close_windows(lane)
+        return "activated"
+
+    def _exchange_daily(self, quest_id: int) -> str:
+        lane = self._ensure_lane()
+        lane.wake()
+        before = int(lane.evaluate("Number(Travian.Player.data.dailyQuestsExchanged) || 0"))
+        self._open_quest(lane, quest_id, True)
+        button = ".modalWrapper a.iconButton[clickable='exchangeDailyQuest()']"
+        usable = lane.evaluate(
+            f"(b => !!b && !b.classList.contains('disabled'))(document.querySelector(\"{button}\"))"
+        )
+        if not usable:
+            self._close_windows(lane)
+            raise ClickModeError("Wymiana zadania dziennego jest teraz niedostępna.")
+        self._click(lane, button)
+        try:
+            lane.wait_for(
+                f"(Number(Travian.Player.data.dailyQuestsExchanged) || 0) > {before}"
+                f" || {self._QUEST_STATUS_JS}({int(quest_id)}) === 0",
+                timeout=10,
+            )
+        except ClickModeError:
+            self._close_windows(lane)
+            raise ClickModeError("Gra nie potwierdziła wymiany zadania.") from None
+        self._close_windows(lane)
+        return "exchanged"
+
+    def _open_premium_menu(self) -> str:
+        """Open the premium menu (shop window) and close it; nothing is bought."""
+        lane = self._ensure_lane()
+        lane.wake()
+        self._close_windows(lane)
+        self._click(lane, "a.gold.subButton[clickable*=\"openWindow('shop'\"]")
+        try:
+            lane.wait_for("!!document.querySelector('.modalWrapper')", timeout=8)
+        except ClickModeError:
+            raise ClickModeError("Menu premium się nie otworzyło.") from None
+        time.sleep(1.5)
+        self._close_windows(lane)
+        return "opened"
+
+    @_exclusive
+    def collect_quest(self, quest_id: int, village_id: str, daily: bool) -> str:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "odbiór nagrody za zadanie"):
+            return self._collect_quest(quest_id, village_id, daily)
+
+    @_exclusive
+    def activate_quest(self, quest_id: int, daily: bool) -> str:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "aktywacja zadania"):
+            return self._activate_quest(quest_id, daily)
+
+    @_exclusive
+    def exchange_daily(self, quest_id: int) -> str:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "wymiana zadania dziennego"):
+            return self._exchange_daily(quest_id)
+
+    @_exclusive
+    def open_premium_menu(self) -> str:
+        lane = self._ensure_lane()
+        with self._gold_guard(lane, 0, "menu premium"):
+            return self._open_premium_menu()
 
     @_exclusive
     def revive_hero(self, village_id: str) -> str:

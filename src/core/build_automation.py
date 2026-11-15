@@ -24,12 +24,16 @@ import time
 from dataclasses import dataclass, field
 
 try:
+    from src.core import quests as qb
+    from src.core import start_plan as sp
     from src.core import village_builder as vb
     from src.core.attack_clicker import ClickModeError
     from src.core.build_clicker import (
         HERO_STATUS_DEAD, BuildClickExecutor, GoldGuardError, StaleStateError, read_build_state,
     )
 except ModuleNotFoundError:  # pragma: no cover - script fallback
+    from core import quests as qb
+    from core import start_plan as sp
     from core import village_builder as vb
     from core.attack_clicker import ClickModeError
     from core.build_clicker import (
@@ -85,6 +89,10 @@ class BuildSnapshot:
     unit_speeds: dict[int, float] = field(default_factory=dict)
     # Village id -> seconds before the attack the evacuation starts.
     raid_leads: dict[str, float] = field(default_factory=dict)
+    quests: list = field(default_factory=list)  # quests.Quest of the quest book
+    daily_exchanged: int = 0
+    daily_exchange_max: int = 0
+    start_states: list = field(default_factory=list)  # start_plan.StepState per step
 
 
 # Hero production: re-check the best setting this often, and keep a new
@@ -247,6 +255,12 @@ class BuildAutomation:
         # Dead hero to revive first: (home village id, costs, seconds).
         self._revive: tuple[str, dict[int, float], float] | None = None
         self._revive_noted = False
+        self._quest_noted: set[str] = set()
+        # Storage goals for quest rewards no storage holds: village -> {1|4: capacity}.
+        self._storage_goals: dict[str, dict[int, float]] = {}
+        self._reward_storage: dict[int, str] = {}  # quest id -> village building for it
+        # Field quests: village -> location -> [(level, share of cost paid, quest)].
+        self._quest_fields: dict[str, dict[int, list]] = {}
         self._settle_noted: str = ""
         self._bank_gold_noted = False
         # village id -> {"wood"|"clay"|"iron"|"grain": cost per hour or None}
@@ -378,6 +392,7 @@ class BuildAutomation:
                     village.hero_bonus = current
         self._settle = self._settle_goal(villages, settings, server_time)
         self._revive = self._revive_goal(villages, settings, hero)
+        self._quest_fields = self._field_quest_shares(villages, qb.quests_from_raw(state), settings)
         plans = vb.plan_all(
             villages,
             settings.capital_target,
@@ -396,7 +411,35 @@ class BuildAutomation:
             town_target=settings.town_target,
             towns=set(settings.town_villages),
             revive=self._revive,
+            quest_fields=self._quest_fields,
         )
+        # Storage for quest rewards: valued with what the queue time is worth
+        # in each village's plan, then those villages are planned again.
+        self._storage_goals = self._reward_storage_goals(
+            villages, qb.quests_from_raw(state), settings,
+            {plan.village.id: vb.queue_hour_value(plan) for plan in plans},
+        )
+        if self._storage_goals:
+            plans = vb.plan_all(
+                villages,
+                settings.capital_target,
+                settings.village_target,
+                server_time,
+                main_building=settings.main_building,
+                balanced=settings.balance_resources and settings.npc_mode != "auto",
+                storage_hours=settings.storage_hours,
+                bonus_buildings=settings.bonus_buildings,
+                construct_config=self._construct_config,
+                military=military_targets,
+                military_first=military_first,
+                granary_max={self._crop_bank} if self._crop_bank and settings.crop_bank_granaries else None,
+                settle=self._settle,
+                town_target=settings.town_target,
+                towns=set(settings.town_villages),
+                revive=self._revive,
+                storage_goals=self._storage_goals,
+                quest_fields=self._quest_fields,
+            )
         merchant_speed = {}
         for key, value in (state.get("merchant_speed") or {}).items():
             try:
@@ -614,6 +657,9 @@ class BuildAutomation:
             crop_bank=self._crop_bank,
             threats_last=threats_last,
             raid_leads=raid_leads,
+            quests=qb.quests_from_raw(state),
+            daily_exchanged=int(state.get("daily_exchanged") or 0),
+            daily_exchange_max=int(state.get("daily_exchange_max") or 0),
             unit_speeds={int(k): float(v) for k, v in (state.get("unit_speeds") or {}).items()},
             troops={
                 int(k): {
@@ -623,13 +669,22 @@ class BuildAutomation:
                 for k, info in (state.get("troops") or {}).items()
             },
         )
+        self.snapshot.start_states = self._start_states(self.snapshot, settings)
         return self.snapshot
 
     def tick(self) -> BuildSnapshot:
         """Refresh the plan and, when enabled, act in every village."""
         snapshot = self.refresh()
         settings = self._settings()
+        if self.halted:
+            return snapshot
+        if settings.start_enabled and settings.start_village:
+            if self._start(snapshot, settings) and not self.halted:
+                time.sleep(SETTLE_SECONDS)
+                snapshot = self.refresh()
         if not settings.enabled or self.halted:
+            if not self.halted and settings.start_enabled and settings.quests_auto:
+                self._quests(snapshot)
             return snapshot
         evaded = False
         if settings.troop_evasion and (snapshot.threats_last or self._evaded):
@@ -660,6 +715,8 @@ class BuildAutomation:
             acted = True
         if not self.halted and self._revive and self._revive_hero(snapshot):
             acted = True
+        if not self.halted and settings.quests_auto and self._quests(snapshot):
+            acted = True
         if not self.halted and settings.crop_bank and self._mill(snapshot, settings):
             acted = True
             time.sleep(SETTLE_SECONDS)
@@ -687,6 +744,8 @@ class BuildAutomation:
                 return acted
             if village.id in settings.disabled_villages or self._backoff.get(village.id, 0) > now:
                 continue
+            if settings.start_enabled and village.id == settings.start_village:
+                continue  # the start plan builds here
             finished_here = False
             step = None
             try:
@@ -780,6 +839,8 @@ class BuildAutomation:
                         first_steps=self._first_steps.get(village.id),
                         settle_level=self._settle.get(village.id, (0, 0))[0],
                         settle_count=self._settle.get(village.id, (0, 0))[1],
+                        storage_goal=self._storage_goals.get(village.id),
+                        quest_fields=self._quest_fields.get(village.id),
                     )
                     recent = self._recent_master.get(village.id, {})
                     now_m = time.monotonic()
@@ -864,6 +925,8 @@ class BuildAutomation:
                         first_steps=self._first_steps.get(village.id),
                         settle_level=self._settle.get(village.id, (0, 0))[0],
                         settle_count=self._settle.get(village.id, (0, 0))[1],
+                        storage_goal=self._storage_goals.get(village.id),
+                        quest_fields=self._quest_fields.get(village.id),
                     )
                     if master_step is not None and not self._can_construct(village, master_step):
                         master_step = None  # requirements only met by planned levels: later
@@ -1175,6 +1238,265 @@ class BuildAutomation:
                     f"(~{need:.1f} h budowy i szkolenia + zapas)."
                 )
         return {village.id: (level, count)} if server_time >= start else {}
+
+    # -- start plan ----------------------------------------------------------------
+    def _start_states(self, snapshot: BuildSnapshot, settings) -> list:
+        plan = next((p for p in snapshot.plans if p.village.id == settings.start_village), None)
+        if plan is None or not settings.start_steps:
+            return []
+        return sp.plan_states(
+            settings.start_steps, plan.village, snapshot.quests, snapshot.troops, self._construct_config,
+        )
+
+    def _start(self, snapshot: BuildSnapshot, settings) -> bool:
+        """Work through the start plan in its village (one click per action)."""
+        village_id = settings.start_village
+        plan = next((p for p in snapshot.plans if p.village.id == village_id), None)
+        if plan is None:
+            return False
+        name = plan.village.name
+        changed = acted = False
+        for state in snapshot.start_states:
+            step = settings.start_steps[state.index] if state.index < len(settings.start_steps) else None
+            if step is not None and state.status == "done" and not step.get("done"):
+                step["done"] = True
+                changed = True
+                self._log(f"Start ({name}): zrobione — {state.text}.")
+        for state in snapshot.start_states:
+            action = state.action
+            if action is None or state.status != "act" or self.halted or self.abandoned:
+                continue
+            key = f"start:{state.index}"
+            if self._backoff.get(key, 0) > time.monotonic():
+                continue
+            if acted:
+                time.sleep(CLICK_PAUSE_SECONDS)
+            logger.info("Start plan action: %s %s", action.kind, state.text)
+            try:
+                if action.kind == "upgrade":
+                    self._executor.upgrade(village_id, action.location, action.from_level, action.is_field)
+                    text = f"rozbudowa rozpoczęta ({action.from_level}→{action.from_level + 1})"
+                elif action.kind == "construct":
+                    self._executor.construct(village_id, action.location, action.type)
+                    text = "budowa nowego budynku rozpoczęta"
+                elif action.kind == "collect":
+                    if self._executor.collect_quest(action.quest_id, village_id, False) != "collected":
+                        continue
+                    text = "nagroda odebrana"
+                elif action.kind == "settlers":
+                    result = self._executor.recruit(
+                        village_id, [vb.RESIDENCE, vb.PALACE], action.unit, action.quantity, 1, 10**9, 1.0,
+                    )
+                    if result.get("status") != "confirmed":
+                        continue
+                    text = f"szkolenie {result.get('quantity') or action.quantity} osadników"
+                else:  # troops
+                    result = self._executor.recruit(
+                        village_id, [sp.BARRACKS], action.unit, action.quantity, action.quantity, 10**9, 1.0,
+                    )
+                    if result.get("status") != "confirmed":
+                        continue
+                    settings.start_steps[state.index]["done"] = True
+                    changed = True
+                    text = f"szkolenie {action.quantity} jednostek"
+            except GoldGuardError as error:
+                self.halted = str(error)
+                self._log(f"Start ({name}): STOP — {error}")
+                break
+            except Exception as error:
+                self._backoff[key] = time.monotonic() + FAILURE_BACKOFF_SECONDS
+                self._log(f"Start ({name}): {state.text} — nie wyszło: {error}")
+                continue
+            acted = True
+            self._log(f"Start ({name}): {state.text} — {text}.")
+        if changed:
+            self.budget_changed = True  # the app saves the settings
+        return acted
+
+    # -- quest book ----------------------------------------------------------------
+    def _quest_storages(self, snapshot: BuildSnapshot) -> list:
+        """Villages a resource reward can go to (none about to be attacked)."""
+        storages = []
+        for plan in snapshot.plans:
+            village = plan.village
+            if village.id in snapshot.threats:
+                continue  # the reward would just be looted
+            coming = village.incoming_total()
+            stock = {r: village.resources.get(r, 0.0) + coming.get(r, 0.0) for r in vb.RESOURCES}
+            warehouse = float(village.capacity.get(1, 0))
+            capacity = {1: warehouse, 2: warehouse, 3: warehouse, 4: float(village.capacity.get(4, 0))}
+            need = sum(
+                max(0.0, sum(step.costs.get(r, 0) for step in plan.steps) - stock[r]) for r in vb.RESOURCES
+            )
+            storages.append(qb.Storage(village.id, village.name, stock, capacity, need))
+        return storages
+
+    def _field_quest_shares(self, villages, quests, settings) -> dict[str, dict[int, list]]:
+        """Fields that finish the active field quests come first in the plan."""
+        if not settings.quests_auto:
+            return {}
+        targets = {
+            v.id: vb.target_level(v, settings.capital_target, settings.village_target,
+                                  settings.town_target, set(settings.town_villages))
+            for v in villages
+        }
+        shares = vb.quest_field_shares(villages, qb.field_quests(quests), targets)
+        for village_id, fields in shares.items():
+            for entries in fields.values():
+                for level, share, label in entries:
+                    note = f"quest-fields:{label}:{village_id}"
+                    if note not in self._quest_noted:
+                        self._quest_noted.add(note)
+                        name = next((v.name for v in villages if v.id == village_id), village_id)
+                        self._log(
+                            f"Zadania: „{label}” — {name} buduje brakujące pola do poziomu {level} "
+                            f"wcześniej (nagroda pokrywa {share:.0%} ich kosztu)."
+                        )
+        return shares
+
+    def _reward_storage_goals(self, villages, quests, settings, hour_values=None) -> dict[str, dict[int, float]]:
+        """Warehouse/granary levels to build first where a finished quest's
+        resource reward would otherwise overflow (only when they keep more of
+        the reward than they cost)."""
+        goals: dict[str, dict[int, float]] = {}
+        self._reward_storage = {}
+        if not settings.quests_auto:
+            return goals
+        for quest in quests:
+            reward = quest.resources
+            if not quest.done or quest.building_level or sum(reward.values()) <= 0:
+                continue
+            found = vb.reward_storage_goal(villages, reward, hour_values=hour_values)
+            if found is None:
+                continue
+            village_id, goal, kept, cost, hours = found
+            self._reward_storage[quest.id] = village_id
+            mine = goals.setdefault(village_id, {})
+            for key, capacity in goal.items():
+                mine[key] = max(mine.get(key, 0.0), capacity)
+            note = f"quest-storage:{quest.id}:{village_id}:{int(sum(goal.values()))}"
+            if note not in self._quest_noted:
+                self._quest_noted.add(note)
+                name = next((v.name for v in villages if v.id == village_id), village_id)
+                self._log(
+                    f"Zadania: nagroda za „{quest.label}” nie mieści się w żadnym magazynie — "
+                    f"{name} rozbudowuje magazyn/spichlerz do "
+                    + ", ".join(
+                        f"{'spichlerz' if k == 4 else 'magazyn'} {c:,.0f}" for k, c in sorted(goal.items())
+                    )
+                    + f" (koszt {cost:,.0f} surowców i {hours:.1f} h kolejki"
+                    + (f", co opóźni pola o tyle samo" if (hour_values or {}).get(village_id) else
+                       ", kolejka i tak czeka na surowce")
+                    + f"; uratuje {kept:,.0f} z nagrody), potem ją odbierze."
+                )
+        return goals
+
+    def _quest_try(self, key: str, action, failure: str) -> str | None:
+        """Run one quest click; a failure backs off (a gold drop halts)."""
+        if self._backoff.get(key, 0) > time.monotonic() or self.abandoned:
+            return None
+        try:
+            return action()
+        except GoldGuardError as error:
+            self.halted = str(error)
+            self._log(f"Zadania: STOP — {error}")
+        except Exception as error:
+            self._backoff[key] = time.monotonic() + FAILURE_BACKOFF_SECONDS
+            self._log(f"Zadania: {failure} — {error}")
+        return None
+
+    def _quests(self, snapshot: BuildSnapshot) -> bool:
+        """Activate new quests, collect finished ones (resource rewards where
+        they fit), open the premium menu for its daily quest and exchange one
+        daily quest the automation cannot do."""
+        acted = False
+        names = {plan.village.id: plan.village.name for plan in snapshot.plans}
+        for quest in snapshot.quests:
+            if self.halted:
+                return acted
+            if quest.status == qb.STATUS_ACTIVATABLE:
+                logger.info("Village build action: activate quest %s", quest.id)
+                if self._quest_try(
+                    f"quest:{quest.id}", lambda q=quest: self._executor.activate_quest(q.id, q.daily),
+                    f"nie aktywowano „{quest.label}”",
+                ) == "activated":
+                    acted = True
+                    self._log(f"Zadania: aktywowano „{quest.label}”.")
+                continue
+            if not quest.done:
+                continue
+            if quest.building_level:
+                key = f"quest-manual:{quest.id}"
+                if self._settings().start_enabled and any(
+                    s.get("kind") == "reward" and int(s.get("type", 0)) == (quest.building_reward or (0,))[0]
+                    for s in self._settings().start_steps
+                ):
+                    continue  # the start plan collects it in its village
+                if key not in self._quest_noted:
+                    self._quest_noted.add(key)
+                    self._log(
+                        f"Zadania: „{quest.label}” daje poziom budynku — odbierz ręcznie w wiosce, "
+                        "w której ma działać."
+                    )
+                continue
+            reward = quest.resources
+            if reward and sum(reward.values()) > 0 and quest.id in self._reward_storage:
+                continue  # its storage is being built first
+            if reward and sum(reward.values()) > 0:
+                storage, lost = qb.reward_village(reward, self._quest_storages(snapshot))
+                if storage is not None and lost > 0 and any(
+                    b.queued for plan in snapshot.plans for b in plan.village.storages
+                ):
+                    storage = None  # a storage level still being built makes room
+                if storage is None:
+                    key = f"quest-wait:{quest.id}"
+                    if key not in self._quest_noted:
+                        self._quest_noted.add(key)
+                        self._log(
+                            f"Zadania: nagroda za „{quest.label}” ("
+                            + " / ".join(f"{reward.get(r, 0):,}" for r in vb.RESOURCES)
+                            + ") nie zmieści się teraz w żadnej wiosce — czekam na miejsce w magazynach."
+                        )
+                    continue
+                village_id = storage.village_id
+            else:
+                village_id, lost = (snapshot.plans[0].village.id if snapshot.plans else ""), 0.0
+            if not village_id:
+                continue
+            logger.info("Village build action: collect quest %s in %s", quest.id, village_id)
+            if self._quest_try(
+                f"quest:{quest.id}",
+                lambda q=quest, v=village_id: self._executor.collect_quest(q.id, v, q.daily),
+                f"nie odebrano nagrody za „{quest.label}”",
+            ) == "collected":
+                acted = True
+                text = (" / ".join(f"{reward.get(r, 0):,}" for r in vb.RESOURCES) + " surowców") if reward else "nagroda"
+                self._log(
+                    f"Zadania: odebrano „{quest.label}” w {names.get(village_id, village_id)} ({text}"
+                    + (f", przepadło ~{lost:,.0f} — magazyn za mały" if lost > 0 else "") + ")."
+                )
+        if self.halted:
+            return acted
+        premium = next(
+            (q for q in snapshot.quests if q.id == qb.DAILY_PREMIUM_MENU and q.status == qb.STATUS_ACTIVE), None,
+        )
+        if premium is not None:
+            logger.info("Village build action: open premium menu")
+            if self._quest_try(
+                "quest:premium", self._executor.open_premium_menu, "nie otwarto menu premium",
+            ) == "opened":
+                acted = True
+                self._log("Zadania: otwarto menu premium (zadanie dzienne, nic nie kupiono).")
+        exchange = qb.daily_to_exchange(snapshot.quests, snapshot.daily_exchanged, snapshot.daily_exchange_max)
+        if exchange is not None and not self.halted:
+            logger.info("Village build action: exchange daily quest %s", exchange.id)
+            if self._quest_try(
+                f"quest:{exchange.id}", lambda: self._executor.exchange_daily(exchange.id),
+                f"nie wymieniono „{exchange.label}”",
+            ) == "exchanged":
+                acted = True
+                self._log(f"Zadania: wymieniono zadanie dzienne „{exchange.label}” (automat go nie wykona).")
+        return acted
 
     # -- hero revive ---------------------------------------------------------------
     def _revive_goal(self, villages, settings, hero: dict) -> tuple[str, dict[int, float], float] | None:

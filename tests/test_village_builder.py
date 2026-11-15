@@ -1617,6 +1617,100 @@ def test_settlers_served_first_by_transfers():
     assert transfers and transfers[0].target_id == "5" and transfers[0].merchants == 5
 
 
+def _reward_village(cost_per_resource=10):
+    warehouse = _storage(30, 10, 10, capacity_step=10_000)
+    warehouse.costs = {lvl: {r: cost_per_resource for r in vb.RESOURCES} for lvl in warehouse.costs}
+    granary = _storage(31, 11, 10, capacity_step=10_000)
+    village = _village([_field(1, 1, 3)], storages=[warehouse, granary], vid="7", capacity=100_000)
+    return village
+
+
+def test_storage_built_for_a_reward_bigger_than_every_storage():
+    village = _reward_village()
+    reward = {1: 130_000, 2: 130_000, 3: 130_000, 4: 0}
+    village_id, goal, kept, cost, hours = vb.reward_storage_goal([village], reward)
+    assert village_id == "7" and goal == {1: 130_000}
+    assert kept == 90_000 and cost == 3 * 40 and abs(hours - 0.5) < 1e-9
+    plan = vb.plan_village(village, 10, 0, storage_goal=goal)
+    assert [(s.type, s.from_level) for s in plan.steps[:3]] == [(10, 10), (10, 11), (10, 12)]
+    assert "nagrodę" in plan.steps[0].reason
+
+
+def test_reward_storage_counts_the_queue_time():
+    reward = {1: 130_000, 2: 130_000, 3: 130_000, 4: 0}
+    village = _reward_village()  # each level: +10 000 per resource (30 000 kept), 10 min
+    # The delayed fields would lose 100 000/h: 16 667 per level, still worth it.
+    assert vb.reward_storage_goal([village], reward, hour_values={"7": 100_000})[1] == {1: 130_000}
+    # 300 000/h: 50 000 per level, more than the 30 000 it keeps.
+    assert vb.reward_storage_goal([village], reward, hour_values={"7": 300_000}) is None
+    # A busy queue elsewhere does not matter; the free village builds.
+    other = _reward_village()
+    other.id = "9"
+    found = vb.reward_storage_goal([village, other], reward, hour_values={"7": 300_000, "9": 0})
+    assert found[0] == "9"
+
+
+def test_queue_hour_value_only_for_queue_bound_villages():
+    village = _village([_field(1, 1, 3, cost=10)], production={1: 1000, 2: 1000, 3: 1000, 4: 1000})
+    plan = vb.plan_village(village, 10, 0)
+    plan.queue_bound = False
+    assert vb.queue_hour_value(plan) == 0
+    plan.queue_bound = True
+    assert vb.queue_hour_value(plan) == sum(s.gain for s in plan.steps if s.gain > 0)
+
+
+def test_no_storage_for_a_reward_when_it_costs_more_than_it_keeps():
+    village = _reward_village(cost_per_resource=50_000)
+    assert vb.reward_storage_goal([village], {1: 130_000, 2: 130_000, 3: 130_000, 4: 0}) is None
+
+
+def test_no_storage_when_some_storage_already_holds_the_reward():
+    small, big = _reward_village(), _reward_village()
+    big.id, big.capacity = "8", {r: 150_000 for r in vb.RESOURCES}
+    assert vb.reward_storage_goal([small, big], {1: 130_000, 2: 130_000, 3: 130_000, 4: 0}) is None
+
+
+def _quest_village(vid, level, cost=1000):
+    fields = [_field(loc, t, level, cost=cost, max_level=20) for loc, t in ((1, 1), (2, 2), (3, 3), (4, 4))]
+    return _village(fields, vid=vid, production={1: 1000, 2: 1000, 3: 1000, 4: 1000})
+
+
+def test_field_quest_shares_pick_the_cheapest_villages():
+    from src.core import quests as qb
+
+    done = _quest_village("1", 10)
+    close = _quest_village("2", 9)
+    far = _quest_village("3", 5)
+    quest = qb.FieldQuest("Fields to 10 in 2", (1, 2, 3), 10, 2, 300_000.0)
+    shares = vb.quest_field_shares([done, close, far], [quest], {"1": 10, "2": 10, "3": 10})
+    assert set(shares) == {"2"}  # village 1 already counts, village 2 is the cheapest
+    assert set(shares["2"]) == {1, 2, 3}  # not the cropland
+    level, share, label = shares["2"][1][0]
+    assert level == 10 and share == 1.0 and label == "Fields to 10 in 2"
+
+
+def test_field_quest_beyond_target_only_when_the_reward_pays_it_all():
+    from src.core import quests as qb
+
+    village = _quest_village("1", 10, cost=1000)
+    quest = qb.FieldQuest("All resource fields to 12", (1, 2, 3, 4), 12, 1, 1_000.0)
+    assert vb.quest_field_shares([village], [quest], {"1": 10}) == {}
+    rich = qb.FieldQuest("All resource fields to 12", (1, 2, 3, 4), 12, 1, 10_000_000.0)
+    shares = vb.quest_field_shares([village], [rich], {"1": 10})
+    plan = vb.plan_village(village, 10, 0, quest_fields=shares["1"])
+    assert plan.steps and plan.steps[0].from_level == 10 and "zadanie" in plan.steps[0].reason
+
+
+def test_quest_fields_come_first_in_the_plan():
+    village = _quest_village("1", 5)
+    plain = vb.plan_village(village, 10, 0)
+    first_plain = plain.steps[0].type
+    other = next(t for t in (1, 2, 3, 4) if t != first_plain)
+    location = next(b.location for b in village.fields if b.type == other)
+    plan = vb.plan_village(village, 10, 0, quest_fields={location: [(10, 1.0, "Q")]})
+    assert plan.steps[0].location == location and "„Q”" in plan.steps[0].reason
+
+
 REVIVE_COSTS = {1: 5923, 2: 10788, 3: 7192, 4: 0}
 
 

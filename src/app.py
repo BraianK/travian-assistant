@@ -69,6 +69,7 @@ try:
     from src.core.build_automation import BuildAutomation
     from src.core.village_builder import completion_forecast
     from src.core.npc_milling import milling_plan
+    from src.core import start_plan
     from src.core.build_clicker import GoldGuardError
     from src.core.scout_planner import ScoutTarget
     from src.core.tournament_square import estimate_levels as estimate_square_levels
@@ -133,6 +134,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from core.build_automation import BuildAutomation
     from core.village_builder import completion_forecast
     from core.npc_milling import milling_plan
+    from core import start_plan
     from core.build_clicker import GoldGuardError
     from core.scout_planner import ScoutTarget
     from core.tournament_square import estimate_levels as estimate_square_levels
@@ -3360,6 +3362,230 @@ def _format_costs(costs: dict) -> str:
     return " / ".join(f"{int(costs.get(r, 0)):,}".replace(",", " ") for r in (1, 2, 3, 4))
 
 
+class StartPlanWidget(QWidget):
+    """Game start: a fixed build order for the first village, step by step."""
+
+    setting_changed = Signal(str, object)
+
+    _STATUS = {
+        "done": ("Zrobione", "#3c8d4f"),
+        "act": ("Teraz", "#2f6fb5"),
+        "wait": ("Czeka", "#a07a1c"),
+        "manual": ("Teraz Ty", "#b5482f"),
+        "blocked": ("Zablokowane", "#b5482f"),
+        "later": ("Później", "#808080"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loading = False
+        self._steps: list[dict] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("Start gry: dwie szybkie wioski")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        hint = QLabel(
+            "Automat buduje w wybranej wiosce krok po kroku według planu (klikając, jak w zakładce "
+            "Budowa — ta wioska jest wtedy pomijana przez automat Budowy). Pola i budynki idą "
+            "równolegle, ale krok czekający na surowce zatrzymuje kolejne. Nagrodę „rezydencja na 10” "
+            "odbiera sam zamiast budować poziomy 6–10, osadników szkoli, gdy są surowce. Na krokach "
+            "ręcznych plan staje, aż klikniesz „Zrobione”. Nie wydaje złota."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("secondaryText")
+        layout.addWidget(hint)
+        ongoing = QLabel(start_plan.ONGOING)
+        ongoing.setWordWrap(True)
+        layout.addWidget(ongoing)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Wioska:"))
+        self.village = QComboBox()
+        self.village.setMinimumWidth(160)
+        self.village.currentIndexChanged.connect(self._village_changed)
+        row.addWidget(self.village)
+        self.enabled = QCheckBox("Plan włączony")
+        self.enabled.toggled.connect(self._enabled_changed)
+        row.addWidget(self.enabled)
+        reset = QPushButton("Przywróć domyślny plan")
+        reset.clicked.connect(self._reset)
+        row.addWidget(reset)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(("#", "Krok", "Stan"))
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        layout.addWidget(self.table, stretch=1)
+
+        buttons = QHBoxLayout()
+        for text, handler in (
+            ("Zrobione", self._mark_done), ("Cofnij „zrobione”", self._mark_undone),
+            ("W górę", lambda: self._move(-1)), ("W dół", lambda: self._move(1)),
+            ("Usuń krok", self._delete),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(handler)
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        add_row = QHBoxLayout()
+        self.manual_text = QLineEdit()
+        self.manual_text.setPlaceholderText("Nowy krok ręczny (dodany pod zaznaczonym)")
+        add_row.addWidget(self.manual_text, stretch=1)
+        add = QPushButton("Dodaj krok ręczny")
+        add.clicked.connect(self._add_manual)
+        add_row.addWidget(add)
+        layout.addLayout(add_row)
+        self.status = QLabel()
+        self.status.setObjectName("secondaryText")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self._states: dict[int, tuple[str, str]] = {}
+
+    # -- settings -------------------------------------------------------------
+    def load_settings(self, settings):
+        self._loading = True
+        try:
+            self._steps = [dict(step) for step in settings.start_steps]
+            self.enabled.setChecked(settings.start_enabled)
+            index = self.village.findData(settings.start_village)
+            if index >= 0:
+                self.village.setCurrentIndex(index)
+            self._village_id = settings.start_village
+            self._render()
+        finally:
+            self._loading = False
+
+    def update_snapshot(self, snapshot, settings):
+        villages = [(p.village.id, p.village.name) for p in snapshot.plans]
+        if [self.village.itemData(i) for i in range(self.village.count())] != [v for v, _ in villages]:
+            self._loading = True
+            try:
+                self.village.clear()
+                self.village.addItem("— wybierz —", "")
+                for village_id, name in villages:
+                    self.village.addItem(name, village_id)
+                self.village.setCurrentIndex(max(0, self.village.findData(settings.start_village)))
+            finally:
+                self._loading = False
+        self._steps = [dict(step) for step in settings.start_steps]
+        self._states = {state.index: (state.status, state.text) for state in snapshot.start_states}
+        self._render()
+        if not settings.start_village:
+            self.status.setText("Wybierz wioskę, w której ma działać plan.")
+        elif not settings.start_enabled:
+            self.status.setText("Plan wyłączony — stan kroków tylko do podglądu.")
+        else:
+            current = next((t for st, t in self._states.values() if st in ("act", "manual", "wait", "blocked")), "")
+            self.status.setText(f"Teraz: {current}" if current else "Plan zakończony.")
+
+    def _render(self):
+        selected = self.table.currentRow()
+        self.table.setRowCount(len(self._steps))
+        for row, step in enumerate(self._steps):
+            status, text = self._states.get(row, ("done" if step.get("done") else "later", start_plan.label(step)))
+            if step.get("done"):
+                status = "done"
+            name, color = self._STATUS.get(status, (status, "#808080"))
+            items = (QTableWidgetItem(str(row + 1)), QTableWidgetItem(start_plan.label(step)),
+                     QTableWidgetItem(name if status in ("done", "later") else f"{name}: {text}"))
+            items[2].setForeground(QColor(color))
+            for column, item in enumerate(items):
+                self.table.setItem(row, column, item)
+        if 0 <= selected < len(self._steps):
+            self.table.selectRow(selected)
+
+    def _save_steps(self):
+        self._states = {}
+        self._render()
+        self.setting_changed.emit("start_steps", [dict(step) for step in self._steps])
+
+    # -- handlers -------------------------------------------------------------
+    def _village_changed(self, _index):
+        if self._loading:
+            return
+        self.setting_changed.emit("start_village", str(self.village.currentData() or ""))
+
+    def _enabled_changed(self, checked: bool):
+        if self._loading:
+            return
+        if checked:
+            answer = QMessageBox.question(
+                self, "Włączyć plan startu?",
+                "Automat będzie w wybranej wiosce klikał budowę, odbiór nagród i szkolenie "
+                "według planu (co kilka minut, w karcie w tle). Wydanych surowców nie da się "
+                "odzyskać. Złota nie wydaje. Włączyć?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self._loading = True
+                self.enabled.setChecked(False)
+                self._loading = False
+                return
+        self.setting_changed.emit("start_enabled", checked)
+
+    def _selected(self) -> int:
+        row = self.table.currentRow()
+        return row if 0 <= row < len(self._steps) else -1
+
+    def _mark_done(self):
+        row = self._selected()
+        if row >= 0:
+            self._steps[row]["done"] = True
+            self._save_steps()
+
+    def _mark_undone(self):
+        row = self._selected()
+        if row >= 0:
+            self._steps[row].pop("done", None)
+            self._save_steps()
+
+    def _move(self, delta: int):
+        row = self._selected()
+        target = row + delta
+        if row < 0 or not 0 <= target < len(self._steps):
+            return
+        self._steps[row], self._steps[target] = self._steps[target], self._steps[row]
+        self._save_steps()
+        self.table.selectRow(target)
+
+    def _delete(self):
+        row = self._selected()
+        if row >= 0:
+            del self._steps[row]
+            self._save_steps()
+
+    def _add_manual(self):
+        text = self.manual_text.text().strip()
+        if not text:
+            return
+        row = self._selected()
+        self._steps.insert(row + 1 if row >= 0 else len(self._steps), {"kind": "manual", "text": text})
+        self.manual_text.clear()
+        self._save_steps()
+
+    def _reset(self):
+        answer = QMessageBox.question(
+            self, "Przywrócić domyślny plan?",
+            "Lista kroków wróci do planu „dwie szybkie wioski”, a oznaczenia „zrobione” znikną.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self._steps = [dict(step) for step in start_plan.DEFAULT_STEPS]
+            self._save_steps()
+
+
 class VillageBuildWidget(QWidget):
     """Resource-field building plan, automation switch and transfer hints."""
 
@@ -3533,6 +3759,28 @@ class VillageBuildWidget(QWidget):
             lambda checked: self._emit("hero_revive", checked)
         )
         status_layout.addWidget(self.revive_checkbox)
+        self.quests_checkbox = QCheckBox(
+            "Zadania: aktywuj, odbieraj nagrody i wymieniaj zadania dzienne"
+        )
+        self.quests_checkbox.setToolTip(
+            "Automat aktywuje nowe zadania w księdze, odbiera nagrody za wykonane, a nagrody "
+            "w surowcach odbiera w wiosce, w której się zmieszczą (najlepiej tej, która ich "
+            "najbardziej potrzebuje; nie w wiosce, na którą idzie atak). Gdy nigdzie nie ma "
+            "miejsca, czeka. Gdy nagroda jest większa niż każdy magazyn, rozbudowuje magazyn lub "
+            "spichlerz tam, gdzie to się najbardziej opłaca — tylko tyle poziomów, ile uratuje "
+            "więcej z nagrody, niż kosztują surowcami i czasem kolejki (w wiosce, w której kolejka "
+            "jest wąskim gardłem, liczy też produkcję utraconą przez opóźnienie pól) — i odbiera "
+            "ją po rozbudowie. Zadania polowe („Fields to 10 in 5”, „All resource fields to 12”…) "
+            "wchodzą do planu budowy: pola, które najtaniej je domkną, tanieją o część nagrody "
+            "i idą wcześniej (ponad cel wioski tylko, gdy nagroda pokrywa cały koszt). Zadanie dzienne „Premium features” wykonuje, otwierając menu "
+            "premium (nic nie kupuje), a raz dziennie wymienia zadanie, którego sam nie zrobi "
+            "(ataki, zwierzęta, kryjówki, aukcje…). Nagrody w poziomach budynków zostawia "
+            "do odebrania ręcznie. Nie wydaje złota."
+        )
+        self.quests_checkbox.toggled.connect(
+            lambda checked: self._emit("quests_auto", checked)
+        )
+        status_layout.addWidget(self.quests_checkbox)
         raid_row = QHBoxLayout()
         self.raid_checkbox = QCheckBox("Przed nadchodzącym atakiem zabezpieczaj surowce na")
         self.raid_checkbox.setToolTip(
@@ -4129,6 +4377,7 @@ class VillageBuildWidget(QWidget):
             self.bonus_checkbox.setChecked(settings.bonus_buildings)
             self.hero_checkbox.setChecked(settings.hero_production_auto)
             self.revive_checkbox.setChecked(settings.hero_revive)
+            self.quests_checkbox.setChecked(settings.quests_auto)
             self.raid_checkbox.setChecked(settings.raid_protection)
             self.raid_minutes.setValue(settings.raid_lead_minutes)
             self.evade_checkbox.setChecked(settings.troop_evasion)
@@ -6605,6 +6854,11 @@ class MainWindow(QMainWindow):
         self.build_tab.military_changed.connect(self._set_build_military)
         self.content_tabs.addTab(self.build_tab, "Budowa")
 
+        self.start_tab = StartPlanWidget()
+        self.start_tab.load_settings(self.settings.build)
+        self.start_tab.setting_changed.connect(self._set_build_setting)
+        self.content_tabs.addTab(self.start_tab, "Start")
+
         self.kingdom_tab = KingdomWidget()
         self.kingdom_tab.refresh_requested.connect(self._refresh_kingdom)
         self.kingdom_tab.update_tk_requested.connect(self._update_tktools_troops)
@@ -8291,6 +8545,7 @@ class MainWindow(QMainWindow):
 
     def _on_build_snapshot(self, snapshot):
         self.build_tab.update_snapshot(snapshot, self.settings.build.disabled_villages)
+        self.start_tab.update_snapshot(snapshot, self.settings.build)
         try:
             from src.core.browser_session import _TROOP_NAMES_BY_TYPE as unit_names
         except ModuleNotFoundError:  # pragma: no cover
@@ -8376,6 +8631,8 @@ class MainWindow(QMainWindow):
             self.build_tab._show_settle(self.settings.build)
         if field == "town_villages":
             self.build_tab._show_towns(self.settings.build.town_villages)
+        if field.startswith("start_"):
+            self.start_tab.load_settings(self.settings.build)
         self._run_build(click=False)
 
     def _set_build_overflow_unit(self, village_id: str, unit: int):

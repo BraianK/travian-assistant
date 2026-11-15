@@ -392,6 +392,14 @@ class KingdomSettings(BaseModel):
         return value
 
 
+def _default_start_steps() -> list[dict]:
+    try:
+        from src.core.start_plan import DEFAULT_STEPS
+    except ImportError:  # pragma: no cover - packaged layout
+        from core.start_plan import DEFAULT_STEPS
+    return [dict(step) for step in DEFAULT_STEPS]
+
+
 class BuildSettings(BaseModel):
     """Resource-field building (upgrades are clicked like a player would)."""
 
@@ -417,6 +425,14 @@ class BuildSettings(BaseModel):
     # Dead hero: its home village saves (and the others ship) the revive
     # cost before building anything else; the revive is clicked when it is there.
     hero_revive: bool = False
+    # Quest book: activate quests, collect finished ones (resources where they
+    # fit), open the premium menu for its daily quest, exchange one undoable
+    # daily quest a day. All clicked; never spends gold.
+    quests_auto: bool = False
+    # Start tab: a fixed build order for the first village (see start_plan).
+    start_enabled: bool = False
+    start_village: str = ""
+    start_steps: list[dict] = Field(default_factory=_default_start_steps)
     # Before an incoming attack lands: spend or send away what could be looted.
     raid_protection: bool = True
     raid_lead_minutes: int = Field(default=10, ge=2, le=60)
@@ -509,7 +525,7 @@ class BuildSettings(BaseModel):
 class AppSettings(BaseModel):
     """Main application settings."""
     app_name: str = Field(default="Travian Kingdoms Assistant")
-    version: str = Field(default="1.3.8")
+    version: str = Field(default="1.3.9")
     
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     credentials: TravianCredentials = Field(default_factory=TravianCredentials, exclude=True)
