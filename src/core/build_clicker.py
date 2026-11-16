@@ -466,6 +466,37 @@ _TARGET_AT_POINT_JS = r"""((selector, index, x, y, accept) => {
         + (clickable ? " [" + clickable.slice(0, 60) + "]" : "")};
 })"""
 
+# Another visible point of the target when its centre is covered (e.g. a
+# neighbour's level bubble lying over a building picture). Points nearer
+# the centre come first; null when the whole element is covered.
+_FREE_POINT_JS = r"""((selector, index, accept) => {
+    const nodes = [...document.querySelectorAll(selector)].filter(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    });
+    const target = nodes[index || 0];
+    if (!target) return null;
+    const rect = target.getBoundingClientRect();
+    const points = [];
+    for (let i = 1; i < 8; i++) {
+        for (let j = 1; j < 8; j++) {
+            points.push([rect.x + rect.width * i / 8, rect.y + rect.height * j / 8,
+                Math.abs(i - 4) + Math.abs(j - 4)]);
+        }
+    }
+    points.sort((a, b) => a[2] - b[2]);
+    for (const [x, y] of points) {
+        if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) continue;
+        const hit = document.elementFromPoint(x, y);
+        if (!hit) continue;
+        const clickable = (hit.getAttribute && (hit.getAttribute("clickable") || "")) || "";
+        if (target === hit || target.contains(hit) || (accept && clickable.indexOf(accept) >= 0)) {
+            return {x: x, y: y};
+        }
+    }
+    return null;
+})"""
+
 
 # Player.vacationState values.
 HERO_STATUS_DEAD = 7
@@ -688,9 +719,14 @@ class BuildClickExecutor:
             hit = str(check.get("hit") or "")
             if "loadingScreen" in hit or "windowLoading" in hit:
                 raise StaleStateError("Gra wciąż się ładuje — ponowię.")
-            raise ClickModeError(
-                f"Kliknięcie wstrzymane — pod kursorem jest inny element ({hit})."
+            free = lane.evaluate(
+                f"{_FREE_POINT_JS}({json.dumps(selector)}, {int(index)}, {json.dumps(accept)})"
             )
+            if not free:
+                raise ClickModeError(
+                    f"Kliknięcie wstrzymane — pod kursorem jest inny element ({hit})."
+                )
+            position = {**position, "x": float(free["x"]), "y": float(free["y"])}
         for event in ("mouseMoved", "mousePressed", "mouseReleased"):
             lane.tab.call_method(
                 "Input.dispatchMouseEvent",

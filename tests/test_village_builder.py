@@ -2141,3 +2141,46 @@ def test_completion_forecast_counts_master_builder_entries_still_waiting():
     village.queue = [vb.QueueEntry(4, 1, 1, 0, id="m", paid=True)]
     hours = vb.completion_forecast([plan]).villages["A"]
     assert 0 < hours < 1
+
+
+def test_click_moves_to_a_free_point_when_the_centre_is_covered():
+    from src.core.build_clicker import BuildClickExecutor, _FREE_POINT_JS, _TARGET_AT_POINT_JS
+
+    class Tab:
+        def __init__(self):
+            self.events = []
+
+        def call_method(self, name, **kwargs):
+            self.events.append((kwargs.get("type"), kwargs.get("x"), kwargs.get("y")))
+
+    class Lane:
+        def __init__(self, free):
+            self.tab = Tab()
+            self.free = free
+
+        def rect(self, selector, index=0):
+            return {"x": 100.0, "y": 100.0, "disabled": False}
+
+        def wait_for(self, expression, timeout=0):
+            return True
+
+        def evaluate(self, expression):
+            if expression.startswith(_TARGET_AT_POINT_JS):
+                return {"ok": False, "hit": "DIV.buildingStatus location21 optionMenu"}
+            if expression.startswith(_FREE_POINT_JS):
+                return self.free
+            return True  # loading screen gone
+
+    executor = BuildClickExecutor(session=None)
+    lane = Lane({"x": 80, "y": 130})
+    executor._click(lane, "#buildingImage28")
+    assert {(x, y) for _, x, y in lane.tab.events} == {(80.0, 130.0)}
+
+    covered = Lane(None)
+    try:
+        executor._click(covered, "#buildingImage28")
+    except Exception as error:
+        assert "pod kursorem" in str(error)
+    else:
+        raise AssertionError("a fully covered element must not be clicked")
+    assert covered.tab.events == []
