@@ -2460,11 +2460,31 @@ def average_production(plan: VillagePlan) -> dict[int, float]:
     return {r: now[r] + max(0.0, final[r] - current[r]) / 2 for r in RESOURCES}
 
 
+def _master_work(village: Village) -> tuple[float, dict[int, float]]:
+    """(build hours, cost still to pay) of the master builder entries: the
+    unreserved ones still need their resources, all of them need the queue."""
+    hours = 0.0
+    costs = {r: 0.0 for r in RESOURCES}
+    for entry, entry_costs, build_hours in master_entry_costs(village):
+        hours += build_hours
+        if not entry.paid:
+            for r in RESOURCES:
+                costs[r] += entry_costs[r]
+    return hours, costs
+
+
+def _has_master_work(plan: VillagePlan) -> bool:
+    return any(entry.queue_type == 4 for entry in plan.village.queue)
+
+
 def _field_work(plan: VillagePlan) -> tuple[dict[int, float], dict[int, float]]:
-    """(resources still to produce for the remaining field levels beyond the
-    stock and shipments on the way, average production) of a village."""
+    """(resources still to produce for the remaining field levels and master
+    builder entries beyond the stock and shipments on the way, average
+    production) of a village."""
     village = plan.village
     _hours, costs = _remaining(village, plan.target)
+    _master_hours, master_costs = _master_work(village)
+    costs = {r: costs[r] + master_costs[r] for r in RESOURCES}
     incoming = village.incoming_total()
     stock = village.build_resources()
     cost = {r: max(0.0, costs[r] - stock[r] - incoming.get(r, 0)) for r in RESOURCES}
@@ -2476,7 +2496,7 @@ def _network_field_work(plans: list[VillagePlan]) -> tuple[dict[int, float], dic
     total_cost = {r: 0.0 for r in RESOURCES}
     total_rate = {r: 0.0 for r in RESOURCES}
     for plan in plans:
-        if plan.finished:
+        if plan.finished and not _has_master_work(plan):
             cost, rate = {r: 0.0 for r in RESOURCES}, average_production(plan)
         else:
             cost, rate = _field_work(plan)
@@ -2517,13 +2537,15 @@ def completion_forecast(plans: list[VillagePlan]) -> CompletionForecast:
     longest_queue = 0.0
     for plan in plans:
         village = plan.village
-        if plan.finished:
+        if plan.finished and not _has_master_work(plan):
             villages[village.id] = 0.0
             queue_bound[village.id] = False
             limits[village.id] = None
             continue
         queue_hours, _costs = _remaining(village, plan.target)
-        queue_hours += plan.queue_hours
+        # Fields lined up at the master builder count as planned levels
+        # above; their build time (and the buildings there) comes on top.
+        queue_hours += plan.queue_hours + _master_work(village)[0]
         produce, slowest = _slowest(*_field_work(plan))
         villages[village.id] = None if produce is None else max(queue_hours, produce)
         queue_bound[village.id] = produce is not None and queue_hours >= produce

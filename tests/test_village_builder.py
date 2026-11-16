@@ -2126,3 +2126,18 @@ def test_front_step_takes_the_place_of_the_weakest_entry_in_a_full_master_queue(
     assert replace and replace[0].id == "3" and "1" not in [e.id for e in replace]  # latest first
     # A free master builder place: nothing is cancelled for it.
     assert vb.master_replacements(village, 10, 0, slots=4, first_steps=[front]) == []
+
+
+def test_completion_forecast_counts_master_builder_entries_still_waiting():
+    # The last field level waits at the master builder for clay: not "done".
+    field = _field(1, 1, 4, queued=1)
+    village = _village([field], resources=0, vid="A", production={1: 100, 2: 10, 3: 100, 4: 100})
+    village.queue = [vb.QueueEntry(4, 1, 1, 0, id="m", paid=False)]
+    plan = vb.VillagePlan(village=village, target=5, finished=True)
+    forecast = vb.completion_forecast([plan])
+    assert forecast.villages["A"] > 1  # clay for the waiting level (0 before)
+    assert forecast.limits["A"] == 2
+    # Reserved: only its build time is left.
+    village.queue = [vb.QueueEntry(4, 1, 1, 0, id="m", paid=True)]
+    hours = vb.completion_forecast([plan]).villages["A"]
+    assert 0 < hours < 1
